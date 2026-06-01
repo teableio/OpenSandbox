@@ -65,6 +65,16 @@ def _app_config_with_image_pull_policy(image_pull_policy: str) -> AppConfig:
         ),
     )
 
+def _app_config_with_sandbox_resource_requests(resource_requests: dict[str, str]) -> AppConfig:
+    """Build an AppConfig with sandbox_resource_requests set."""
+    return AppConfig(
+        runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+        kubernetes=KubernetesRuntimeConfig(
+            namespace="test-ns",
+            sandbox_resource_requests=resource_requests,
+        ),
+    )
+
 def _app_config_with_egress_disable_ipv6(disable_ipv6: bool = True) -> AppConfig:
     """Build an AppConfig with ``egress.disable_ipv6`` set (privileged execd init when egress is used)."""
     return AppConfig(
@@ -620,6 +630,33 @@ spec:
         
         assert resources["limits"] == {"cpu": "1", "memory": "1Gi"}
         assert resources["requests"] == {"cpu": "1", "memory": "1Gi"}
+
+    def test_create_workload_uses_configured_sandbox_resource_requests(self, mock_k8s_client):
+        provider = BatchSandboxProvider(
+            mock_k8s_client,
+            _app_config_with_sandbox_resource_requests({"cpu": "500m", "memory": "1Gi"}),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "sandbox-test", "uid": "uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={"cpu": "2", "memory": "4Gi"},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:latest"
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        resources = body["spec"]["template"]["spec"]["containers"][0]["resources"]
+
+        assert resources["limits"] == {"cpu": "2", "memory": "4Gi"}
+        assert resources["requests"] == {"cpu": "500m", "memory": "1Gi"}
     
     def test_create_workload_handles_empty_resource_limits(self, mock_k8s_client):
         provider = BatchSandboxProvider(mock_k8s_client)

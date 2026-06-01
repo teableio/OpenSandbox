@@ -94,6 +94,9 @@ class AgentSandboxProvider(WorkloadProvider):
         )
         self.ingress_config = app_config.ingress if app_config else None
         self.execd_init_resources = k8s_config.execd_init_resources if k8s_config else None
+        self.sandbox_resource_requests = (
+            k8s_config.sandbox_resource_requests if k8s_config else None
+        )
 
         self.resolver = SecureRuntimeResolver(app_config) if app_config else None
         self.runtime_class = (
@@ -260,6 +263,7 @@ class AgentSandboxProvider(WorkloadProvider):
             entrypoint=entrypoint,
             env=env,
             resource_limits=resource_limits,
+            resource_requests=self.sandbox_resource_requests,
             has_network_policy=network_policy is not None,
         )
         

@@ -108,6 +108,24 @@ def _translate_resource_limits_for_k8s(
     # for extended resources.
     translated[_K8S_NVIDIA_GPU_RESOURCE] = str(gpu_count)
     return translated
+
+
+def _build_resource_requests_for_k8s(
+    translated_limits: Dict[str, str],
+    resource_requests: Optional[Dict[str, str]],
+) -> Dict[str, str]:
+    if not translated_limits:
+        return {}
+
+    requests = dict(translated_limits)
+    if resource_requests:
+        for key in ("cpu", "memory"):
+            value = resource_requests.get(key)
+            if value:
+                requests[key] = value
+    return requests
+
+
 def _build_execd_init_container(
     execd_image: str,
     execd_init_resources: Any,
@@ -154,6 +172,7 @@ def _build_main_container(
     env: Dict[str, str],
     resource_limits: Dict[str, str],
     *,
+    resource_requests: Optional[Dict[str, str]] = None,
     has_network_policy: bool = False,
     image_pull_policy: Optional[str] = None,
 ) -> V1Container:
@@ -163,9 +182,13 @@ def _build_main_container(
     translated_limits = _translate_resource_limits_for_k8s(resource_limits)
     resources = None
     if translated_limits:
+        translated_requests = _build_resource_requests_for_k8s(
+            translated_limits,
+            resource_requests,
+        )
         resources = V1ResourceRequirements(
             limits=translated_limits,
-            requests=translated_limits,
+            requests=translated_requests,
         )
 
     volume_mounts = [

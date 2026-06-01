@@ -17,6 +17,7 @@ from fastapi import HTTPException
 
 from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.k8s.provider_common import (
+    _build_resource_requests_for_k8s,
     _translate_resource_limits_for_k8s,
 )
 
@@ -72,3 +73,18 @@ def test_translate_resource_limits_drops_invalid_gpu(bad_value):
 
 def test_translate_resource_limits_empty_dict():
     assert _translate_resource_limits_for_k8s({}) == {}
+
+
+def test_build_resource_requests_overrides_cpu_memory_only():
+    result = _build_resource_requests_for_k8s(
+        {"cpu": "2", "memory": "4Gi", "nvidia.com/gpu": "1"},
+        {"cpu": "500m", "memory": "1Gi", "nvidia.com/gpu": "0"},
+    )
+    assert result == {"cpu": "500m", "memory": "1Gi", "nvidia.com/gpu": "1"}
+
+
+def test_build_resource_requests_defaults_to_limits():
+    limits = {"cpu": "2", "memory": "4Gi"}
+    result = _build_resource_requests_for_k8s(limits, None)
+    assert result == limits
+    assert result is not limits
