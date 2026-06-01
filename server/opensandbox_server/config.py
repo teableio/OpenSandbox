@@ -42,6 +42,8 @@ CONFIG_ENV_VAR = "SANDBOX_CONFIG_PATH"
 DEFAULT_CONFIG_PATH = Path.home() / ".sandbox.toml"
 
 API_KEY_ENV_VAR = "OPENSANDBOX_SERVER_API_KEY"
+K8S_SANDBOX_REQUEST_CPU_ENV_VAR = "OPENSANDBOX_K8S_SANDBOX_REQUEST_CPU"
+K8S_SANDBOX_REQUEST_MEMORY_ENV_VAR = "OPENSANDBOX_K8S_SANDBOX_REQUEST_MEMORY"
 
 _HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?:\.(?!-)[A-Za-z0-9-]{1,63})*$")
 _WILDCARD_DOMAIN_RE = re.compile(r"^\*\.(?!-)[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+$")
@@ -619,6 +621,13 @@ class KubernetesRuntimeConfig(BaseModel):
             "If unset, no resource constraints are applied."
         ),
     )
+    sandbox_resource_requests: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Resource requests for sandbox containers. "
+            "If unset, Kubernetes requests default to resourceLimits."
+        ),
+    )
     image_pull_policy: Optional[str] = Field(
         default="IfNotPresent",
         description=(
@@ -627,6 +636,21 @@ class KubernetesRuntimeConfig(BaseModel):
             "Can be overridden per-sandbox via image.pull_policy in create request."
         ),
     )
+
+    @model_validator(mode="after")
+    def apply_sandbox_resource_request_env(self) -> "KubernetesRuntimeConfig":
+        cpu_request = os.environ.get(K8S_SANDBOX_REQUEST_CPU_ENV_VAR)
+        memory_request = os.environ.get(K8S_SANDBOX_REQUEST_MEMORY_ENV_VAR)
+        if not cpu_request and not memory_request:
+            return self
+
+        requests = dict(self.sandbox_resource_requests or {})
+        if cpu_request:
+            requests["cpu"] = cpu_request
+        if memory_request:
+            requests["memory"] = memory_request
+        self.sandbox_resource_requests = requests
+        return self
 
 
 class ExecdInitResources(BaseModel):
