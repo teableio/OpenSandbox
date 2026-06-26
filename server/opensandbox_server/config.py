@@ -44,6 +44,7 @@ DEFAULT_CONFIG_PATH = Path.home() / ".sandbox.toml"
 API_KEY_ENV_VAR = "OPENSANDBOX_SERVER_API_KEY"
 K8S_SANDBOX_REQUEST_CPU_ENV_VAR = "OPENSANDBOX_K8S_SANDBOX_REQUEST_CPU"
 K8S_SANDBOX_REQUEST_MEMORY_ENV_VAR = "OPENSANDBOX_K8S_SANDBOX_REQUEST_MEMORY"
+K8S_SANDBOX_REQUEST_EPHEMERAL_STORAGE_ENV_VAR = "OPENSANDBOX_K8S_SANDBOX_REQUEST_EPHEMERAL_STORAGE"
 
 _HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?:\.(?!-)[A-Za-z0-9-]{1,63})*$")
 _WILDCARD_DOMAIN_RE = re.compile(r"^\*\.(?!-)[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+$")
@@ -641,7 +642,8 @@ class KubernetesRuntimeConfig(BaseModel):
     def apply_sandbox_resource_request_env(self) -> "KubernetesRuntimeConfig":
         cpu_request = os.environ.get(K8S_SANDBOX_REQUEST_CPU_ENV_VAR)
         memory_request = os.environ.get(K8S_SANDBOX_REQUEST_MEMORY_ENV_VAR)
-        if not cpu_request and not memory_request:
+        ephemeral_storage_request = os.environ.get(K8S_SANDBOX_REQUEST_EPHEMERAL_STORAGE_ENV_VAR)
+        if not cpu_request and not memory_request and not ephemeral_storage_request:
             return self
 
         requests = dict(self.sandbox_resource_requests or {})
@@ -649,6 +651,8 @@ class KubernetesRuntimeConfig(BaseModel):
             requests["cpu"] = cpu_request
         if memory_request:
             requests["memory"] = memory_request
+        if ephemeral_storage_request:
+            requests["ephemeral-storage"] = ephemeral_storage_request
         self.sandbox_resource_requests = requests
         return self
 

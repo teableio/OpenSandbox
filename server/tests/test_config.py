@@ -162,15 +162,17 @@ def test_docker_runtime_disallows_kubernetes_block():
 def test_kubernetes_sandbox_resource_requests_env_override(monkeypatch):
     monkeypatch.setenv("OPENSANDBOX_K8S_SANDBOX_REQUEST_CPU", "500m")
     monkeypatch.setenv("OPENSANDBOX_K8S_SANDBOX_REQUEST_MEMORY", "1Gi")
+    monkeypatch.setenv("OPENSANDBOX_K8S_SANDBOX_REQUEST_EPHEMERAL_STORAGE", "5Gi")
 
     kubernetes_cfg = config_module.KubernetesRuntimeConfig(
         namespace="sandbox",
-        sandbox_resource_requests={"cpu": "1", "memory": "2Gi"},
+        sandbox_resource_requests={"cpu": "1", "memory": "2Gi", "ephemeral-storage": "15Gi"},
     )
 
     assert kubernetes_cfg.sandbox_resource_requests == {
         "cpu": "500m",
         "memory": "1Gi",
+        "ephemeral-storage": "5Gi",
     }
 
 
