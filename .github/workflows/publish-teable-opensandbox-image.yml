@@ -1,0 +1,161 @@
+name: Publish Teable OpenSandbox Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: opensandbox
+  REGISTRY_GITHUB: ghcr.io/teableio
+  REGISTRY_DOCKERHUB: docker.io/teableio
+  REGISTRY_ALIYUN: registry.cn-shenzhen.aliyuncs.com/teable
+
+jobs:
+  test:
+    name: Server tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - name: Run focused server tests
+        working-directory: server
+        run: |
+          uv run --group dev pytest \
+            tests/k8s/test_provider_common.py \
+            tests/k8s/test_batchsandbox_provider.py::TestBatchSandboxProvider::test_create_workload_uses_configured_sandbox_resource_requests \
+            tests/test_config.py::test_kubernetes_sandbox_resource_requests_env_override
+
+  build-push:
+    name: Build and push GHCR image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      release_id: ${{ steps.release.outputs.release_id }}
+      sha_tag: ${{ steps.release.outputs.sha_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Compute image tags
+        id: release
+        run: |
+          RELEASE_TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          RELEASE_TIMESTAMP_TAG="$(printf '%s' "$RELEASE_TIMESTAMP" | tr ':' '-')"
+          RELEASE_ID="release.${RELEASE_TIMESTAMP_TAG}.${GITHUB_RUN_NUMBER:-1}"
+          SHA_TAG="sha-${GITHUB_SHA::12}"
+
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+          echo "Release id: $RELEASE_ID"
+          echo "SHA tag: $SHA_TAG"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_GITHUB }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.release.outputs.release_id }}
+            type=raw,value=${{ steps.release.outputs.sha_tag }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: server
+          file: server/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+
+  sync-dockerhub:
+    name: Sync image to Docker Hub
+    runs-on: ubuntu-latest
+    needs: build-push
+    steps:
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Sync tags
+        env:
+          SRC_CREDS: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          DST_CREDS: ${{ vars.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_TOKEN }}
+          TAGS: latest,${{ needs.build-push.outputs.release_id }},${{ needs.build-push.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra TAG_LIST <<< "$TAGS"
+
+          for tag in "${TAG_LIST[@]}"; do
+            [ -n "$tag" ] || continue
+            skopeo copy --all \
+              --src-creds="$SRC_CREDS" \
+              --dest-creds="$DST_CREDS" \
+              "docker://${{ env.REGISTRY_GITHUB }}/${{ env.IMAGE_NAME }}:${tag}" \
+              "docker://${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME }}:${tag}"
+          done
+
+  sync-aliyun:
+    name: Sync image to Aliyun Shenzhen
+    runs-on: ubuntu-latest
+    needs: build-push
+    steps:
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Sync tags
+        env:
+          SRC_CREDS: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          DST_CREDS: ${{ vars.ALIYUN_USERNAME }}:${{ secrets.ALIYUN_PASSWORD }}
+          TAGS: latest,${{ needs.build-push.outputs.release_id }},${{ needs.build-push.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra TAG_LIST <<< "$TAGS"
+
+          for tag in "${TAG_LIST[@]}"; do
+            [ -n "$tag" ] || continue
+            skopeo copy --all \
+              --src-creds="$SRC_CREDS" \
+              --dest-creds="$DST_CREDS" \
+              "docker://${{ env.REGISTRY_GITHUB }}/${{ env.IMAGE_NAME }}:${tag}" \
+              "docker://${{ env.REGISTRY_ALIYUN }}/${{ env.IMAGE_NAME }}:${tag}"
+          done
