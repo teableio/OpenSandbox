@@ -119,7 +119,7 @@ def _build_resource_requests_for_k8s(
 
     requests = dict(translated_limits)
     if resource_requests:
-        for key in ("cpu", "memory"):
+        for key in translated_limits:
             value = resource_requests.get(key)
             if value:
                 requests[key] = value

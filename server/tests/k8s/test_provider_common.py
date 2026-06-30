@@ -75,12 +75,23 @@ def test_translate_resource_limits_empty_dict():
     assert _translate_resource_limits_for_k8s({}) == {}
 
 
-def test_build_resource_requests_overrides_cpu_memory_only():
+def test_build_resource_requests_overrides_configured_limit_keys():
     result = _build_resource_requests_for_k8s(
-        {"cpu": "2", "memory": "4Gi", "nvidia.com/gpu": "1"},
-        {"cpu": "500m", "memory": "1Gi", "nvidia.com/gpu": "0"},
+        {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "15Gi", "nvidia.com/gpu": "1"},
+        {
+            "cpu": "500m",
+            "memory": "1Gi",
+            "ephemeral-storage": "5Gi",
+            "example.com/unused": "1",
+        },
     )
-    assert result == {"cpu": "500m", "memory": "1Gi", "nvidia.com/gpu": "1"}
+    assert result == {
+        "cpu": "500m",
+        "memory": "1Gi",
+        "ephemeral-storage": "5Gi",
+        "nvidia.com/gpu": "1",
+    }
+    assert "example.com/unused" not in result
 
 
 def test_build_resource_requests_defaults_to_limits():
