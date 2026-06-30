@@ -159,6 +159,21 @@ def test_docker_runtime_disallows_kubernetes_block():
         AppConfig(server=server_cfg, runtime=runtime_cfg, kubernetes=kubernetes_cfg)
 
 
+def test_kubernetes_sandbox_resource_requests_env_override(monkeypatch):
+    monkeypatch.setenv("OPENSANDBOX_K8S_SANDBOX_REQUEST_CPU", "500m")
+    monkeypatch.setenv("OPENSANDBOX_K8S_SANDBOX_REQUEST_MEMORY", "1Gi")
+
+    kubernetes_cfg = config_module.KubernetesRuntimeConfig(
+        namespace="sandbox",
+        sandbox_resource_requests={"cpu": "1", "memory": "2Gi"},
+    )
+
+    assert kubernetes_cfg.sandbox_resource_requests == {
+        "cpu": "500m",
+        "memory": "1Gi",
+    }
+
+
 def test_server_config_defaults_include_max_sandbox_timeout():
     server_cfg = ServerConfig()
     assert server_cfg.max_sandbox_timeout_seconds is None
@@ -1417,4 +1432,3 @@ class TestSecureAccessTomlLoading:
 
         with pytest.raises(ValidationError, match="not found in secure_access.keys"):
             config_module.load_config(config_path)
-
