@@ -176,7 +176,7 @@ def test_proxy_forwards_filtered_headers_and_query(
     assert "connection" not in lowered_headers
     assert "upgrade" not in lowered_headers
     assert "trailer" not in lowered_headers
-    assert "authorization" not in lowered_headers
+    assert lowered_headers.get("authorization") == "Bearer top-secret"
     assert "cookie" not in lowered_headers
     assert SANDBOX_API_KEY_HEADER.lower() not in lowered_headers
     assert "x-hop-temp" not in lowered_headers
@@ -515,7 +515,7 @@ def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
     lowered_headers = {
         key.lower(): value for key, value in (call["additional_headers"] or {}).items()
     }
-    assert "authorization" not in lowered_headers
+    assert lowered_headers.get("authorization") == "Bearer top-secret"
     assert "cookie" not in lowered_headers
     assert "origin" not in lowered_headers
     assert lowered_headers["opensandbox-ingress-to"] == "sbx-123-44772"
