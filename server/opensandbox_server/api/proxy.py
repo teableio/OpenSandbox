@@ -49,9 +49,11 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
-# Headers that shouldn't be forwarded to untrusted/internal backends
+# Headers that shouldn't be forwarded to untrusted/internal backends.
+# "authorization" is intentionally forwarded: in-sandbox services authenticate
+# clients with scoped bearer tokens, and the k8s wildcard ingress-gateway
+# (which bypasses this proxy) already forwards it.
 SENSITIVE_HEADERS = {
-    "authorization",
     "cookie",
     SANDBOX_API_KEY_HEADER.lower(),
 }
