@@ -2112,6 +2112,60 @@ spec:
         assert "sandbox-shared-data" in volume_names
         assert "opensandbox-bin" in volume_names
 
+    def test_create_workload_merges_template_env_into_main_container(self, mock_k8s_client, tmp_path):
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(
+            """
+spec:
+  template:
+    spec:
+      containers:
+        - name: sandbox
+          env:
+            - name: NODE_EXTRA_CA_CERTS
+              value: /etc/ssl/certs/pg-ingress-common.crt
+            - name: EXECD
+              value: /template/should-not-win
+          volumeMounts:
+            - name: ingress-common-tls
+              mountPath: /etc/ssl/certs/pg-ingress-common.crt
+              subPath: tls.crt
+              readOnly: true
+      volumes:
+        - name: ingress-common-tls
+          secret:
+            secretName: secret-ingress-pgcloud
+"""
+        )
+        provider = BatchSandboxProvider(mock_k8s_client, _app_config_with_template(str(template_file)))
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={"FOO": "bar"},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, 10, 0, 0, tzinfo=timezone.utc),
+            execd_image="execd:latest",
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        main_container = body["spec"]["template"]["spec"]["containers"][0]
+        env = {item["name"]: item["value"] for item in main_container["env"]}
+        assert env["FOO"] == "bar"
+        assert env["NODE_EXTRA_CA_CERTS"] == "/etc/ssl/certs/pg-ingress-common.crt"
+        assert env["EXECD"] == "/opt/opensandbox/bin/execd"
+
+        mount_names = [mount["name"] for mount in main_container["volumeMounts"]]
+        volume_names = [volume["name"] for volume in body["spec"]["template"]["spec"]["volumes"]]
+        assert "ingress-common-tls" in mount_names
+        assert "ingress-common-tls" in volume_names
+
     # ===== Phase + Condition Validation Tests =====
 
     def test_pause_sandbox_running_allows(self, mock_k8s_client):

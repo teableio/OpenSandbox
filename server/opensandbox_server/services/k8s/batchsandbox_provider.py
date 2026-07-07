@@ -151,7 +151,7 @@ class BatchSandboxProvider(WorkloadProvider):
                 annotations=annotations,
             )
 
-        extra_volumes, extra_mounts = self._extract_template_pod_extras()
+        extra_volumes, extra_mounts, extra_env = self._extract_template_pod_extras()
 
         if windows_profile:
             validate_windows_profile_resource_limits(resource_limits)
@@ -258,7 +258,7 @@ class BatchSandboxProvider(WorkloadProvider):
             batchsandbox["spec"].pop("expireTime", None)
         else:
             batchsandbox["spec"]["expireTime"] = expires_at.isoformat()
-        self._merge_pod_spec_extras(batchsandbox, extra_volumes, extra_mounts)
+        self._merge_pod_spec_extras(batchsandbox, extra_volumes, extra_mounts, extra_env)
         if platform is not None and not windows_profile:
             merged_pod_spec = batchsandbox.get("spec", {}).get("template", {}).get("spec", {})
             WorkloadProvider.ensure_platform_compatible_with_affinity(merged_pod_spec, platform)
@@ -370,14 +370,15 @@ class BatchSandboxProvider(WorkloadProvider):
             "uid": created["metadata"]["uid"],
         }
 
-    def _extract_template_pod_extras(self) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
-        """Extract extra template volumes and mounts for runtime merge."""
+    def _extract_template_pod_extras(self) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], list[Dict[str, Any]]]:
+        """Extract extra template volumes, mounts, and env for runtime merge."""
         template = self.template_manager.get_base_template()
         spec = template.get("spec", {}) if isinstance(template, dict) else {}
         template_spec = spec.get("template", {}).get("spec", {})
         extra_volumes = template_spec.get("volumes", []) or []
 
         extra_mounts: list[Dict[str, Any]] = []
+        extra_env: list[Dict[str, Any]] = []
         containers = template_spec.get("containers", []) or []
         if containers:
             target = None
@@ -388,20 +389,24 @@ class BatchSandboxProvider(WorkloadProvider):
             if target is None:
                 target = containers[0]
             extra_mounts = target.get("volumeMounts", []) or []
+            extra_env = target.get("env", []) or []
 
         if not isinstance(extra_volumes, list):
             extra_volumes = []
         if not isinstance(extra_mounts, list):
             extra_mounts = []
-        return extra_volumes, extra_mounts
+        if not isinstance(extra_env, list):
+            extra_env = []
+        return extra_volumes, extra_mounts, extra_env
 
     def _merge_pod_spec_extras(
         self,
         batchsandbox: Dict[str, Any],
         extra_volumes: list[Dict[str, Any]],
         extra_mounts: list[Dict[str, Any]],
+        extra_env: list[Dict[str, Any]],
     ) -> None:
-        """Merge template-provided volumes and mounts into runtime pod spec."""
+        """Merge template-provided volumes, mounts, and env into runtime pod spec."""
         try:
             spec = batchsandbox["spec"]["template"]["spec"]
         except KeyError:
@@ -436,6 +441,19 @@ class BatchSandboxProvider(WorkloadProvider):
                 mounts.append(mnt)
                 existing.add(name)
             main_container["volumeMounts"] = mounts
+
+        env = main_container.get("env", []) or []
+        if isinstance(env, list) and extra_env:
+            existing = {item.get("name") for item in env if isinstance(item, dict)}
+            for item in extra_env:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not name or name in existing:
+                    continue
+                env.append(item)
+                existing.add(name)
+            main_container["env"] = env
 
     def _build_task_template(
         self,
