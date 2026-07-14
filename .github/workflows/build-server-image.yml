@@ -10,6 +10,11 @@ on:
         description: "Image tag (e.g. v0.2.0-fix5)"
         required: true
         type: string
+      push_ghcr:
+        description: "Also push to GHCR (needs the package's Actions access to include this repo)"
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   build:
@@ -48,10 +53,12 @@ jobs:
           provenance: false
           sbom: false
           tags: |
-            ghcr.io/teableio/opensandbox-server:${{ inputs.tag }}
+            ${{ inputs.push_ghcr && format('ghcr.io/teableio/opensandbox-server:{0}', inputs.tag) || '' }}
             registry.cn-shenzhen.aliyuncs.com/teable/opensandbox-server:${{ inputs.tag }}
 
       - name: Inspect manifests
         run: |
-          docker buildx imagetools inspect "ghcr.io/teableio/opensandbox-server:${{ inputs.tag }}"
+          if [ "${{ inputs.push_ghcr }}" = "true" ]; then
+            docker buildx imagetools inspect "ghcr.io/teableio/opensandbox-server:${{ inputs.tag }}"
+          fi
           docker buildx imagetools inspect "registry.cn-shenzhen.aliyuncs.com/teable/opensandbox-server:${{ inputs.tag }}"
