@@ -853,9 +853,11 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 else:
                     exposed_ports = None
 
-            # Inject volume bind mounts into Docker host config
-            if volume_binds:
-                host_config_kwargs["binds"] = volume_binds
+            # Inject volume bind mounts into Docker host config; config-level
+            # binds (docker.sandbox_binds) apply to every sandbox and come first.
+            all_binds = list(self.app_config.docker.sandbox_binds or []) + (volume_binds or [])
+            if all_binds:
+                host_config_kwargs["binds"] = all_binds
             if requested_windows_profile:
                 host_config_kwargs = apply_windows_runtime_host_config_defaults(
                     host_config_kwargs,
