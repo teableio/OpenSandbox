@@ -1,0 +1,70 @@
+name: Build execd image
+
+# Manual multi-arch build of opensandbox-execd, pushed to GHCR and the
+# Shenzhen ACR mirror — the registries our clusters pull from. Mirrors
+# build-server-image.yml; the upstream publish-components workflow targets
+# the upstream registries instead.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (e.g. v1.0.19-fix3)"
+        required: true
+        type: string
+      push_ghcr:
+        description: "Also push to GHCR (needs the package's Actions access to include this repo)"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login Shenzhen ACR
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cn-shenzhen.aliyuncs.com
+          username: ${{ secrets.ALI_DOCKER_USERNAME }}
+          password: ${{ secrets.ALI_DOCKER_PASSWORD }}
+
+      # The Dockerfile copies components/internal alongside components/execd,
+      # so the build context has to be the repository root.
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: components/execd/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            VERSION=${{ inputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+          tags: |
+            ${{ inputs.push_ghcr && format('ghcr.io/teableio/opensandbox-execd:{0}', inputs.tag) || '' }}
+            registry.cn-shenzhen.aliyuncs.com/teable/opensandbox-execd:${{ inputs.tag }}
+
+      - name: Inspect manifests
+        run: |
+          if [ "${{ inputs.push_ghcr }}" = "true" ]; then
+            docker buildx imagetools inspect "ghcr.io/teableio/opensandbox-execd:${{ inputs.tag }}"
+          fi
+          docker buildx imagetools inspect "registry.cn-shenzhen.aliyuncs.com/teable/opensandbox-execd:${{ inputs.tag }}"
