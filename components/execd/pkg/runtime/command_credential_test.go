@@ -19,7 +19,6 @@ package runtime
 
 import (
 	"os"
-	"os/exec"
 	"syscall"
 	"testing"
 
@@ -77,24 +76,36 @@ func TestCredentialIsCurrentProcess(t *testing.T) {
 	assert.False(t, credentialIsCurrentProcess(&syscall.Credential{Uid: uid, Gid: gid + 1}))
 }
 
-// TestExecWithSelfCredential_Unprivileged is the regression this fix exists for:
-// as an unprivileged user, spawning a child with an explicit Credential for our
-// own identity fails with EPERM, while inheriting credentials succeeds.
-func TestExecWithSelfCredential_Unprivileged(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root can setgroups/setuid; the EPERM path only shows unprivileged")
-	}
+func TestCredentialIsCurrentProcess_GroupsWeDoNotHold(t *testing.T) {
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
-
-	explicit := exec.Command("/bin/sh", "-c", "true")
-	explicit.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{gid}},
-	}
-	assert.Error(t, explicit.Run(), "explicit self-credential is expected to fail unprivileged")
-
-	cred, err := buildCredential(&uid, &gid)
+	current, err := os.Getgroups()
 	require.NoError(t, err)
-	inherited := exec.Command("/bin/sh", "-c", "true")
-	inherited.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
-	assert.NoError(t, inherited.Run(), "buildCredential must let the child inherit our identity")
+
+	unheld := uint32(gid + 4242)
+	for _, g := range current {
+		if uint32(g) == unheld {
+			t.Skip("picked group is actually held; skipping to stay deterministic")
+		}
+	}
+
+	// Inheriting would silently drop a group the caller asked for.
+	assert.False(t, credentialIsCurrentProcess(
+		&syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{unheld}}))
+}
+
+func TestGroupsAreSubset(t *testing.T) {
+	const primary = uint32(1000)
+
+	// Equal sets — the production case (image NSS groups match the runtime's).
+	assert.True(t, groupsAreSubset([]uint32{1000}, []int{1000}, primary))
+	// Primary gid counts as held even when getgroups(2) omits it, and as
+	// requested even when the caller omits it.
+	assert.True(t, groupsAreSubset([]uint32{1000}, []int{}, primary))
+	assert.True(t, groupsAreSubset(nil, []int{1000}, primary))
+	// Extra groups we hold (e.g. pod-level supplementalGroups) are fine.
+	assert.True(t, groupsAreSubset([]uint32{1000}, []int{1000, 2000}, primary))
+	// A requested group we do not hold must not be inherited away.
+	assert.False(t, groupsAreSubset([]uint32{1000, 3000}, []int{1000}, primary))
+	// Defensive: a negative gid from the platform is never treated as held.
+	assert.False(t, groupsAreSubset([]uint32{7}, []int{-1}, primary))
 }

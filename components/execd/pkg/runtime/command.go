@@ -97,17 +97,54 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 	return cred, nil
 }
 
-// credentialIsCurrentProcess reports whether cred describes the identity this
-// process already runs under. Real and effective IDs must both match, so a
-// process that is mid-switch (or on a platform without POSIX IDs, where these
-// return -1) still takes the explicit path.
+// credentialIsCurrentProcess reports whether inheriting our credentials gives
+// the child everything cred asks for. Real and effective IDs must both match,
+// so a process that is mid-switch (or on a platform without POSIX IDs, where
+// these return -1) still takes the explicit path.
+//
+// The requested groups must be a subset of ours. Equal sets are the common
+// case; extra groups can only come from the pod/container spec, and every
+// other process in the container — including the caller — already carries
+// them, so inheriting them grants nothing new. A requested group we do *not*
+// hold would be lost by inheriting, so that case takes the explicit path and
+// fails loudly rather than silently running with less access than asked for.
 func credentialIsCurrentProcess(cred *syscall.Credential) bool {
 	uid, gid := os.Getuid(), os.Getgid()
 	if uid < 0 || gid < 0 {
 		return false
 	}
-	return uid == os.Geteuid() && gid == os.Getegid() &&
-		cred.Uid == uint32(uid) && cred.Gid == uint32(gid)
+	if uid != os.Geteuid() || gid != os.Getegid() {
+		return false
+	}
+	if cred.Uid != uint32(uid) || cred.Gid != uint32(gid) {
+		return false
+	}
+
+	current, err := os.Getgroups()
+	if err != nil {
+		return false
+	}
+	return groupsAreSubset(cred.Groups, current, cred.Gid)
+}
+
+// groupsAreSubset reports whether every group in requested is one we hold.
+// The primary gid counts as held on both sides: getgroups(2) is not required
+// to list it, and the caller may or may not include it in the request.
+func groupsAreSubset(requested []uint32, current []int, primaryGid uint32) bool {
+	held := make(map[uint32]struct{}, len(current)+1)
+	held[primaryGid] = struct{}{}
+	for _, g := range current {
+		if g < 0 {
+			return false
+		}
+		held[uint32(g)] = struct{}{}
+	}
+	for _, g := range requested {
+		if _, ok := held[g]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // runCommand executes shell commands and streams their output.
