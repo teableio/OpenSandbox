@@ -83,7 +83,31 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 		cred.Gid = *gid
 	}
 
+	// Requesting the identity we already run as is a no-op switch, and doing it
+	// anyway breaks unprivileged sandboxes: the child calls setgroups(2), which
+	// always requires CAP_SETGID, and a container running as a non-root user has
+	// an empty effective capability set. The fork would fail with EPERM
+	// ("fork/exec /usr/bin/bash: operation not permitted") even though no
+	// privilege change was ever needed. Inheriting the current credentials
+	// yields exactly the requested identity.
+	if credentialIsCurrentProcess(cred) {
+		return nil, nil //nolint:nilnil
+	}
+
 	return cred, nil
+}
+
+// credentialIsCurrentProcess reports whether cred describes the identity this
+// process already runs under. Real and effective IDs must both match, so a
+// process that is mid-switch (or on a platform without POSIX IDs, where these
+// return -1) still takes the explicit path.
+func credentialIsCurrentProcess(cred *syscall.Credential) bool {
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid < 0 || gid < 0 {
+		return false
+	}
+	return uid == os.Geteuid() && gid == os.Getegid() &&
+		cred.Uid == uint32(uid) && cred.Gid == uint32(gid)
 }
 
 // runCommand executes shell commands and streams their output.
