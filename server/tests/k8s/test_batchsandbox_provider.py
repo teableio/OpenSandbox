@@ -3037,6 +3037,65 @@ spec:
         assert main_sc["capabilities"]["drop"] == ["ALL", "NET_ADMIN"]
         assert main_sc["allowPrivilegeEscalation"] is False
 
+    def test_template_add_cannot_regrant_runtime_dropped_capability(
+        self, mock_k8s_client, tmp_path
+    ):
+        """A template `add` must not undo the egress NET_ADMIN drop."""
+        provider = self._provider_with_template(
+            mock_k8s_client,
+            tmp_path,
+            """
+spec:
+  template:
+    spec:
+      containers:
+        - name: sandbox
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "SYS_PTRACE"]
+""",
+        )
+
+        self._create(
+            provider,
+            network_policy=NetworkPolicy(
+                default_action="deny",
+                egress=[NetworkRule(action="allow", target="pypi.org")],
+            ),
+            egress_image="opensandbox/egress:test",
+        )
+
+        spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"][
+            "template"
+        ]["spec"]
+        caps = spec["containers"][0]["securityContext"]["capabilities"]
+        assert caps["drop"] == ["NET_ADMIN"]
+        assert "NET_ADMIN" not in caps["add"]
+        assert caps["add"] == ["SYS_PTRACE"]
+
+    def test_windows_profile_skips_template_security_context(
+        self, mock_k8s_client, tmp_path
+    ):
+        """Hardening template must not contradict the privileged Windows shape."""
+        provider = self._provider_with_template(
+            mock_k8s_client, tmp_path, self.SC_TEMPLATE
+        )
+
+        self._create(
+            provider,
+            platform=PlatformSpec(os="windows", arch="amd64"),
+            resource_limits={"cpu": "2", "memory": "4Gi"},
+        )
+
+        spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"][
+            "template"
+        ]["spec"]
+        sc = spec["containers"][0]["securityContext"]
+        assert sc["privileged"] is True
+        assert "runAsNonRoot" not in sc
+        assert "allowPrivilegeEscalation" not in sc
+        assert "ALL" not in (sc.get("capabilities", {}).get("drop") or [])
+
     def test_no_template_security_context_keeps_runtime_behavior(
         self, mock_k8s_client, tmp_path
     ):

@@ -265,7 +265,12 @@ class BatchSandboxProvider(WorkloadProvider):
         else:
             batchsandbox["spec"]["expireTime"] = expires_at.isoformat()
         self._merge_pod_spec_extras(batchsandbox, extra_volumes, extra_mounts, extra_env)
-        self._merge_template_security_contexts(batchsandbox)
+        if not windows_profile:
+            # The Windows profile deliberately builds a privileged container
+            # with NET_ADMIN/NET_RAW; folding a hardening template
+            # (runAsNonRoot, drop ALL, allowPrivilegeEscalation=false) into it
+            # would produce a contradictory spec that cannot start.
+            self._merge_template_security_contexts(batchsandbox)
         if platform is not None and not windows_profile:
             merged_pod_spec = batchsandbox.get("spec", {}).get("template", {}).get("spec", {})
             WorkloadProvider.ensure_platform_compatible_with_affinity(merged_pod_spec, platform)
