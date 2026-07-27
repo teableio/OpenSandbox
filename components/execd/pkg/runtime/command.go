@@ -103,11 +103,14 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 // these return -1) still takes the explicit path.
 //
 // The requested groups must be a subset of ours. Equal sets are the common
-// case; extra groups can only come from the pod/container spec, and every
-// other process in the container — including the caller — already carries
-// them, so inheriting them grants nothing new. A requested group we do *not*
-// hold would be lost by inheriting, so that case takes the explicit path and
-// fails loudly rather than silently running with less access than asked for.
+// case. Where they are not, this is a deliberate policy choice rather than a
+// strict equivalence: the child may keep supplemental groups the request did
+// not name. Those come from how the container was started, and every process
+// in it — including the caller issuing this request — already carries them,
+// so the command gains nothing its own container does not already have. A
+// requested group we do *not* hold is the opposite case and would be lost by
+// inheriting, so it takes the explicit path and fails loudly rather than
+// silently running with less access than asked for.
 func credentialIsCurrentProcess(cred *syscall.Credential) bool {
 	uid, gid := os.Getuid(), os.Getgid()
 	if uid < 0 || gid < 0 {

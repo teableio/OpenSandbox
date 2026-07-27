@@ -19,6 +19,8 @@ package runtime
 
 import (
 	"os"
+	"os/user"
+	"strconv"
 	"syscall"
 	"testing"
 
@@ -42,10 +44,42 @@ func TestBuildCredential_NilWhenRequestingCurrentIdentity(t *testing.T) {
 	// Asking to run as the user we already are is a no-op switch. Returning a
 	// Credential here would make the child call setgroups(2), which needs
 	// CAP_SETGID — unavailable to an unprivileged sandbox container.
-	cred, err := buildCredential(u32(os.Getuid()), u32(os.Getgid()))
-
+	//
+	// The expectation follows the actual group relationship rather than
+	// assuming it: on a host where this user's NSS groups are not all held by
+	// the test process, the explicit path is the correct answer.
+	uid, gid := os.Getuid(), os.Getgid()
+	current, err := os.Getgroups()
 	require.NoError(t, err)
-	assert.Nil(t, cred, "no credential switch should be requested for the current identity")
+	nssGroups := nssGroupsFor(t, uid)
+
+	cred, err := buildCredential(u32(uid), u32(gid))
+	require.NoError(t, err)
+
+	if groupsAreSubset(nssGroups, current, uint32(gid)) {
+		assert.Nil(t, cred, "identity is fully covered by ours; the child should inherit it")
+	} else {
+		assert.NotNil(t, cred, "a group we do not hold must not be silently dropped")
+	}
+}
+
+func nssGroupsFor(t *testing.T, uid int) []uint32 {
+	t.Helper()
+	u, err := user.LookupId(strconv.Itoa(uid))
+	if err != nil {
+		return nil
+	}
+	ids, err := u.GroupIds()
+	if err != nil {
+		return nil
+	}
+	groups := make([]uint32, 0, len(ids))
+	for _, id := range ids {
+		g, err := strconv.ParseUint(id, 10, 32)
+		require.NoError(t, err)
+		groups = append(groups, uint32(g))
+	}
+	return groups
 }
 
 func TestBuildCredential_SetWhenRequestingDifferentIdentity(t *testing.T) {
