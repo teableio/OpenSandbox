@@ -167,15 +167,21 @@ workload is created. The referenced PVCs must be mounted into the server pod at
 the paths given in `mounts`; claims not listed are skipped, as are read-only
 volumes.
 
-Ownership is applied to directories the server creates, and converged on
-directories it adopts (so directories left root-owned by kubelet before this
-feature was enabled are corrected, and concurrent server replicas agree). Only
-the directory entry is touched, never its contents. Each component is opened
-relative to its parent with `O_NOFOLLOW`, so a symlink cannot redirect the walk
-outside the mount root; an existing non-directory in the path is an error. When
-the server already runs as `uid:gid` the chown is skipped, so `CAP_CHOWN` is
-only needed if they differ. Failures abort the sandbox create rather than hand
-out a workspace the sandbox user cannot write to.
+Listing a claim here declares that **the whole tree under that mount root is
+managed by this server for `uid:gid`**: every component of a requested subPath
+is created with that owner, and an existing component's owner is converged to
+it (which repairs directories kubelet created as root before this feature was
+enabled, and keeps concurrent replicas in agreement). Only directory entries
+are touched, never their contents — but do not point `mounts` at a volume whose
+directories belong to someone else.
+
+Each component is opened relative to its parent with `O_NOFOLLOW`, so a symlink
+cannot redirect the walk outside the mount root; an existing non-directory in
+the path is an error. When the server already runs as `uid:gid` the chown is
+skipped, so `CAP_CHOWN` is only needed if they differ. Failures abort the
+sandbox create rather than hand out a workspace the sandbox user cannot write
+to. POSIX hosts only — on other platforms the create fails with an explicit
+error instead of silently skipping the ownership work.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

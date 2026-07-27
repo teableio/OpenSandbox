@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 from types import SimpleNamespace
 from datetime import datetime, timezone
@@ -3113,6 +3115,9 @@ spec:
         assert "securityContext" not in spec["containers"][0]
 
 
+@pytest.mark.skipif(
+    os.name != "posix", reason="subPath precreate is POSIX-only"
+)
 class TestVolumeSubpathPrecreateWiring:
     """create_workload pre-creates rw PVC subPath dirs when configured."""
 

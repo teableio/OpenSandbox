@@ -32,6 +32,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _require_posix() -> None:
+    """Fail loudly on platforms without the POSIX primitives this needs.
+
+    The safe walk relies on ``O_DIRECTORY``/``O_NOFOLLOW``, ``mkdir(dir_fd=)``
+    and ``fchown``, none of which exist on Windows. The feature only makes
+    sense for Linux sandbox nodes anyway; the explicit error beats an
+    AttributeError deep in the create path.
+    """
+    if os.name != "posix":
+        raise RuntimeError(
+            "subPath precreate requires a POSIX host "
+            f"(os.name={os.name!r}); disable kubernetes.volume_subpath_precreate"
+        )
+
+
 def precreate_volume_subpaths(
     volumes: Optional[List["Volume"]],
     precreate: Optional["VolumeSubpathPrecreate"],
@@ -39,16 +54,22 @@ def precreate_volume_subpaths(
     """Create missing subPath directories for read-write PVC volumes.
 
     Only claims listed in ``precreate.mounts`` are handled; read-only volumes
-    (externally provisioned content such as skills) are skipped. Ownership is
-    only applied to directories this call creates — pre-existing directories
-    are never touched.
+    (externally provisioned content such as skills) are skipped.
 
-    Raises ``RuntimeError`` when a directory cannot be created or chowned:
-    failing the sandbox create loudly beats handing out a workspace the
-    sandbox user cannot write to.
+    Configuring a claim in ``mounts`` declares that the whole directory tree
+    under that mount root is managed by this server for ``uid:gid`` — every
+    component of a requested subPath is created with that owner, and an
+    existing component's owner is converged to it. Do not point ``mounts`` at a
+    volume whose directories are owned by someone else.
+
+    Raises ``RuntimeError`` when a directory cannot be created or given the
+    configured ownership: failing the sandbox create loudly beats handing out a
+    workspace the sandbox user cannot write to.
     """
     if not volumes or not precreate or not precreate.mounts:
         return
+
+    _require_posix()
 
     for vol in volumes:
         if vol.pvc is None or vol.read_only or not vol.sub_path:
@@ -94,8 +115,11 @@ def _makedirs_owned(root: str, sub_path: str, uid: int, gid: int, dir_mode: int)
     # skipped or it would fail with EPERM.
     chown_needed = not (os.geteuid() == uid and os.getegid() == gid)
 
+    # O_NOFOLLOW also covers the realpath→open window on the root itself: if
+    # the resolved root is swapped for a symlink in between, the open fails
+    # instead of anchoring the whole walk outside the volume.
     try:
-        parent_fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY)
+        parent_fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
         raise RuntimeError(
             f"subPath precreate: cannot open mount root '{root}': {exc}"
@@ -187,16 +211,16 @@ def _mkdir_or_open_dir(
             os.fchown(fd, uid, gid)
     except OSError as exc:
         # The directory exists but is not usable by the sandbox user, and a
-        # retry would take the "already exists" path and skip the fix — so
-        # remove it and let the caller retry from a clean state.
-        try:
-            os.rmdir(name, dir_fd=parent_fd)
-        except OSError:
-            logger.warning(
-                "subPath precreate: failed to roll back '%s' after an "
-                "ownership error; it may stay root-owned",
-                path_for_errors,
-            )
+        # plain retry would take the "already exists" path — the adoption
+        # branch above repairs ownership, but only remove the directory we
+        # ourselves created so a concurrent creator's directory is never
+        # deleted by our rollback.
+        _rollback_created_dir(
+            parent_fd=parent_fd,
+            name=name,
+            created_fd=fd,
+            path_for_errors=path_for_errors,
+        )
         os.close(fd)
         raise RuntimeError(
             f"subPath precreate: cannot set owner {uid}:{gid} / mode "
@@ -211,3 +235,34 @@ def _mkdir_or_open_dir(
         dir_mode,
     )
     return fd
+
+
+def _rollback_created_dir(
+    *, parent_fd: int, name: str, created_fd: int, path_for_errors: str
+) -> None:
+    """Remove ``name`` only if it is still the directory we created.
+
+    Between our mkdir and this rollback another replica may have moved our
+    directory away and created its own under the same name; comparing the
+    entry's identity with our open fd keeps us from deleting theirs.
+    """
+    try:
+        created_stat = os.fstat(created_fd)
+        current_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (created_stat.st_dev, created_stat.st_ino) != (
+            current_stat.st_dev,
+            current_stat.st_ino,
+        ):
+            logger.warning(
+                "subPath precreate: '%s' was replaced concurrently; skipping "
+                "rollback so the other creator's directory survives",
+                path_for_errors,
+            )
+            return
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        logger.warning(
+            "subPath precreate: failed to roll back '%s' after an ownership "
+            "error; a later create will repair its owner instead",
+            path_for_errors,
+        )
