@@ -245,6 +245,11 @@ def _rollback_created_dir(
     Between our mkdir and this rollback another replica may have moved our
     directory away and created its own under the same name; comparing the
     entry's identity with our open fd keeps us from deleting theirs.
+
+    A window remains between that comparison and the rmdir — POSIX has no
+    "remove this open directory" call. The residual damage is bounded: rmdir
+    only removes empty directories, and the next create re-creates and
+    re-owns the entry, so a lost race costs one retry rather than data.
     """
     try:
         created_stat = os.fstat(created_fd)
