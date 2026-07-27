@@ -16,3 +16,21 @@ spec:
       restartPolicy: Never
       tolerations:
         - operator: "Exists"
+      # Container entries are matched onto the runtime-generated containers:
+      # volumeMounts, env and securityContext declared on the "sandbox"
+      # container (and, for securityContext, on initContainers matched by
+      # name) are merged into the pod the server creates. For securityContext,
+      # runtime-generated fields win on conflict, capability add/drop lists are
+      # unioned, and if the same capability appears on both sides the runtime
+      # one wins. Windows-profile sandboxes skip this merge (they need a
+      # privileged shape a hardening template would contradict). Example:
+      #   containers:
+      #     - name: sandbox
+      #       securityContext:
+      #         allowPrivilegeEscalation: false
+      #         capabilities:
+      #           drop: ["ALL"]
+      #   initContainers:
+      #     - name: execd-installer
+      #       securityContext:
+      #         allowPrivilegeEscalation: false

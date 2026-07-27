@@ -246,6 +246,58 @@ def _container_to_dict(container: V1Container) -> Dict[str, Any]:
     return result
 
 
+def merge_template_security_context(
+    template_sc: Optional[Dict[str, Any]],
+    runtime_sc: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Merge a template-declared container securityContext with the runtime one.
+
+    Runtime-generated fields win on conflicts — they carry feature-critical
+    settings such as the egress NET_ADMIN drop. Capability ``add``/``drop``
+    lists are unioned instead, so template hardening such as ``drop: [ALL]``
+    survives alongside runtime drops; on a cross conflict (the same capability
+    added on one side and dropped on the other) the runtime side wins.
+    """
+    if not template_sc:
+        return runtime_sc
+    if not runtime_sc:
+        return {k: v for k, v in template_sc.items()}
+
+    merged = {
+        **template_sc,
+        **{k: v for k, v in runtime_sc.items() if k != "capabilities"},
+    }
+    template_caps = template_sc.get("capabilities") or {}
+    runtime_caps = runtime_sc.get("capabilities") or {}
+    if template_caps or runtime_caps:
+        runtime_add = set(runtime_caps.get("add") or [])
+        runtime_drop = set(runtime_caps.get("drop") or [])
+        # A capability listed in both add and drop is ambiguous — the runtime
+        # applies drops before adds, so it would effectively stay granted.
+        # Runtime intent wins on a cross conflict: a template `add` cannot
+        # re-grant what the runtime drops (the egress NET_ADMIN drop is
+        # security-critical), and a template `drop` cannot revoke what the
+        # runtime needs to add.
+        template_add = {
+            cap for cap in (template_caps.get("add") or []) if cap not in runtime_drop
+        }
+        template_drop = {
+            cap for cap in (template_caps.get("drop") or []) if cap not in runtime_add
+        }
+        caps: Dict[str, Any] = {}
+        add = sorted(template_add | runtime_add)
+        drop = sorted(template_drop | runtime_drop)
+        if add:
+            caps["add"] = add
+        if drop:
+            caps["drop"] = drop
+        if caps:
+            merged["capabilities"] = caps
+        else:
+            merged.pop("capabilities", None)
+    return merged
+
+
 def _workload_platform_constraint_scope(
     workload: Dict[str, Any],
     pod_template_key: str,

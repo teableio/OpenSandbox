@@ -136,6 +136,7 @@ If `runtime.type = "kubernetes"` and the `[kubernetes]` table is absent, the ser
 | `write_qps` | float | `0` | K8s API **write** rate limit (QPS). **0** = unlimited. |
 | `write_burst` | integer | `0` | Burst for write limiter. |
 | `execd_init_resources` | table \| omitted | `null` | Optional resource requests/limits for the **execd init** container. |
+| `volume_subpath_precreate` | table \| omitted | `null` | Pre-create missing PVC `subPath` directories (owned by `uid:gid`) before creating workloads, so sandbox pods can run as a non-root user on shared RWX volumes. |
 
 ### BatchSandbox vs agent-sandbox
 
@@ -156,6 +157,47 @@ Kubernetes workloads are created by a **workload provider**. There is **no** `[b
 |-----|------|-------------|
 | `limits` | map string → string | e.g. `{ cpu = "100m", memory = "128Mi" }` |
 | `requests` | map string → string | e.g. `{ cpu = "50m", memory = "64Mi" }` |
+
+### `kubernetes.volume_subpath_precreate`
+
+kubelet creates missing `subPath` directories owned by `root:root`, which a
+non-root sandbox user cannot write to. With this table configured, the server
+creates the requested directories itself — owned by `uid:gid` — before the
+workload is created. The referenced PVCs must be mounted into the server pod at
+the paths given in `mounts`; claims not listed are skipped, as are read-only
+volumes.
+
+Listing a claim here declares that **the whole tree under that mount root is
+managed by this server for `uid:gid`**: every component of a requested subPath
+is created with that owner, and an existing component's owner is converged to
+it (which repairs directories kubelet created as root before this feature was
+enabled, and keeps concurrent replicas in agreement). Only directory entries
+are touched, never their contents — but do not point `mounts` at a volume whose
+directories belong to someone else.
+
+Each component is opened relative to its parent with `O_NOFOLLOW`, so a symlink
+cannot redirect the walk outside the mount root; an existing non-directory in
+the path is an error. When the server already runs as `uid:gid` the chown is
+skipped, so `CAP_CHOWN` is only needed if they differ. Failures abort the
+sandbox create rather than hand out a workspace the sandbox user cannot write
+to. POSIX hosts only — on other platforms the create fails with an explicit
+error instead of silently skipping the ownership work.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `uid` | integer | `1000` | Owner uid for created directories. |
+| `gid` | integer | `1000` | Owner gid for created directories. |
+| `dir_mode` | integer | `0o755` | Permission bits for created directories. |
+| `mounts` | map string → string | `{}` | PVC `claimName` → absolute path where that volume is mounted **inside the server pod**. |
+
+```toml
+[kubernetes.volume_subpath_precreate]
+uid = 1000
+gid = 1000
+
+[kubernetes.volume_subpath_precreate.mounts]
+"agent-data-pvc" = "/mnt/agent-data"
+```
 
 ---
 

@@ -46,6 +46,7 @@ from opensandbox_server.services.k8s.provider_common import (
     _container_to_dict,
     _extract_platform_unschedulable_message_from_pod,
     _workload_platform_constraint_scope,
+    merge_template_security_context,
 )
 from opensandbox_server.services.k8s.windows_profile import (
     apply_windows_profile_arch_selector,
@@ -54,6 +55,7 @@ from opensandbox_server.services.k8s.windows_profile import (
     validate_windows_profile_resource_limits,
 )
 from opensandbox_server.services.k8s.volume_helper import apply_volumes_to_pod_spec
+from opensandbox_server.services.k8s.volume_precreate import precreate_volume_subpaths
 from opensandbox_server.services.k8s.workload_provider import WorkloadProvider
 from opensandbox_server.services.runtime_resolver import SecureRuntimeResolver
 
@@ -78,6 +80,9 @@ class BatchSandboxProvider(WorkloadProvider):
         self.execd_init_resources = k8s_config.execd_init_resources if k8s_config else None
         self.sandbox_resource_requests = (
             k8s_config.sandbox_resource_requests if k8s_config else None
+        )
+        self.volume_subpath_precreate = (
+            k8s_config.volume_subpath_precreate if k8s_config else None
         )
         self.image_pull_policy = k8s_config.image_pull_policy if k8s_config else "IfNotPresent"
 
@@ -227,6 +232,7 @@ class BatchSandboxProvider(WorkloadProvider):
         )
 
         if volumes:
+            precreate_volume_subpaths(volumes, self.volume_subpath_precreate)
             apply_volumes_to_pod_spec(pod_spec, volumes)
 
         spec: Dict[str, Any] = {
@@ -259,6 +265,12 @@ class BatchSandboxProvider(WorkloadProvider):
         else:
             batchsandbox["spec"]["expireTime"] = expires_at.isoformat()
         self._merge_pod_spec_extras(batchsandbox, extra_volumes, extra_mounts, extra_env)
+        if not windows_profile:
+            # The Windows profile deliberately builds a privileged container
+            # with NET_ADMIN/NET_RAW; folding a hardening template
+            # (runAsNonRoot, drop ALL, allowPrivilegeEscalation=false) into it
+            # would produce a contradictory spec that cannot start.
+            self._merge_template_security_contexts(batchsandbox)
         if platform is not None and not windows_profile:
             merged_pod_spec = batchsandbox.get("spec", {}).get("template", {}).get("spec", {})
             WorkloadProvider.ensure_platform_compatible_with_affinity(merged_pod_spec, platform)
@@ -454,6 +466,81 @@ class BatchSandboxProvider(WorkloadProvider):
                 env.append(item)
                 existing.add(name)
             main_container["env"] = env
+
+    def _merge_template_security_contexts(self, batchsandbox: Dict[str, Any]) -> None:
+        """Apply template-declared container securityContexts to the runtime spec.
+
+        The deep merge replaces the ``containers`` list wholesale, so
+        container-level securityContext from the template would be lost (the
+        same reason volumes/mounts/env are merged back above). The template's
+        main container ("sandbox", or the first entry) maps onto the runtime
+        main container; init containers are matched by name.
+        """
+        template = self.template_manager.get_base_template()
+        template_spec = (
+            (template.get("spec", {}) if isinstance(template, dict) else {})
+            .get("template", {})
+            .get("spec", {})
+        )
+        if not isinstance(template_spec, dict):
+            return
+
+        main_sc: Optional[Dict[str, Any]] = None
+        template_containers = template_spec.get("containers", []) or []
+        if isinstance(template_containers, list) and template_containers:
+            target = None
+            for container in template_containers:
+                if isinstance(container, dict) and container.get("name") == "sandbox":
+                    target = container
+                    break
+            if target is None and isinstance(template_containers[0], dict):
+                target = template_containers[0]
+            if target is not None:
+                candidate = target.get("securityContext")
+                if isinstance(candidate, dict) and candidate:
+                    main_sc = candidate
+
+        init_scs: Dict[str, Dict[str, Any]] = {}
+        template_inits = template_spec.get("initContainers", []) or []
+        if isinstance(template_inits, list):
+            for container in template_inits:
+                if not isinstance(container, dict):
+                    continue
+                name = container.get("name")
+                candidate = container.get("securityContext")
+                if name and isinstance(candidate, dict) and candidate:
+                    init_scs[name] = candidate
+
+        if main_sc is None and not init_scs:
+            return
+
+        try:
+            spec = batchsandbox["spec"]["template"]["spec"]
+        except KeyError:
+            return
+
+        containers = spec.get("containers", []) or []
+        if main_sc is not None and isinstance(containers, list) and containers:
+            main_container = containers[0]
+            if isinstance(main_container, dict):
+                merged = merge_template_security_context(
+                    main_sc, main_container.get("securityContext")
+                )
+                if merged:
+                    main_container["securityContext"] = merged
+
+        if init_scs:
+            for init_container in spec.get("initContainers", []) or []:
+                if not isinstance(init_container, dict):
+                    continue
+                template_sc = init_scs.get(init_container.get("name"))
+                if template_sc is None:
+                    continue
+                merged = merge_template_security_context(
+                    template_sc, init_container.get("securityContext")
+                )
+                if merged:
+                    init_container["securityContext"] = merged
 
     def _build_task_template(
         self,

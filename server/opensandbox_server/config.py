@@ -622,6 +622,14 @@ class KubernetesRuntimeConfig(BaseModel):
             "If unset, no resource constraints are applied."
         ),
     )
+    volume_subpath_precreate: Optional["VolumeSubpathPrecreate"] = Field(
+        default=None,
+        description=(
+            "Pre-create missing PVC subPath directories (with the configured "
+            "owner) before creating sandbox workloads, so sandboxes can run "
+            "as a non-root user on shared volumes. Unset disables the feature."
+        ),
+    )
     sandbox_resource_requests: Optional[Dict[str, str]] = Field(
         default=None,
         description=(
@@ -667,6 +675,42 @@ class ExecdInitResources(BaseModel):
     requests: Optional[Dict[str, str]] = Field(
         default=None,
         description='Resource requests, e.g. {cpu = "50m", memory = "64Mi"}.',
+    )
+
+
+class VolumeSubpathPrecreate(BaseModel):
+    """Pre-create missing PVC subPath directories from the control plane.
+
+    When sandbox pods run as a non-root user on shared RWX volumes, kubelet
+    creates missing subPath directories owned by root:root, which the sandbox
+    user cannot write to. With this block configured, the server creates the
+    requested subPath directories (owned by uid/gid) before creating the
+    workload. The referenced PVCs must be mounted into the server pod at the
+    paths given in ``mounts``.
+    """
+
+    uid: int = Field(
+        default=1000,
+        ge=0,
+        description="Owner uid applied to directories created by the server.",
+    )
+    gid: int = Field(
+        default=1000,
+        ge=0,
+        description="Owner gid applied to directories created by the server.",
+    )
+    dir_mode: int = Field(
+        default=0o755,
+        ge=0,
+        le=0o777,
+        description='Permission bits for created directories, e.g. 0o755.',
+    )
+    mounts: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Map of PVC claimName to the absolute path where that volume is "
+            "mounted inside the server pod. Claims not listed here are skipped."
+        ),
     )
 
 
