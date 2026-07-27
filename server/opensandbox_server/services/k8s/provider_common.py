@@ -246,6 +246,43 @@ def _container_to_dict(container: V1Container) -> Dict[str, Any]:
     return result
 
 
+def merge_template_security_context(
+    template_sc: Optional[Dict[str, Any]],
+    runtime_sc: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Merge a template-declared container securityContext with the runtime one.
+
+    Runtime-generated fields win on conflicts — they carry feature-critical
+    settings (the egress NET_ADMIN drop, isolation seccomp/AppArmor overrides).
+    Capability ``add``/``drop`` lists are unioned instead, so template
+    hardening such as ``drop: [ALL]`` survives alongside runtime drops.
+    """
+    if not template_sc:
+        return runtime_sc
+    if not runtime_sc:
+        return {k: v for k, v in template_sc.items()}
+
+    merged = {
+        **template_sc,
+        **{k: v for k, v in runtime_sc.items() if k != "capabilities"},
+    }
+    template_caps = template_sc.get("capabilities") or {}
+    runtime_caps = runtime_sc.get("capabilities") or {}
+    if template_caps or runtime_caps:
+        caps: Dict[str, Any] = {}
+        add = sorted({*(template_caps.get("add") or []), *(runtime_caps.get("add") or [])})
+        drop = sorted({*(template_caps.get("drop") or []), *(runtime_caps.get("drop") or [])})
+        if add:
+            caps["add"] = add
+        if drop:
+            caps["drop"] = drop
+        if caps:
+            merged["capabilities"] = caps
+        else:
+            merged.pop("capabilities", None)
+    return merged
+
+
 def _workload_platform_constraint_scope(
     workload: Dict[str, Any],
     pod_template_key: str,

@@ -136,6 +136,7 @@ If `runtime.type = "kubernetes"` and the `[kubernetes]` table is absent, the ser
 | `write_qps` | float | `0` | K8s API **write** rate limit (QPS). **0** = unlimited. |
 | `write_burst` | integer | `0` | Burst for write limiter. |
 | `execd_init_resources` | table \| omitted | `null` | Optional resource requests/limits for the **execd init** container. |
+| `volume_subpath_precreate` | table \| omitted | `null` | Pre-create missing PVC `subPath` directories (owned by `uid:gid`) before creating workloads, so sandbox pods can run as a non-root user on shared RWX volumes. |
 
 ### BatchSandbox vs agent-sandbox
 
@@ -156,6 +157,31 @@ Kubernetes workloads are created by a **workload provider**. There is **no** `[b
 |-----|------|-------------|
 | `limits` | map string → string | e.g. `{ cpu = "100m", memory = "128Mi" }` |
 | `requests` | map string → string | e.g. `{ cpu = "50m", memory = "64Mi" }` |
+
+### `kubernetes.volume_subpath_precreate`
+
+kubelet creates missing `subPath` directories owned by `root:root`, which a
+non-root sandbox user cannot write to. With this table configured, the server
+creates the requested directories itself — owned by `uid:gid` — before the
+workload is created. The referenced PVCs must be mounted into the server pod at
+the paths given in `mounts`; claims not listed are skipped, as are read-only
+volumes. Ownership is only applied to directories the server creates.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `uid` | integer | `1000` | Owner uid for created directories. |
+| `gid` | integer | `1000` | Owner gid for created directories. |
+| `dir_mode` | integer | `0o755` | Permission bits for created directories. |
+| `mounts` | map string → string | `{}` | PVC `claimName` → absolute path where that volume is mounted **inside the server pod**. |
+
+```toml
+[kubernetes.volume_subpath_precreate]
+uid = 1000
+gid = 1000
+
+[kubernetes.volume_subpath_precreate.mounts]
+"agent-data-pvc" = "/mnt/agent-data"
+```
 
 ---
 

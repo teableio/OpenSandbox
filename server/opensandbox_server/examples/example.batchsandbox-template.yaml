@@ -16,3 +16,19 @@ spec:
       restartPolicy: Never
       tolerations:
         - operator: "Exists"
+      # Container entries are matched onto the runtime-generated containers:
+      # volumeMounts, env and securityContext declared on the "sandbox"
+      # container (and, for securityContext, on initContainers matched by
+      # name) are merged into the pod the server creates. For securityContext,
+      # runtime-generated fields win on conflict and capability add/drop lists
+      # are unioned, e.g.:
+      #   containers:
+      #     - name: sandbox
+      #       securityContext:
+      #         allowPrivilegeEscalation: false
+      #         capabilities:
+      #           drop: ["ALL"]
+      #   initContainers:
+      #     - name: execd-installer
+      #       securityContext:
+      #         allowPrivilegeEscalation: false

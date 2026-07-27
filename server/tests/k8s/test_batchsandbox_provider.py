@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 from fastapi import HTTPException
 from kubernetes.client import ApiException
 
-from opensandbox_server.api.schema import ImageSpec, ImageAuth, NetworkPolicy, NetworkRule, PlatformSpec
+from opensandbox_server.api.schema import ImageSpec, ImageAuth, NetworkPolicy, NetworkRule, PlatformSpec, PVC, Volume
 from opensandbox_server.config import (
     AppConfig,
     EGRESS_MODE_DNS,
@@ -28,6 +28,7 @@ from opensandbox_server.config import (
     ExecdInitResources,
     KubernetesRuntimeConfig,
     RuntimeConfig,
+    VolumeSubpathPrecreate,
 )
 from opensandbox_server.services.constants import SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY
 from opensandbox_server.services.k8s.batchsandbox_provider import BatchSandboxProvider
@@ -2942,3 +2943,165 @@ spec:
         assert by_path["/path/to/skills"].get("subPath") == "skill-hub/publish"
         assert by_path["/path/to/draft"]["name"] == "skills"
         assert by_path["/path/to/draft"].get("subPath") == "skill-hub/draft"
+
+
+class TestTemplateSecurityContextMerge:
+    """Template container-level securityContext survives the container-list replace."""
+
+    SC_TEMPLATE = """
+spec:
+  template:
+    spec:
+      containers:
+        - name: sandbox
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+      initContainers:
+        - name: execd-installer
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+"""
+
+    def _provider_with_template(self, mock_k8s_client, tmp_path, content: str):
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(content)
+        provider = BatchSandboxProvider(
+            mock_k8s_client, _app_config_with_template(str(template_file))
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "uid"}
+        }
+        return provider
+
+    def _create(self, provider, **overrides):
+        kwargs = dict(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:latest",
+        )
+        kwargs.update(overrides)
+        provider.create_workload(**kwargs)
+
+    def test_template_security_context_applies_to_main_and_init(
+        self, mock_k8s_client, tmp_path
+    ):
+        provider = self._provider_with_template(
+            mock_k8s_client, tmp_path, self.SC_TEMPLATE
+        )
+
+        self._create(provider)
+
+        spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"][
+            "template"
+        ]["spec"]
+        main_sc = spec["containers"][0]["securityContext"]
+        assert main_sc["allowPrivilegeEscalation"] is False
+        assert main_sc["runAsNonRoot"] is True
+        assert main_sc["capabilities"] == {"drop": ["ALL"]}
+        init_sc = spec["initContainers"][0]["securityContext"]
+        assert init_sc["allowPrivilegeEscalation"] is False
+        assert init_sc["capabilities"] == {"drop": ["ALL"]}
+
+    def test_runtime_egress_drops_union_with_template_drops(
+        self, mock_k8s_client, tmp_path
+    ):
+        provider = self._provider_with_template(
+            mock_k8s_client, tmp_path, self.SC_TEMPLATE
+        )
+
+        self._create(
+            provider,
+            network_policy=NetworkPolicy(
+                default_action="deny",
+                egress=[NetworkRule(action="allow", target="pypi.org")],
+            ),
+            egress_image="opensandbox/egress:test",
+        )
+
+        spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"][
+            "template"
+        ]["spec"]
+        main_sc = spec["containers"][0]["securityContext"]
+        # Template hardening and the runtime NET_ADMIN drop must both survive.
+        assert main_sc["capabilities"]["drop"] == ["ALL", "NET_ADMIN"]
+        assert main_sc["allowPrivilegeEscalation"] is False
+
+    def test_no_template_security_context_keeps_runtime_behavior(
+        self, mock_k8s_client, tmp_path
+    ):
+        provider = self._provider_with_template(
+            mock_k8s_client,
+            tmp_path,
+            "spec:\n  template:\n    spec:\n      containers:\n        - name: sandbox\n",
+        )
+
+        self._create(provider)
+
+        spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"][
+            "template"
+        ]["spec"]
+        assert "securityContext" not in spec["containers"][0]
+
+
+class TestVolumeSubpathPrecreateWiring:
+    """create_workload pre-creates rw PVC subPath dirs when configured."""
+
+    def test_create_workload_precreates_configured_subpaths(
+        self, mock_k8s_client, tmp_path, monkeypatch
+    ):
+        import os as os_module
+
+        monkeypatch.setattr(os_module, "geteuid", lambda: 1000)
+        monkeypatch.setattr(os_module, "getegid", lambda: 1000)
+        mount_root = tmp_path / "juicefs"
+        mount_root.mkdir()
+        config = AppConfig(
+            runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+            kubernetes=KubernetesRuntimeConfig(
+                namespace="test-ns",
+                volume_subpath_precreate=VolumeSubpathPrecreate(
+                    uid=1000, gid=1000, mounts={"agent-data": str(mount_root)}
+                ),
+            ),
+        )
+        provider = BatchSandboxProvider(mock_k8s_client, config)
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:latest",
+            volumes=[
+                Volume(
+                    name="uploads",
+                    pvc=PVC(claim_name="agent-data"),
+                    mount_path="/home/agent/uploads",
+                    read_only=False,
+                    sub_path="teable/user/u1/uploads",
+                )
+            ],
+        )
+
+        assert (mount_root / "teable" / "user" / "u1" / "uploads").is_dir()
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        mounts = body["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+        assert any(m.get("subPath") == "teable/user/u1/uploads" for m in mounts)
