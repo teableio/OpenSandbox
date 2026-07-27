@@ -83,7 +83,71 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 		cred.Gid = *gid
 	}
 
+	// Requesting the identity we already run as is a no-op switch, and doing it
+	// anyway breaks unprivileged sandboxes: the child calls setgroups(2), which
+	// always requires CAP_SETGID, and a container running as a non-root user has
+	// an empty effective capability set. The fork would fail with EPERM
+	// ("fork/exec /usr/bin/bash: operation not permitted") even though no
+	// privilege change was ever needed. Inheriting the current credentials
+	// yields exactly the requested identity.
+	if credentialIsCurrentProcess(cred) {
+		return nil, nil //nolint:nilnil
+	}
+
 	return cred, nil
+}
+
+// credentialIsCurrentProcess reports whether inheriting our credentials gives
+// the child everything cred asks for. Real and effective IDs must both match,
+// so a process that is mid-switch (or on a platform without POSIX IDs, where
+// these return -1) still takes the explicit path.
+//
+// The requested groups must be a subset of ours. Equal sets are the common
+// case. Where they are not, this is a deliberate policy choice rather than a
+// strict equivalence: the child may keep supplemental groups the request did
+// not name. Those come from how the container was started, and every process
+// in it — including the caller issuing this request — already carries them,
+// so the command gains nothing its own container does not already have. A
+// requested group we do *not* hold is the opposite case and would be lost by
+// inheriting, so it takes the explicit path and fails loudly rather than
+// silently running with less access than asked for.
+func credentialIsCurrentProcess(cred *syscall.Credential) bool {
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid < 0 || gid < 0 {
+		return false
+	}
+	if uid != os.Geteuid() || gid != os.Getegid() {
+		return false
+	}
+	if cred.Uid != uint32(uid) || cred.Gid != uint32(gid) {
+		return false
+	}
+
+	current, err := os.Getgroups()
+	if err != nil {
+		return false
+	}
+	return groupsAreSubset(cred.Groups, current, cred.Gid)
+}
+
+// groupsAreSubset reports whether every group in requested is one we hold.
+// The primary gid counts as held on both sides: getgroups(2) is not required
+// to list it, and the caller may or may not include it in the request.
+func groupsAreSubset(requested []uint32, current []int, primaryGid uint32) bool {
+	held := make(map[uint32]struct{}, len(current)+1)
+	held[primaryGid] = struct{}{}
+	for _, g := range current {
+		if g < 0 {
+			return false
+		}
+		held[uint32(g)] = struct{}{}
+	}
+	for _, g := range requested {
+		if _, ok := held[g]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // runCommand executes shell commands and streams their output.
