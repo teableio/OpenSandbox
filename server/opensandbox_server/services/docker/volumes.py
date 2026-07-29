@@ -39,6 +39,7 @@ from opensandbox_server.services.validators import (
     ensure_valid_host_path,
     ensure_volumes_valid,
 )
+from opensandbox_server.services.volume_precreate import precreate_volume_subpaths
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ class DockerVolumesMixin:
                         auto_created_volumes.append(volume.pvc.claim_name)
                 elif volume.ossfs is not None:
                     self._validate_ossfs_volume(volume)
+            self._precreate_pvc_subpaths(request)
         except Exception:
             # If any subsequent volume validation fails, remove volumes we
             # already auto-created so they don't leak — delete_sandbox will
@@ -100,6 +102,30 @@ class DockerVolumesMixin:
             raise
 
         return pvc_inspect_cache, auto_created_volumes
+
+    def _precreate_pvc_subpaths(self, request) -> None:
+        """Pre-create pvc subPath directories with the configured owner.
+
+        dockerd creates a missing bind source (the named volume's Mountpoint +
+        subPath) owned by root:root, which a non-root sandbox user cannot
+        write to — the Docker-runtime twin of kubelet's subPath behavior.
+        With ``docker.volume_subpath_precreate`` configured, create the
+        directories first through the volume's mount inside the server
+        container; claims not in the mounts map and read-only volumes are
+        skipped.
+        """
+        try:
+            precreate_volume_subpaths(
+                request.volumes, self.app_config.docker.volume_subpath_precreate
+            )
+        except RuntimeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.SUBPATH_PRECREATE_FAILED,
+                    "message": str(e),
+                },
+            ) from e
 
     @staticmethod
     def _validate_host_volume(volume, allowed_prefixes: Optional[list[str]]) -> None:

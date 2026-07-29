@@ -31,6 +31,7 @@ from opensandbox_server.config import (
     ServerConfig,
     StorageConfig,
     IngressConfig,
+    VolumeSubpathPrecreate,
 )
 from opensandbox_server.extensions import ACCESS_RENEW_EXTEND_SECONDS_METADATA_KEY
 from opensandbox_server.services.constants import (
@@ -3498,6 +3499,189 @@ class TestDockerVolumeValidation:
 
         host_config_call = mock_client.api.create_host_config.call_args
         assert "binds" not in host_config_call.kwargs
+
+
+@pytest.mark.skipif(os.name != "posix", reason="subPath precreate is POSIX-only")
+@patch("opensandbox_server.services.docker.docker_service.docker")
+class TestDockerVolumeSubpathPrecreate:
+    """_validate_volumes pre-creates rw pvc subPath dirs when configured."""
+
+    @staticmethod
+    def _config_with_precreate(mounts: dict[str, str]) -> AppConfig:
+        # uid/gid = the test process so the chown branch is skipped; ownership
+        # mechanics are covered by tests/test_volume_precreate.py.
+        return AppConfig(
+            server=ServerConfig(),
+            runtime=RuntimeConfig(
+                type="docker", execd_image="ghcr.io/opensandbox/platform:latest"
+            ),
+            ingress=IngressConfig(mode="direct"),
+            docker=DockerConfig(
+                volume_subpath_precreate=VolumeSubpathPrecreate(
+                    uid=os.geteuid(), gid=os.getegid(), mounts=mounts
+                )
+            ),
+        )
+
+    @staticmethod
+    def _mock_client(mountpoint: str = "/var/lib/docker/volumes/agent-data/_data"):
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = []
+        mock_client.api.inspect_volume.return_value = {
+            "Name": "agent-data",
+            "Driver": "local",
+            "Mountpoint": mountpoint,
+        }
+        return mock_client
+
+    def test_precreates_rw_subpath_dirs(self, mock_docker, tmp_path):
+        mock_docker.from_env.return_value = self._mock_client()
+        service = DockerSandboxService(
+            config=self._config_with_precreate({"agent-data": str(tmp_path)})
+        )
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=120,
+            resourceLimits=ResourceLimits(root={}),
+            env={},
+            metadata={},
+            entrypoint=["python"],
+            volumes=[
+                Volume(
+                    name="generations",
+                    pvc=PVC(claim_name="agent-data"),
+                    mount_path="/home/agent/.teable/generations",
+                    read_only=False,
+                    sub_path="teable/app/a1/generations",
+                ),
+                Volume(
+                    name="skills",
+                    pvc=PVC(claim_name="agent-data"),
+                    mount_path="/home/agent/.teable/skills",
+                    read_only=True,
+                    sub_path="teable/app/a1/skills",
+                ),
+            ],
+        )
+
+        service._validate_volumes(request)
+
+        assert (tmp_path / "teable" / "app" / "a1" / "generations").is_dir()
+        # Read-only volumes are externally provisioned content — never created.
+        assert not (tmp_path / "teable" / "app" / "a1" / "skills").exists()
+
+    def test_claim_not_in_mounts_is_skipped(self, mock_docker, tmp_path):
+        mock_docker.from_env.return_value = self._mock_client()
+        service = DockerSandboxService(
+            config=self._config_with_precreate({"other-claim": str(tmp_path)})
+        )
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=120,
+            resourceLimits=ResourceLimits(root={}),
+            env={},
+            metadata={},
+            entrypoint=["python"],
+            volumes=[
+                Volume(
+                    name="data",
+                    pvc=PVC(claim_name="agent-data"),
+                    mount_path="/mnt/data",
+                    read_only=False,
+                    sub_path="teable/app/a1",
+                )
+            ],
+        )
+
+        service._validate_volumes(request)
+
+        assert not (tmp_path / "teable").exists()
+
+    def test_unconfigured_precreate_is_a_noop(self, mock_docker):
+        mock_docker.from_env.return_value = self._mock_client()
+        service = DockerSandboxService(config=_app_config())
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=120,
+            resourceLimits=ResourceLimits(root={}),
+            env={},
+            metadata={},
+            entrypoint=["python"],
+            volumes=[
+                Volume(
+                    name="data",
+                    pvc=PVC(claim_name="agent-data"),
+                    mount_path="/mnt/data",
+                    read_only=False,
+                    sub_path="teable/app/a1",
+                )
+            ],
+        )
+
+        cache, auto_created = service._validate_volumes(request)
+        assert "agent-data" in cache
+        assert auto_created == []
+
+    def test_precreate_failure_maps_to_http_500_and_cleans_up(
+        self, mock_docker, tmp_path
+    ):
+        """A failing precreate surfaces as HTTP 500 and removes auto-created volumes."""
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = []
+        # First inspect: volume missing -> auto-create; later inspects (incl.
+        # cleanup's label check) return the managed volume.
+        managed = {
+            "Name": "agent-data",
+            "Driver": "local",
+            "Mountpoint": "/var/lib/docker/volumes/agent-data/_data",
+            "Labels": {"opensandbox.io/volume-managed-by": "server"},
+        }
+        mock_client.api.inspect_volume.side_effect = [
+            DockerNotFound("volume not found"),
+            managed,
+            managed,
+        ]
+        mock_client.api.create_volume.return_value = {}
+        mock_docker.from_env.return_value = mock_client
+
+        missing_root = tmp_path / "not-mounted"
+        service = DockerSandboxService(
+            config=self._config_with_precreate({"agent-data": str(missing_root)})
+        )
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=120,
+            resourceLimits=ResourceLimits(root={}),
+            env={},
+            metadata={},
+            entrypoint=["python"],
+            volumes=[
+                Volume(
+                    name="data",
+                    pvc=PVC(
+                        claim_name="agent-data",
+                        create_if_not_exists=True,
+                        delete_on_sandbox_termination=True,
+                    ),
+                    mount_path="/mnt/data",
+                    read_only=False,
+                    sub_path="teable/app/a1",
+                )
+            ],
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            service._validate_volumes(request)
+
+        assert exc_info.value.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert (
+            exc_info.value.detail["code"] == SandboxErrorCodes.SUBPATH_PRECREATE_FAILED
+        )
+        mock_client.api.remove_volume.assert_called_once_with("agent-data")
 
 
 def test_docker_get_endpoint_rejects_expires():

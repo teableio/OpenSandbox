@@ -681,12 +681,14 @@ class ExecdInitResources(BaseModel):
 class VolumeSubpathPrecreate(BaseModel):
     """Pre-create missing PVC subPath directories from the control plane.
 
-    When sandbox pods run as a non-root user on shared RWX volumes, kubelet
+    When sandboxes run as a non-root user on shared volumes, the node runtime
     creates missing subPath directories owned by root:root, which the sandbox
-    user cannot write to. With this block configured, the server creates the
-    requested subPath directories (owned by uid/gid) before creating the
-    workload. The referenced PVCs must be mounted into the server pod at the
-    paths given in ``mounts``.
+    user cannot write to — kubelet for PVC subPaths, dockerd for the bind
+    sources the Docker runtime resolves from a named volume's Mountpoint +
+    subPath. With this block configured, the server creates the requested
+    subPath directories (owned by uid/gid) before creating the workload or
+    container. The referenced volumes must be mounted into the server pod or
+    container at the paths given in ``mounts``.
     """
 
     uid: int = Field(
@@ -708,8 +710,9 @@ class VolumeSubpathPrecreate(BaseModel):
     mounts: Dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Map of PVC claimName to the absolute path where that volume is "
-            "mounted inside the server pod. Claims not listed here are skipped."
+            "Map of claimName (Kubernetes PVC claim / Docker named volume "
+            "name) to the absolute path where that volume is mounted inside "
+            "the server pod or container. Claims not listed here are skipped."
         ),
     )
 
@@ -926,6 +929,18 @@ class DockerConfig(BaseModel):
             "Host bind mounts applied to every sandbox container, in Docker -v syntax "
             "(host_path:container_path[:mode]). Prepended to the binds derived from a request's "
             "volumes. Useful for mounting a private CA certificate into all sandboxes."
+        ),
+    )
+    volume_subpath_precreate: Optional[VolumeSubpathPrecreate] = Field(
+        default=None,
+        description=(
+            "Docker-runtime counterpart of kubernetes.volume_subpath_precreate: "
+            "pre-create missing pvc subPath directories (with the configured "
+            "owner) before creating the sandbox container, so sandboxes can run "
+            "as a non-root user on shared named volumes — dockerd otherwise "
+            "creates the missing bind sources owned by root:root. The referenced "
+            "named volumes must be mounted into the server container at the "
+            "paths given in mounts. Unset disables the feature."
         ),
     )
 

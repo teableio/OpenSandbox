@@ -55,7 +55,7 @@ from opensandbox_server.services.k8s.windows_profile import (
     validate_windows_profile_resource_limits,
 )
 from opensandbox_server.services.k8s.volume_helper import apply_volumes_to_pod_spec
-from opensandbox_server.services.k8s.volume_precreate import precreate_volume_subpaths
+from opensandbox_server.services.volume_precreate import precreate_volume_subpaths
 from opensandbox_server.services.k8s.workload_provider import WorkloadProvider
 from opensandbox_server.services.runtime_resolver import SecureRuntimeResolver
 
