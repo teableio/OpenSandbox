@@ -3549,27 +3549,27 @@ class TestDockerVolumeSubpathPrecreate:
             entrypoint=["python"],
             volumes=[
                 Volume(
-                    name="generations",
+                    name="workdir",
                     pvc=PVC(claim_name="agent-data"),
-                    mount_path="/home/agent/.teable/generations",
+                    mount_path="/mnt/work",
                     read_only=False,
-                    sub_path="teable/app/a1/generations",
+                    sub_path="users/u1/work",
                 ),
                 Volume(
-                    name="skills",
+                    name="models",
                     pvc=PVC(claim_name="agent-data"),
-                    mount_path="/home/agent/.teable/skills",
+                    mount_path="/mnt/models",
                     read_only=True,
-                    sub_path="teable/app/a1/skills",
+                    sub_path="users/u1/models",
                 ),
             ],
         )
 
         service._validate_volumes(request)
 
-        assert (tmp_path / "teable" / "app" / "a1" / "generations").is_dir()
+        assert (tmp_path / "users" / "u1" / "work").is_dir()
         # Read-only volumes are externally provisioned content — never created.
-        assert not (tmp_path / "teable" / "app" / "a1" / "skills").exists()
+        assert not (tmp_path / "users" / "u1" / "models").exists()
 
     def test_claim_not_in_mounts_is_skipped(self, mock_docker, tmp_path):
         mock_docker.from_env.return_value = self._mock_client()
@@ -3590,14 +3590,14 @@ class TestDockerVolumeSubpathPrecreate:
                     pvc=PVC(claim_name="agent-data"),
                     mount_path="/mnt/data",
                     read_only=False,
-                    sub_path="teable/app/a1",
+                    sub_path="users/u1",
                 )
             ],
         )
 
         service._validate_volumes(request)
 
-        assert not (tmp_path / "teable").exists()
+        assert not (tmp_path / "users").exists()
 
     def test_unconfigured_precreate_is_a_noop(self, mock_docker):
         mock_docker.from_env.return_value = self._mock_client()
@@ -3616,7 +3616,7 @@ class TestDockerVolumeSubpathPrecreate:
                     pvc=PVC(claim_name="agent-data"),
                     mount_path="/mnt/data",
                     read_only=False,
-                    sub_path="teable/app/a1",
+                    sub_path="users/u1",
                 )
             ],
         )
@@ -3669,7 +3669,7 @@ class TestDockerVolumeSubpathPrecreate:
                     ),
                     mount_path="/mnt/data",
                     read_only=False,
-                    sub_path="teable/app/a1",
+                    sub_path="users/u1",
                 )
             ],
         )
