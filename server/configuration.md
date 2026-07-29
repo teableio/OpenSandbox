@@ -110,6 +110,42 @@ Example files in this repository:
 | `pids_limit` | integer \| null | `4096` | Max PIDs per sandbox container; set to **`null`** to disable the limit. |
 | `sandbox_env` | table | `{}` | Environment variables injected into **every** sandbox container; keys from a creation request override same-named keys. Docker-runtime counterpart of the Kubernetes pod template (e.g. `NODE_EXTRA_CA_CERTS` to trust a private CA, together with `sandbox_binds`). |
 | `sandbox_binds` | string[] | `[]` | Host bind mounts applied to **every** sandbox container, Docker `-v` syntax (`host:container[:mode]`); prepended to binds derived from a request's `volumes`. |
+| `volume_subpath_precreate` | table \| omitted | `null` | Pre-create missing `pvc` `subPath` directories (owned by `uid:gid`) before creating sandbox containers, so sandboxes can run as a non-root user on shared named volumes. See [`docker.volume_subpath_precreate`](#dockervolume_subpath_precreate). |
+
+### `docker.volume_subpath_precreate`
+
+Docker-runtime counterpart of
+[`kubernetes.volume_subpath_precreate`](#kubernetesvolume_subpath_precreate),
+sharing its keys and semantics. When a request mounts a `pvc` (Docker named
+volume) with a `subPath`, the server resolves the bind source as the volume's
+`Mountpoint` + `subPath`; if that directory does not exist, dockerd creates it
+owned by `root:root`, which a non-root sandbox user cannot write to. With this
+table configured, the server creates the directories itself — owned by
+`uid:gid` — through the volume's mount inside the server container, before the
+sandbox container is created.
+
+`mounts` maps the Docker named volume name (`pvc.claimName`) to the absolute
+path where that volume is mounted **inside the server container** — the volume
+must be mounted there for the feature to work. Claims not listed and read-only
+volumes are skipped, as are whole-volume mounts without `subPath` (Docker's
+own copy-up already gives those image-defined ownership).
+
+```toml
+[docker.volume_subpath_precreate]
+uid = 1000
+gid = 1000
+
+[docker.volume_subpath_precreate.mounts]
+"agent-data" = "/mnt/agent-data"
+```
+
+```yaml
+# docker-compose: give the server the same view of the shared volume
+services:
+  opensandbox-server:
+    volumes:
+      - agent-data:/mnt/agent-data
+```
 
 ---
 

@@ -18,7 +18,7 @@ import pytest
 
 from opensandbox_server.api.schema import PVC, Volume
 from opensandbox_server.config import VolumeSubpathPrecreate
-from opensandbox_server.services.k8s.volume_precreate import precreate_volume_subpaths
+from opensandbox_server.services.volume_precreate import precreate_volume_subpaths
 
 # The feature targets Linux sandbox nodes and uses POSIX-only primitives
 # (O_DIRECTORY/O_NOFOLLOW, mkdir(dir_fd=), fchown), so these tests only run

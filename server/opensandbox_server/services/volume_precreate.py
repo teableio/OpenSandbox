@@ -14,11 +14,14 @@
 
 """Control-plane pre-creation of PVC subPath directories.
 
-kubelet creates missing subPath directories owned by root:root (0755), which a
-non-root sandbox user cannot write to. When ``kubernetes.volume_subpath_precreate``
-is configured, the server creates the requested directories itself — owned by
-the configured uid/gid — before the workload is created, so sandbox pods never
-need root to fix ownership.
+Both node runtimes create missing subPath directories owned by root:root
+(0755), which a non-root sandbox user cannot write to: kubelet for PVC
+subPaths, dockerd for the bind-mount sources the Docker runtime derives from a
+named volume's Mountpoint + subPath. When ``kubernetes.volume_subpath_precreate``
+or ``docker.volume_subpath_precreate`` is configured, the server creates the
+requested directories itself — owned by the configured uid/gid — before the
+workload or container is created, so sandboxes never need root to fix
+ownership.
 """
 
 import logging
@@ -43,7 +46,7 @@ def _require_posix() -> None:
     if os.name != "posix":
         raise RuntimeError(
             "subPath precreate requires a POSIX host "
-            f"(os.name={os.name!r}); disable kubernetes.volume_subpath_precreate"
+            f"(os.name={os.name!r}); disable volume_subpath_precreate"
         )
 
 
@@ -183,7 +186,8 @@ def _mkdir_or_open_dir(
         # Converge ownership of directories we adopt. This is idempotent, so
         # concurrent replicas agree, and it closes two gaps: another replica
         # that created the directory but has not chowned it yet, and legacy
-        # directories kubelet created as root before this feature existed.
+        # directories the node runtime created as root before this feature
+        # existed.
         # Only the directory entry itself is touched, never its contents.
         if chown_needed:
             try:
