@@ -257,6 +257,20 @@ class TestPrecreateVolumeSubpaths:
 
         assert (tmp_path / "teable").stat().st_mode & 0o777 == 0o755
 
+    def test_setgid_dir_mode_is_accepted_and_applied(self, tmp_path, monkeypatch):
+        # A control plane running as the storage owner uses setgid + group-write
+        # (0o2775) so sandboxes with a matching supplementary group can write;
+        # the config bound must not reject bits above 0o777.
+        monkeypatch.setattr(os, "geteuid", lambda: 1000)
+        monkeypatch.setattr(os, "getegid", lambda: 1000)
+        precreate = VolumeSubpathPrecreate(
+            uid=1000, gid=1000, dir_mode=0o2775, mounts={"agent-data": str(tmp_path)}
+        )
+
+        precreate_volume_subpaths([_rw_pvc_volume("agent-data", "teable")], precreate)
+
+        assert (tmp_path / "teable").stat().st_mode & 0o7777 == 0o2775
+
     def test_missing_mount_root_raises(self, tmp_path):
         precreate = VolumeSubpathPrecreate(
             mounts={"agent-data": str(tmp_path / "not-mounted")}

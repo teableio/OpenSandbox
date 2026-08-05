@@ -704,8 +704,11 @@ class VolumeSubpathPrecreate(BaseModel):
     dir_mode: int = Field(
         default=0o755,
         ge=0,
-        le=0o777,
-        description='Permission bits for created directories, e.g. 0o755.',
+        le=0o7777,
+        description=(
+            "Mode bits for created directories, e.g. 0o755, or 0o2775 to "
+            "combine group-write with setgid group inheritance."
+        ),
     )
     mounts: Dict[str, str] = Field(
         default_factory=dict,
