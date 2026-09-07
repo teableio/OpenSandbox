@@ -78,6 +78,19 @@ def _app_config_with_sandbox_resource_requests(resource_requests: dict[str, str]
         ),
     )
 
+def _app_config_with_execd_delivery(
+    execd_delivery: str, *, egress_disable_ipv6: bool = False
+) -> AppConfig:
+    """Build an AppConfig with ``kubernetes.execd_delivery`` set."""
+    return AppConfig(
+        runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+        kubernetes=KubernetesRuntimeConfig(
+            namespace="test-ns",
+            execd_delivery=execd_delivery,
+        ),
+        egress=EgressConfig(disable_ipv6=egress_disable_ipv6),
+    )
+
 def _app_config_with_egress_disable_ipv6(disable_ipv6: bool = True) -> AppConfig:
     """Build an AppConfig with ``egress.disable_ipv6`` set (privileged execd init when egress is used)."""
     return AppConfig(
@@ -399,6 +412,72 @@ spec:
         assert init_container["volumeMounts"][0]["name"] == "opensandbox-bin"
         # No resources configured: resources field should be absent
         assert "resources" not in init_container
+
+    def test_create_workload_image_volume_delivery_skips_init_container(self, mock_k8s_client):
+        provider = BatchSandboxProvider(
+            mock_k8s_client,
+            _app_config_with_execd_delivery("image_volume"),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test", "uid": "uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:test",
+        )
+
+        pod_spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"]["template"]["spec"]
+
+        assert "initContainers" not in pod_spec
+        bin_volume = next(v for v in pod_spec["volumes"] if v["name"] == "opensandbox-bin")
+        # No pullPolicy: Kubernetes applies the same default the init container had.
+        assert bin_volume == {"name": "opensandbox-bin", "image": {"reference": "execd:test"}}
+        # The main container keeps the same mount and bootstrap wrapper.
+        main = pod_spec["containers"][0]
+        assert {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox/bin"} in main["volumeMounts"]
+        assert main["command"][0] == "/opt/opensandbox/bin/bootstrap.sh"
+
+    def test_create_workload_image_volume_delivery_keeps_init_for_egress_disable_ipv6(self, mock_k8s_client):
+        provider = BatchSandboxProvider(
+            mock_k8s_client,
+            _app_config_with_execd_delivery("image_volume", egress_disable_ipv6=True),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test", "uid": "uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:test",
+            network_policy=NetworkPolicy(
+                default_action="deny",
+                egress=[NetworkRule(action="allow", target="pypi.org")],
+            ),
+            egress_image="opensandbox/egress:v1.0.12",
+        )
+
+        pod_spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"]["template"]["spec"]
+
+        # The sysctl prelude needs the privileged init container, so the
+        # emptyDir path wins over image_volume here.
+        assert pod_spec["initContainers"][0]["name"] == "execd-installer"
+        bin_volume = next(v for v in pod_spec["volumes"] if v["name"] == "opensandbox-bin")
+        assert bin_volume == {"name": "opensandbox-bin", "emptyDir": {}}
 
     def test_create_workload_init_container_with_configured_resources(self, mock_k8s_client):
         provider = BatchSandboxProvider(
@@ -2994,6 +3073,39 @@ spec:
         )
         kwargs.update(overrides)
         provider.create_workload(**kwargs)
+
+    def test_image_volume_delivery_drops_template_installer_stub(
+        self, mock_k8s_client, tmp_path
+    ):
+        # The template only carries a securityContext for execd-installer.
+        # With image_volume there is no installer, so the stub (no image)
+        # must not survive the deep merge, while the main container's
+        # securityContext still does.
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(self.SC_TEMPLATE)
+        provider = BatchSandboxProvider(
+            mock_k8s_client,
+            AppConfig(
+                runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+                kubernetes=KubernetesRuntimeConfig(
+                    namespace="test-ns",
+                    batchsandbox_template_file=str(template_file),
+                    execd_delivery="image_volume",
+                ),
+            ),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "uid"}
+        }
+
+        self._create(provider)
+
+        pod_spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"]["template"]["spec"]
+        assert "initContainers" not in pod_spec
+        assert pod_spec["containers"][0]["securityContext"]["runAsNonRoot"] is True
+        bin_volume = next(v for v in pod_spec["volumes"] if v["name"] == "opensandbox-bin")
+        # _create() passes execd_image="execd:latest".
+        assert bin_volume == {"name": "opensandbox-bin", "image": {"reference": "execd:latest"}}
 
     def test_template_security_context_applies_to_main_and_init(
         self, mock_k8s_client, tmp_path
