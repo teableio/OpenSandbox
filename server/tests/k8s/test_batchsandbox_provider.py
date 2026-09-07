@@ -438,8 +438,8 @@ spec:
 
         assert "initContainers" not in pod_spec
         bin_volume = next(v for v in pod_spec["volumes"] if v["name"] == "opensandbox-bin")
-        assert bin_volume["image"] == {"reference": "execd:test", "pullPolicy": "IfNotPresent"}
-        assert "emptyDir" not in bin_volume
+        # No pullPolicy: Kubernetes applies the same default the init container had.
+        assert bin_volume == {"name": "opensandbox-bin", "image": {"reference": "execd:test"}}
         # The main container keeps the same mount and bootstrap wrapper.
         main = pod_spec["containers"][0]
         assert {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox/bin"} in main["volumeMounts"]
@@ -3073,6 +3073,38 @@ spec:
         )
         kwargs.update(overrides)
         provider.create_workload(**kwargs)
+
+    def test_image_volume_delivery_drops_template_installer_stub(
+        self, mock_k8s_client, tmp_path
+    ):
+        # The template only carries a securityContext for execd-installer.
+        # With image_volume there is no installer, so the stub (no image)
+        # must not survive the deep merge, while the main container's
+        # securityContext still does.
+        template_file = tmp_path / "template.yaml"
+        template_file.write_text(self.SC_TEMPLATE)
+        provider = BatchSandboxProvider(
+            mock_k8s_client,
+            AppConfig(
+                runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+                kubernetes=KubernetesRuntimeConfig(
+                    namespace="test-ns",
+                    batchsandbox_template_file=str(template_file),
+                    execd_delivery="image_volume",
+                ),
+            ),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "uid"}
+        }
+
+        self._create(provider)
+
+        pod_spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"]["template"]["spec"]
+        assert "initContainers" not in pod_spec
+        assert pod_spec["containers"][0]["securityContext"]["runAsNonRoot"] is True
+        bin_volume = next(v for v in pod_spec["volumes"] if v["name"] == "opensandbox-bin")
+        assert bin_volume == {"name": "opensandbox-bin", "image": {"reference": "execd:test"}}
 
     def test_template_security_context_applies_to_main_and_init(
         self, mock_k8s_client, tmp_path

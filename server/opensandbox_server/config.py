@@ -628,8 +628,9 @@ class KubernetesRuntimeConfig(BaseModel):
             "How the execd binary and bootstrap.sh reach the sandbox pod. "
             "'init_container' copies them from execd_image into an emptyDir "
             "via an init container. 'image_volume' mounts execd_image "
-            "read-only as a Kubernetes image volume (ImageVolume, GA in "
-            "Kubernetes 1.35), which skips the init container lifecycle. "
+            "read-only as a Kubernetes image volume (ImageVolume: beta and "
+            "enabled by default in Kubernetes 1.35, GA in 1.36; off by "
+            "default before 1.35), which skips the init container lifecycle. "
             "Windows profiles and egress with disable_ipv6 always use the "
             "init container."
         ),

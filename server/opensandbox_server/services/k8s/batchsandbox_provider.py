@@ -190,15 +190,19 @@ class BatchSandboxProvider(WorkloadProvider):
             # execd and bootstrap.sh sit at the execd image root, so mounting
             # the image rootfs at /opt/opensandbox/bin yields the same layout
             # the init container produces, minus one container lifecycle.
+            # pullPolicy is left unset so Kubernetes applies the same default
+            # the init container had (Always for :latest, else IfNotPresent).
+            # The empty initContainers list is deliberate: the template deep
+            # merge replaces lists wholesale, and an absent key would let a
+            # template's execd-installer stub (securityContext only, no
+            # image) leak into the pod and fail admission.
             pod_spec = {
+                "initContainers": [],
                 "containers": containers,
                 "volumes": [
                     {
                         "name": "opensandbox-bin",
-                        "image": {
-                            "reference": execd_image,
-                            "pullPolicy": "IfNotPresent",
-                        },
+                        "image": {"reference": execd_image},
                     }
                 ],
             }
@@ -285,6 +289,12 @@ class BatchSandboxProvider(WorkloadProvider):
             runtime_manifest["metadata"]["annotations"] = annotations
 
         batchsandbox = self.template_manager.merge_with_runtime_values(runtime_manifest)
+        if use_image_volume:
+            # Drop the now-empty list so the manifest does not carry an
+            # explicit "initContainers: []".
+            merged_spec = batchsandbox.get("spec", {}).get("template", {}).get("spec", {})
+            if isinstance(merged_spec, dict) and not merged_spec.get("initContainers"):
+                merged_spec.pop("initContainers", None)
         if expires_at is None:
             batchsandbox["spec"].pop("expireTime", None)
         else:
