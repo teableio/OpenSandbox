@@ -78,6 +78,7 @@ class BatchSandboxProvider(WorkloadProvider):
         if template_file_path:
             logger.info(f"Using BatchSandbox template file: {template_file_path}")
         self.execd_init_resources = k8s_config.execd_init_resources if k8s_config else None
+        self.execd_delivery = k8s_config.execd_delivery if k8s_config else "init_container"
         self.sandbox_resource_requests = (
             k8s_config.sandbox_resource_requests if k8s_config else None
         )
@@ -166,12 +167,6 @@ class BatchSandboxProvider(WorkloadProvider):
             and egress_image is not None
             and self.egress_disable_ipv6
         )
-        init_container = _build_execd_init_container(
-            execd_image,
-            self.execd_init_resources,
-            disable_ipv6_for_egress=disable_ipv6_for_egress,
-        )
-        
         main_container = _build_main_container(
             image_spec=image_spec,
             entrypoint=entrypoint,
@@ -181,18 +176,48 @@ class BatchSandboxProvider(WorkloadProvider):
             has_network_policy=network_policy is not None,
             image_pull_policy=self.image_pull_policy,
         )
-        
+
         containers = [_container_to_dict(main_container)]
-        pod_spec = {
-            "initContainers": [_container_to_dict(init_container)],
-            "containers": containers,
-            "volumes": [
-                {
-                    "name": "opensandbox-bin",
-                    "emptyDir": {}
-                }
-            ],
-        }
+        # The Windows profile installs execd via install.bat and the egress
+        # disable_ipv6 path needs the privileged init container for sysctl,
+        # so both keep the init container regardless of execd_delivery.
+        use_image_volume = (
+            self.execd_delivery == "image_volume"
+            and not windows_profile
+            and not disable_ipv6_for_egress
+        )
+        if use_image_volume:
+            # execd and bootstrap.sh sit at the execd image root, so mounting
+            # the image rootfs at /opt/opensandbox/bin yields the same layout
+            # the init container produces, minus one container lifecycle.
+            pod_spec = {
+                "containers": containers,
+                "volumes": [
+                    {
+                        "name": "opensandbox-bin",
+                        "image": {
+                            "reference": execd_image,
+                            "pullPolicy": "IfNotPresent",
+                        },
+                    }
+                ],
+            }
+        else:
+            init_container = _build_execd_init_container(
+                execd_image,
+                self.execd_init_resources,
+                disable_ipv6_for_egress=disable_ipv6_for_egress,
+            )
+            pod_spec = {
+                "initContainers": [_container_to_dict(init_container)],
+                "containers": containers,
+                "volumes": [
+                    {
+                        "name": "opensandbox-bin",
+                        "emptyDir": {}
+                    }
+                ],
+            }
         if windows_profile:
             apply_windows_profile_overrides(
                 pod_spec=pod_spec,

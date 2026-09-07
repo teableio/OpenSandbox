@@ -622,6 +622,18 @@ class KubernetesRuntimeConfig(BaseModel):
             "If unset, no resource constraints are applied."
         ),
     )
+    execd_delivery: Literal["init_container", "image_volume"] = Field(
+        default="init_container",
+        description=(
+            "How the execd binary and bootstrap.sh reach the sandbox pod. "
+            "'init_container' copies them from execd_image into an emptyDir "
+            "via an init container. 'image_volume' mounts execd_image "
+            "read-only as a Kubernetes image volume (ImageVolume, GA in "
+            "Kubernetes 1.35), which skips the init container lifecycle. "
+            "Windows profiles and egress with disable_ipv6 always use the "
+            "init container."
+        ),
+    )
     volume_subpath_precreate: Optional["VolumeSubpathPrecreate"] = Field(
         default=None,
         description=(
