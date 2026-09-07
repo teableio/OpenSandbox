@@ -3104,7 +3104,8 @@ spec:
         assert "initContainers" not in pod_spec
         assert pod_spec["containers"][0]["securityContext"]["runAsNonRoot"] is True
         bin_volume = next(v for v in pod_spec["volumes"] if v["name"] == "opensandbox-bin")
-        assert bin_volume == {"name": "opensandbox-bin", "image": {"reference": "execd:test"}}
+        # _create() passes execd_image="execd:latest".
+        assert bin_volume == {"name": "opensandbox-bin", "image": {"reference": "execd:latest"}}
 
     def test_template_security_context_applies_to_main_and_init(
         self, mock_k8s_client, tmp_path
