@@ -19,7 +19,6 @@ This module implements API Key authentication as specified in the OpenAPI spec.
 API keys are configured via config.toml and validated against the OPEN-SANDBOX-API-KEY header.
 """
 
-import re
 from typing import Callable, Optional
 
 from fastapi import Request, Response, status
@@ -39,19 +38,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
     Returns 401 Unauthorized if authentication fails.
     """
 
-    # Paths that don't require authentication
+    # Paths that don't require authentication.
+    # The proxy-to-sandbox route (/sandboxes/{id}/proxy/{port}) is deliberately NOT exempt:
+    # browser previews go through the ingress gateway (Kubernetes) or the edge proxy's
+    # subdomain route (Docker), which dial the sandbox directly. The path proxy is a
+    # machine API; an unauthenticated one would serve arbitrary sandbox content on the
+    # server's own origin. WebSocket upgrades bypass this middleware (BaseHTTPMiddleware
+    # only sees HTTP), so api/proxy.py enforces the same check on the websocket routes.
     EXEMPT_PATHS = ["/health", "/docs", "/redoc", "/openapi.json"]
-
-    # Strict pattern for proxy-to-sandbox: /sandboxes/{id}/proxy/{port}/... with numeric port only.
-    # Matches the actual route in proxy.py; rejects path traversal (..) and malformed port.
-    _PROXY_PATH_RE = re.compile(r"^(/v1)?/sandboxes/[^/]+/proxy/\d+(/|$)")
-
-    @staticmethod
-    def _is_proxy_path(path: str) -> bool:
-        """True only for the exact proxy-route shape; rejects path traversal (..)."""
-        if ".." in path:
-            return False
-        return bool(AuthMiddleware._PROXY_PATH_RE.match(path))
 
     def __init__(self, app, config: Optional[AppConfig] = None):
         """
@@ -65,6 +59,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
         self.config = config or get_config()
         # Read the API key directly from config; suitable for dev/test usage
         self.valid_api_keys = self._load_api_keys()
+
+    def is_api_key_valid(self, api_key: Optional[str]) -> bool:
+        """True when no key is configured, or the supplied key matches a configured one."""
+        if not self.valid_api_keys:
+            return True
+        return bool(api_key) and api_key in self.valid_api_keys
 
     def _load_api_keys(self) -> set:
         """
@@ -93,11 +93,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
         """
         # Skip authentication for exempt paths
         if any(request.url.path.startswith(path) for path in self.EXEMPT_PATHS):
-            return await call_next(request)
-
-        # Skip authentication only for the exact proxy-to-sandbox route shape
-        # (no path traversal, no loose substring match)
-        if self._is_proxy_path(request.url.path):
             return await call_next(request)
 
         # If no API keys are configured, skip authentication

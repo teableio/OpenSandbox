@@ -32,6 +32,7 @@ from websockets.typing import Origin
 
 from opensandbox_server.api import lifecycle
 from opensandbox_server.api.schema import Endpoint
+from opensandbox_server.config import get_config
 from opensandbox_server.middleware.auth import SANDBOX_API_KEY_HEADER
 from opensandbox_server.services.constants import OPEN_SANDBOX_SECURE_ACCESS_HEADER
 
@@ -298,12 +299,32 @@ async def _relay_backend_messages(
         cancel_scope.cancel()
 
 
+def _websocket_api_key_valid(websocket: WebSocket) -> bool:
+    """Same rule and same config object as AuthMiddleware, which never sees websocket scopes."""
+    config = getattr(websocket.app.state, "config", None) or get_config()
+    configured = (config.server.api_key or "").strip()
+    if not configured:
+        return True
+    return websocket.headers.get(SANDBOX_API_KEY_HEADER) == configured
+
+
 async def _proxy_websocket_request(
     websocket: WebSocket,
     sandbox_id: str,
     port: int,
     full_path: str,
 ) -> None:
+    if not _websocket_api_key_valid(websocket):
+        logger.warning(
+            "Rejecting unauthenticated websocket proxy request for sandbox=%s port=%s",
+            sandbox_id,
+            port,
+        )
+        # Close before accept on purpose: the handshake is denied (HTTP 403 on the wire),
+        # the same stage at which AuthMiddleware rejects HTTP requests.
+        await websocket.close(code=1008, reason="unauthorized")
+        return
+
     _schedule_proxy_renew(websocket, sandbox_id)
 
     try:
