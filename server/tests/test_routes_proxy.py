@@ -1,3 +1,4 @@
+import pytest
 # Copyright 2026 Alibaba Group Holding Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +19,7 @@ from typing import Any, cast
 import httpx
 from fastapi.testclient import TestClient
 from websockets.typing import Origin
+from starlette.websockets import WebSocketDisconnect
 
 import opensandbox_server.api.proxy as proxy_api
 from opensandbox_server.api import lifecycle
@@ -468,6 +470,23 @@ def test_proxy_rejects_websocket_upgrade_for_post_and_mixed_case_header(
 
     assert response.status_code == 400
     assert response.json()["message"] == "Websocket upgrade is not supported yet"
+
+
+def test_proxy_websocket_requires_api_key(client: TestClient, monkeypatch) -> None:
+    """AuthMiddleware never sees websocket scopes, so the route itself must reject a missing/wrong key."""
+
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+            raise AssertionError("endpoint must not be resolved for an unauthenticated websocket")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    for headers in ({}, {"OPEN-SANDBOX-API-KEY": "wrong-key"}):
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with client.websocket_connect("/v1/sandboxes/sbx-123/proxy/44772/ws", headers=headers):
+                pass
+        assert excinfo.value.code == 1008
 
 
 def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
