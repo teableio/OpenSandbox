@@ -193,7 +193,12 @@ func (w *WebSocketProxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				m := websocket.FormatCloseMessage(websocket.CloseNormalClosure, fmt.Sprintf("%v", err))
 				if e, ok := err.(*websocket.CloseError); ok { //nolint:errorlint
-					if e.Code != websocket.CloseNoStatusReceived {
+					// gorilla reports a peer that went away without a Close frame as
+					// CloseError{Code: 1006}. Relaying that code verbatim would put a
+					// reserved status on the wire; strict peers (Node's ws, which Next.js
+					// dev servers use) reject such a frame and raise an uncaught
+					// exception. Reserved codes fall back to the generic close above.
+					if !isReservedCloseCode(e.Code) {
 						m = websocket.FormatCloseMessage(e.Code, e.Text)
 					}
 				}
@@ -223,6 +228,17 @@ func (w *WebSocketProxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	if e, ok := err.(*websocket.CloseError); !ok || e.Code == websocket.CloseAbnormalClosure { //nolint:errorlint
 		Logger.With(slogger.Field{Key: "error", Value: err}).Errorf(message, err)
 	}
+}
+
+// isReservedCloseCode reports whether code is one that RFC 6455 section 7.4.1
+// reserves for local use: an endpoint may hand it to the application to
+// describe how a connection ended, but must never send it in a Close frame.
+func isReservedCloseCode(code int) bool {
+	switch code {
+	case websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure, websocket.CloseTLSHandshake:
+		return true
+	}
+	return false
 }
 
 func copyResponse(rw http.ResponseWriter, resp *http.Response) error {
