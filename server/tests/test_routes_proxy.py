@@ -1478,6 +1478,35 @@ def test_proxy_websocket_endpoint_lookup_sees_the_tenant(
     assert seen == [tenant]
 
 
+def test_proxy_websocket_multi_tenant_rejects_unknown_key(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    # In multi-tenant mode the single-tenant server.api_key gate steps aside;
+    # tenant authentication must still reject a missing or unknown key before
+    # the endpoint is resolved.
+    class Provider:
+        @staticmethod
+        def lookup(api_key: str) -> TenantEntry | None:
+            return None
+
+    class StubService:
+        @staticmethod
+        def get_endpoint(*args, **kwargs) -> Endpoint:
+            raise AssertionError("endpoint must not be resolved for an unauthenticated websocket")
+
+    monkeypatch.setattr(client.app.state, "tenant_provider", Provider(), raising=False)
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    for headers in ({}, {SANDBOX_API_KEY_HEADER: "unknown-key"}):
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with client.websocket_connect(
+                "/v1/sandboxes/sbx-123/proxy/44772/ws", headers=headers
+            ) as websocket:
+                websocket.receive_text()
+        assert excinfo.value.code == 1008
+
+
 @pytest.mark.parametrize("configured_resolve_internal", [True, False])
 def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
     client: TestClient,

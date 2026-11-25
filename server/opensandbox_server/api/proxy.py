@@ -646,7 +646,14 @@ async def _relay_backend_messages(
 
 
 def _websocket_api_key_valid(websocket: WebSocket) -> bool:
-    """Same rule and same config object as AuthMiddleware, which never sees websocket scopes."""
+    """Same rule and same config object as AuthMiddleware, which never sees websocket scopes.
+
+    In multi-tenant mode AuthMiddleware ignores server.api_key and resolves the key
+    through the tenant provider instead; _authenticate_websocket_tenant does the same
+    for websockets, so this single-tenant check steps aside.
+    """
+    if getattr(websocket.app.state, "tenant_provider", None) is not None:
+        return True
     config = getattr(websocket.app.state, "config", None) or get_config()
     configured = (config.server.api_key or "").strip()
     if not configured:
