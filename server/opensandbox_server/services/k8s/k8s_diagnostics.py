@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,45 +13,185 @@
 # limitations under the License.
 
 """
-Kubernetes diagnostics mixin for DevOps API.
+Kubernetes diagnostics mixins for the Diagnostics API.
 
-Provides get_sandbox_logs, get_sandbox_inspect, and get_sandbox_events
-by querying K8s Pod state and events. Mixed into KubernetesSandboxService.
+K8sDiagnosticsMixin serves sandbox logs and events from K8s Pod state;
+K8sStartupDiagnosticsMixin explains Pods that never became ready. Both
+are mixed into KubernetesSandboxService.
 """
 
 from __future__ import annotations
 
-import re
+import logging
+from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, status
+from kubernetes.client.exceptions import ApiException
 
 from opensandbox_server.services.constants import (
     SANDBOX_ID_LABEL,
     SandboxErrorCodes,
 )
+from opensandbox_server.services.diagnostics import (
+    DiagnosticContext,
+    DiagnosticResult,
+    limit_diagnostic_lines,
+    unsupported_scope_error,
+)
+from opensandbox_server.services.k8s.workload_access import _get_owned_workload_or_404
+from opensandbox_server.services.k8s.error_helpers import _build_k8s_api_error
+from opensandbox_server.services.k8s.workload_mapper import _build_sandbox_from_workload
+
+if TYPE_CHECKING:
+    from opensandbox_server.services.k8s.client import K8sClient
 
 
-def _parse_since(since: str) -> int:
-    """Parse a human-readable duration string (e.g. '10m', '1h') into seconds."""
-    m = re.fullmatch(r"(\d+)\s*([smhd])", since.strip().lower())
-    if not m:
-        return 600
-    value, unit = int(m.group(1)), m.group(2)
-    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    return value * multipliers[unit]
+def _allocated_pods_from_provider(workload_provider: Any, workload: Any) -> list[str]:
+    """Ask the workload provider for pool-allocated pod names when unlabelled."""
+    if workload is None or workload_provider is None:
+        return []
+    getter = getattr(workload_provider, "get_allocated_pod_names", None)
+    if not callable(getter):
+        return []
+    names = getter(workload)
+    if not isinstance(names, (list, tuple)):
+        return []
+    return [name for name in names if isinstance(name, str) and name]
+
+_SUPPORTED_LOG_SCOPES = ("container", "all")
+logger = logging.getLogger(__name__)
+_SUPPORTED_EVENT_SCOPES = ("runtime", "all")
+_STABLE_LOG_LINE_LIMIT = 100
+_STABLE_EVENT_LINE_LIMIT = 50
+
+#: Default container to pull logs from when the caller does not specify one.
+#: OSB-managed sandbox pods canonically run the user workload in a container
+#: named "sandbox" alongside sidecars (e.g. "egress") and init containers
+#: (e.g. "execd-installer"). Without this default, Kubernetes returns HTTP 400
+#: on any pod with more than one container.
+DEFAULT_LOG_CONTAINER = "sandbox"
 
 
 class K8sDiagnosticsMixin:
     """Mixin that implements diagnostics methods for the Kubernetes backend."""
 
+    def get_sandbox_diagnostic_context(self, sandbox_id: str) -> DiagnosticContext:
+        try:
+            namespace = self._resolve_namespace_for_lookup(sandbox_id)
+            workload = _get_owned_workload_or_404(self.workload_provider, namespace, sandbox_id)
+            sandbox = _build_sandbox_from_workload(workload, self.workload_provider)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Error getting sandbox diagnostic context %s", sandbox_id)
+            raise _build_k8s_api_error("get sandbox diagnostic context", exc) from exc
+        metadata = workload.get("metadata", {}) if isinstance(workload, dict) else workload.metadata
+        name = metadata.get("name") if isinstance(metadata, dict) else metadata.name
+        uid = metadata.get("uid") if isinstance(metadata, dict) else metadata.uid
+        identifiers = {"namespace": namespace}
+        if name:
+            identifiers["workloadName"] = name
+        if uid:
+            identifiers["workloadUid"] = str(uid)
+        pod_names = _allocated_pods_from_provider(
+            getattr(self, "workload_provider", None), workload
+        )
+        if len(pod_names) == 1:
+            identifiers["podName"] = pod_names[0]
+        return DiagnosticContext(
+            sandbox_id=sandbox_id,
+            state=sandbox.status.state,
+            backend_type="kubernetes",
+            backend_identifiers=identifiers,
+        )
+
+    def get_sandbox_log_diagnostics(
+        self,
+        sandbox_id: str,
+        scope: str,
+    ) -> DiagnosticResult:
+        """Collect stable log diagnostics using Kubernetes capabilities."""
+        normalized_scope = scope.strip().lower()
+        if normalized_scope not in _SUPPORTED_LOG_SCOPES:
+            raise unsupported_scope_error("logs", scope, _SUPPORTED_LOG_SCOPES)
+
+        content = self.get_sandbox_logs(
+            sandbox_id,
+            tail=_STABLE_LOG_LINE_LIMIT + 1,
+        )
+        content, truncated = limit_diagnostic_lines(
+            content,
+            _STABLE_LOG_LINE_LIMIT,
+            keep_tail=True,
+        )
+        warnings: tuple[str, ...] = ()
+        if normalized_scope == "all":
+            warnings = (
+                "The current backend only contributes sandbox container logs to the all scope.",
+            )
+        return DiagnosticResult(
+            sandbox_id=sandbox_id,
+            kind="logs",
+            scope=normalized_scope,
+            content=content,
+            truncated=truncated,
+            warnings=warnings,
+        )
+
+    def get_sandbox_event_diagnostics(
+        self,
+        sandbox_id: str,
+        scope: str,
+    ) -> DiagnosticResult:
+        """Collect stable event diagnostics using Kubernetes capabilities."""
+        normalized_scope = scope.strip().lower()
+        if normalized_scope not in _SUPPORTED_EVENT_SCOPES:
+            raise unsupported_scope_error("events", scope, _SUPPORTED_EVENT_SCOPES)
+
+        content = self.get_sandbox_events(
+            sandbox_id,
+            limit=_STABLE_EVENT_LINE_LIMIT + 1,
+        )
+        content, truncated = limit_diagnostic_lines(
+            content,
+            _STABLE_EVENT_LINE_LIMIT,
+            keep_tail=False,
+        )
+        warnings: tuple[str, ...] = ()
+        if normalized_scope == "all":
+            warnings = ("The current backend only contributes runtime events to the all scope.",)
+        return DiagnosticResult(
+            sandbox_id=sandbox_id,
+            kind="events",
+            scope=normalized_scope,
+            content=content,
+            truncated=truncated,
+            warnings=warnings,
+        )
+
     def _find_pod_for_sandbox(self, sandbox_id: str):
-        """Find the Pod associated with a sandbox ID via label selector."""
+        namespace = self._resolve_namespace()
+        workload = None
+        workload_provider = getattr(self, "workload_provider", None)
+        if workload_provider is not None:
+            workload = _get_owned_workload_or_404(
+                workload_provider,
+                namespace,
+                sandbox_id,
+            )
         label_selector = f"{SANDBOX_ID_LABEL}={sandbox_id}"
         try:
             pods = self.k8s_client.list_pods(
-                namespace=self.namespace,
+                namespace=namespace,
                 label_selector=label_selector,
             )
+            if not pods:
+                # Pool-allocated pods don't carry the sandbox ID label.
+                pods = [
+                    pod
+                    for name in _allocated_pods_from_provider(workload_provider, workload)
+                    if (pod := self.k8s_client.read_pod(namespace, name)) is not None
+                ]
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -71,128 +211,332 @@ class K8sDiagnosticsMixin:
             )
         return pods[0]
 
-    def get_sandbox_logs(self, sandbox_id: str, tail: int = 100, since: str | None = None) -> str:
+    def get_sandbox_logs(
+        self,
+        sandbox_id: str,
+        tail: int = 100,
+    ) -> str:
         pod = self._find_pod_for_sandbox(sandbox_id)
         pod_name = pod.metadata.name
         core_v1 = self.k8s_client.get_core_v1_api()
 
+        target_container = self._resolve_log_container(pod)
+
         kwargs: dict = {
             "name": pod_name,
-            "namespace": self.namespace,
+            "namespace": pod.metadata.namespace,
+            "container": target_container,
             "tail_lines": tail,
             "timestamps": True,
         }
-        if since:
-            kwargs["since_seconds"] = _parse_since(since)
 
-        log_text = core_v1.read_namespaced_pod_log(**kwargs)
+        try:
+            log_text = core_v1.read_namespaced_pod_log(**kwargs)
+        except ApiException as exc:
+            raise _map_pod_log_error(pod_name, target_container, exc) from exc
+
         return log_text or "(no logs)"
 
-    def get_sandbox_inspect(self, sandbox_id: str) -> str:
-        pod = self._find_pod_for_sandbox(sandbox_id)
-        meta = pod.metadata
-        spec = pod.spec
-        pod_status = pod.status
+    @staticmethod
+    def _resolve_log_container(pod) -> str:
+        """Pick the container to read logs from.
 
-        lines: list[str] = []
-        lines.append(f"Pod Name:       {meta.name}")
-        lines.append(f"Namespace:      {meta.namespace}")
-        lines.append(f"Node:           {spec.node_name or 'N/A'}")
-        lines.append(f"Phase:          {pod_status.phase if pod_status else 'Unknown'}")
-        lines.append(f"Pod IP:         {pod_status.pod_ip if pod_status else 'N/A'}")
-        lines.append(f"Host IP:        {pod_status.host_ip if pod_status else 'N/A'}")
-        lines.append(f"Start Time:     {pod_status.start_time if pod_status else 'N/A'}")
+        Order of preference:
+        1. ``DEFAULT_LOG_CONTAINER`` ("sandbox") when present.
+        2. The first regular container declared in the pod spec.
+        3. The first init container.
+        """
+        spec = getattr(pod, "spec", None)
+        regular = list(getattr(spec, "containers", None) or []) if spec else []
+        init = list(getattr(spec, "init_containers", None) or []) if spec else []
+        all_names = [c.name for c in regular] + [c.name for c in init]
 
-        if spec.runtime_class_name:
-            lines.append(f"Runtime Class:  {spec.runtime_class_name}")
-
-        # Container statuses
-        if pod_status and pod_status.container_statuses:
-            lines.append("")
-            lines.append("Containers:")
-            for cs in pod_status.container_statuses:
-                lines.append(f"  {cs.name}:")
-                lines.append(f"    Ready:          {cs.ready}")
-                lines.append(f"    Restart Count:  {cs.restart_count}")
-                lines.append(f"    Image:          {cs.image}")
-                if cs.state:
-                    if cs.state.running:
-                        lines.append(f"    State:          Running (since {cs.state.running.started_at})")
-                    elif cs.state.waiting:
-                        lines.append(f"    State:          Waiting ({cs.state.waiting.reason})")
-                        if cs.state.waiting.message:
-                            lines.append(f"    Message:        {cs.state.waiting.message}")
-                    elif cs.state.terminated:
-                        t = cs.state.terminated
-                        lines.append(f"    State:          Terminated (exit={t.exit_code}, reason={t.reason})")
-                        if t.message:
-                            lines.append(f"    Message:        {t.message}")
-                if cs.last_state and cs.last_state.terminated:
-                    t = cs.last_state.terminated
-                    lines.append(f"    Last State:     Terminated (exit={t.exit_code}, reason={t.reason})")
-
-        # Init container statuses
-        if pod_status and pod_status.init_container_statuses:
-            lines.append("")
-            lines.append("Init Containers:")
-            for cs in pod_status.init_container_statuses:
-                lines.append(f"  {cs.name}:")
-                lines.append(f"    Ready:          {cs.ready}")
-                if cs.state:
-                    if cs.state.terminated:
-                        t = cs.state.terminated
-                        lines.append(f"    State:          Terminated (exit={t.exit_code}, reason={t.reason})")
-                    elif cs.state.waiting:
-                        lines.append(f"    State:          Waiting ({cs.state.waiting.reason})")
-
-        # Conditions
-        if pod_status and pod_status.conditions:
-            lines.append("")
-            lines.append("Conditions:")
-            for cond in pod_status.conditions:
-                lines.append(f"  {cond.type}: {cond.status} (reason={cond.reason or 'N/A'})")
-                if cond.message:
-                    lines.append(f"    Message: {cond.message}")
-
-        # Labels
-        if meta.labels:
-            lines.append("")
-            lines.append("Labels:")
-            for k, v in sorted(meta.labels.items()):
-                lines.append(f"  {k}={v}")
-
-        # Resource requests/limits
-        if spec.containers:
-            lines.append("")
-            lines.append("Resources:")
-            for container in spec.containers:
-                if container.resources:
-                    lines.append(f"  {container.name}:")
-                    if container.resources.requests:
-                        lines.append(f"    Requests: {dict(container.resources.requests)}")
-                    if container.resources.limits:
-                        lines.append(f"    Limits:   {dict(container.resources.limits)}")
-
-        return "\n".join(lines)
+        if DEFAULT_LOG_CONTAINER in all_names:
+            return DEFAULT_LOG_CONTAINER
+        if regular:
+            return regular[0].name
+        if init:
+            return init[0].name
+        # Fall back to the canonical name so the upstream Kubernetes error is
+        # explicit instead of silently None-ing the container kwarg.
+        return DEFAULT_LOG_CONTAINER
 
     def get_sandbox_events(self, sandbox_id: str, limit: int = 50) -> str:
         pod = self._find_pod_for_sandbox(sandbox_id)
         pod_name = pod.metadata.name
         core_v1 = self.k8s_client.get_core_v1_api()
 
-        events_resp = core_v1.list_namespaced_event(
-            namespace=self.namespace,
-            field_selector=f"involvedObject.name={pod_name}",
-            limit=limit,
-        )
+        events: list[Any] = []
+        continuation: str | None = None
+        try:
+            while len(events) < limit:
+                if continuation is None:
+                    events_resp = core_v1.list_namespaced_event(
+                        namespace=pod.metadata.namespace,
+                        field_selector=f"involvedObject.name={pod_name}",
+                        limit=limit,
+                    )
+                else:
+                    events_resp = core_v1.list_namespaced_event(
+                        namespace=pod.metadata.namespace,
+                        field_selector=f"involvedObject.name={pod_name}",
+                        limit=limit,
+                        _continue=continuation,
+                    )
 
-        if not events_resp.items:
+                events.extend(events_resp.items or [])
+                metadata = getattr(events_resp, "metadata", None)
+                next_continuation = getattr(metadata, "_continue", None)
+                if not next_continuation or next_continuation == continuation:
+                    break
+                continuation = next_continuation
+        except ApiException as exc:
+            raise _map_pod_event_error(pod_name, exc) from exc
+
+        if not events:
             return "(no events)"
 
         lines: list[str] = []
-        for ev in events_resp.items:
+        for ev in events[:limit]:
             ts = ev.last_timestamp or ev.event_time or ev.first_timestamp or "N/A"
             lines.append(
                 f"[{ts}] {ev.type:8s} {ev.reason or 'N/A':20s} {ev.message or ''}"
             )
         return "\n".join(lines)
+
+
+_STARTUP_DETAIL_MAX_PODS = 3
+_STARTUP_DETAIL_MAX_EVENTS = 5
+_STARTUP_DETAIL_MAX_ITEM_CHARS = 300
+_STARTUP_DETAIL_MAX_CHARS = 1500
+
+
+def _clip(text: Any, limit: int = _STARTUP_DETAIL_MAX_ITEM_CHARS) -> str:
+    value = " ".join(str(text).split())
+    return value if len(value) <= limit else value[: limit - 3] + "..."
+
+
+def _describe_reason(reason: Any, message: Any) -> str:
+    text = _clip(reason or "Unknown")
+    if message:
+        text += f" ({_clip(message)})"
+    return text
+
+
+def _pod_status_details(pod: Any) -> list[str]:
+    """Summarize why a Pod is not ready from its status alone."""
+    details: list[str] = []
+    pod_status = getattr(pod, "status", None)
+    if pod_status is None:
+        return details
+    for cond in getattr(pod_status, "conditions", None) or []:
+        if getattr(cond, "type", None) == "PodScheduled" and getattr(cond, "status", None) == "False":
+            details.append(
+                "not scheduled: " + _describe_reason(cond.reason, cond.message)
+            )
+    for kind, statuses in (
+        ("init container", getattr(pod_status, "init_container_statuses", None)),
+        ("container", getattr(pod_status, "container_statuses", None)),
+    ):
+        for cs in statuses or []:
+            state = getattr(cs, "state", None)
+            waiting = getattr(state, "waiting", None) if state else None
+            terminated = getattr(state, "terminated", None) if state else None
+            if waiting is not None and getattr(waiting, "reason", None):
+                details.append(
+                    f"{kind} {cs.name} waiting: "
+                    + _describe_reason(waiting.reason, waiting.message)
+                )
+            elif terminated is not None and (
+                getattr(terminated, "exit_code", 0) or kind == "container"
+            ):
+                details.append(
+                    f"{kind} {cs.name} terminated (exit={terminated.exit_code}): "
+                    + _describe_reason(terminated.reason, terminated.message)
+                )
+    return details
+
+
+class K8sStartupDiagnosticsMixin:
+    """Best-effort details for sandboxes that did not become ready in time."""
+
+    k8s_client: "K8sClient"
+
+    def _warning_events_for(self, namespace: str, name: str) -> list[str]:
+        core_v1 = self.k8s_client.get_core_v1_api()
+        resp = core_v1.list_namespaced_event(
+            namespace=namespace,
+            field_selector=f"involvedObject.name={name},type=Warning",
+            limit=50,
+        )
+        events = list(getattr(resp, "items", None) or [])
+        # Latest first; repeated events are folded by reason and message.
+        events.sort(
+            key=lambda ev: str(
+                getattr(ev, "last_timestamp", None)
+                or getattr(ev, "event_time", None)
+                or getattr(ev, "first_timestamp", None)
+                or ""
+            ),
+            reverse=True,
+        )
+        seen: set[tuple[str, str]] = set()
+        lines: list[str] = []
+        for ev in events:
+            key = (str(ev.reason or ""), str(ev.message or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append("event " + _describe_reason(ev.reason, ev.message))
+            if len(lines) >= _STARTUP_DETAIL_MAX_EVENTS:
+                break
+        return lines
+
+    def collect_startup_failure_details(
+        self,
+        sandbox_id: str,
+        namespace: str,
+        workload: Any = None,
+    ) -> str:
+        """Describe why a sandbox's Pod has not started.
+
+        Reads Pod status (scheduling, container waiting/terminated reasons)
+        and recent Warning events for the Pod, or for the workload when no
+        Pod exists yet. Kubernetes API errors are raised to the caller, which
+        must treat them as non-fatal.
+        """
+        pods = list(
+            self.k8s_client.list_pods(
+                namespace=namespace,
+                label_selector=f"{SANDBOX_ID_LABEL}={sandbox_id}",
+            )
+            or []
+        )
+        if not pods:
+            # Pool-allocated pods don't carry the sandbox ID label.
+            workload_provider = getattr(self, "workload_provider", None)
+            pods = [
+                pod
+                for name in _allocated_pods_from_provider(workload_provider, workload)
+                if (pod := self.k8s_client.read_pod(namespace, name)) is not None
+            ]
+
+        parts: list[str] = []
+        if not pods:
+            parts.append("no pod found for sandbox")
+            metadata = workload.get("metadata") if isinstance(workload, dict) else None
+            workload_name = metadata.get("name") if isinstance(metadata, dict) else None
+            if workload_name:
+                events = self._warning_events_for(namespace, workload_name)
+                if events:
+                    parts.append(f"workload {workload_name}: " + "; ".join(events))
+        for pod in pods[:_STARTUP_DETAIL_MAX_PODS]:
+            pod_name = pod.metadata.name
+            details = _pod_status_details(pod)
+            details.extend(
+                self._warning_events_for(pod.metadata.namespace or namespace, pod_name)
+            )
+            if details:
+                parts.append(f"pod {pod_name}: " + "; ".join(details))
+            else:
+                parts.append(f"pod {pod_name}: no failure reason reported")
+        return _clip(" | ".join(parts), _STARTUP_DETAIL_MAX_CHARS)
+
+
+def _map_pod_log_error(pod_name: str, container: str, exc: ApiException) -> HTTPException:
+    """Translate a Kubernetes pod-log ApiException into a sensible HTTPException.
+
+    Bare ``ApiException`` instances are not JSON-serialisable, so when they
+    escape the request handler FastAPI/uvicorn surfaces them as opaque 500
+    responses. Wrap them with structured detail and a status code that
+    reflects whether the problem is the request, the credentials, or the
+    cluster itself.
+    """
+    raw_status = getattr(exc, "status", None) or 0
+    body = getattr(exc, "body", None) or str(exc)
+
+    if raw_status == 400:
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.K8S_API_ERROR,
+                "message": (
+                    f"Kubernetes rejected log request for pod '{pod_name}' "
+                    f"container '{container}': {body}"
+                ),
+            },
+        )
+    if raw_status in (401, 403):
+        return HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": SandboxErrorCodes.K8S_API_ERROR,
+                "message": (
+                    f"Kubernetes denied log access for pod '{pod_name}' "
+                    f"container '{container}': {body}"
+                ),
+            },
+        )
+    if raw_status == 404:
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
+                "message": (
+                    f"Pod '{pod_name}' or container '{container}' not found: {body}"
+                ),
+            },
+        )
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "code": SandboxErrorCodes.K8S_API_ERROR,
+            "message": (
+                f"Kubernetes returned {raw_status} when reading logs for pod "
+                f"'{pod_name}' container '{container}': {body}"
+            ),
+        },
+    )
+
+
+def _map_pod_event_error(pod_name: str, exc: ApiException) -> HTTPException:
+    """Translate a Kubernetes event ApiException into a contract error."""
+    raw_status = getattr(exc, "status", None) or 0
+    body = getattr(exc, "body", None) or str(exc)
+
+    if raw_status == 400:
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.K8S_API_ERROR,
+                "message": (
+                    f"Kubernetes rejected event request for pod '{pod_name}': {body}"
+                ),
+            },
+        )
+    if raw_status in (401, 403):
+        return HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": SandboxErrorCodes.K8S_API_ERROR,
+                "message": f"Kubernetes denied event access for pod '{pod_name}': {body}",
+            },
+        )
+    if raw_status == 404:
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
+                "message": f"Pod '{pod_name}' not found when reading events: {body}",
+            },
+        )
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "code": SandboxErrorCodes.K8S_API_ERROR,
+            "message": (
+                f"Kubernetes returned {raw_status} when reading events for pod "
+                f"'{pod_name}': {body}"
+            ),
+        },
+    )

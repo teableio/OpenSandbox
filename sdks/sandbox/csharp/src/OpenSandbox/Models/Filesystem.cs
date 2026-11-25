@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,36 @@ using System.Text.Json.Serialization;
 namespace OpenSandbox.Models;
 
 /// <summary>
+/// Parsed Content-Range response header.
+/// </summary>
+public sealed record ByteRange(long Start, long End, long Total, string Raw);
+
+/// <summary>
+/// Downloaded body and its HTTP response metadata.
+/// </summary>
+public sealed record ReadBytesResponse<T>(
+    T Body,
+    int StatusCode,
+    string? ContentType,
+    string? ContentDisposition,
+    long ContentLength,
+    long TotalSize,
+    ByteRange? ContentRange)
+{
+    /// <summary>
+    /// Gets whether the server returned 206 Partial Content.
+    /// </summary>
+    public bool IsPartial => StatusCode == 206;
+}
+
+/// <summary>
+/// A single-use download body that can be disposed without consuming it.
+/// </summary>
+public interface IAsyncReadBytesStream : IAsyncEnumerable<byte[]>, IAsyncDisposable
+{
+}
+
+/// <summary>
 /// Information about a file in the sandbox.
 /// </summary>
 public class SandboxFileInfo
@@ -26,6 +56,12 @@ public class SandboxFileInfo
     /// </summary>
     [JsonPropertyName("path")]
     public required string Path { get; set; }
+
+    /// <summary>
+    /// Gets or sets the entry type.
+    /// </summary>
+    [JsonPropertyName("type")]
+    public string? Type { get; set; }
 
     /// <summary>
     /// Gets or sets the file size in bytes.
@@ -267,8 +303,21 @@ public class ReadFileOptions
 
     /// <summary>
     /// Gets or sets the byte range to read (e.g., "bytes=0-1023").
+    /// Mutually exclusive with Offset/Limit.
     /// </summary>
     public string? Range { get; set; }
+
+    /// <summary>
+    /// Gets or sets the starting line number (1-based) for line-based reading.
+    /// Mutually exclusive with Range.
+    /// </summary>
+    public int? Offset { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of lines to return for line-based reading.
+    /// Mutually exclusive with Range.
+    /// </summary>
+    public int? Limit { get; set; }
 }
 
 /// <summary>
@@ -278,8 +327,21 @@ public class ReadBytesOptions
 {
     /// <summary>
     /// Gets or sets the byte range to read (e.g., "bytes=0-1023").
+    /// Mutually exclusive with Offset/Limit.
     /// </summary>
     public string? Range { get; set; }
+
+    /// <summary>
+    /// Gets or sets the starting line number (1-based) for line-based reading.
+    /// Mutually exclusive with Range.
+    /// </summary>
+    public int? Offset { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of lines to return for line-based reading.
+    /// Mutually exclusive with Range.
+    /// </summary>
+    public int? Limit { get; set; }
 }
 
 /// <summary>
@@ -316,4 +378,32 @@ public class ReplaceFileContentItem
     /// </summary>
     [JsonPropertyName("new")]
     public required string New { get; set; }
+}
+
+/// <summary>
+/// Result of a content replacement operation on a single file.
+/// </summary>
+public class ContentReplaceResult
+{
+    /// <summary>
+    /// Gets or sets the file path.
+    /// </summary>
+    public required string Path { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of occurrences replaced. 0 means old content was not found.
+    /// </summary>
+    public int ReplacedCount { get; set; }
+}
+
+/// <summary>
+/// API response model for replace file content result.
+/// </summary>
+public class ReplaceFileContentResult
+{
+    /// <summary>
+    /// Gets or sets the number of occurrences replaced.
+    /// </summary>
+    [JsonPropertyName("replacedCount")]
+    public int ReplacedCount { get; set; }
 }

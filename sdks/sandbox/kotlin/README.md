@@ -1,6 +1,5 @@
 # Alibaba Sandbox SDK for Kotlin
 
-English | [中文](README_zh.md)
 
 A Kotlin SDK for low-level interaction with OpenSandbox. It provides capabilities to create, manage, and interact with secure sandbox environments, including executing shell commands, managing files, and monitoring resources.
 
@@ -59,7 +58,7 @@ public class QuickStart {
             System.out.println(execution.getLogs().getStdout().get(0).getText());
 
             // 5. Cleanup (sandbox.close() called automatically)
-            // Note: kill() must be called explicitly if you want to terminate the remote sandbox instance immediately
+            // kill() requests remote deletion; runtime cleanup may continue after it returns.
             sandbox.kill();
         } catch (SandboxException e) {
             // Handle Sandbox specific exceptions
@@ -87,10 +86,15 @@ sandbox.renew(Duration.ofMinutes(30));
 sandbox.pause();
 
 // Resume execution
-sandbox.resume();
+// There is no Sandbox.resume() instance method: resuming re-attaches to an
+// existing sandbox by id and returns a new, connected handle.
+Sandbox resumed = Sandbox.resumer()
+    .sandboxId(sandbox.getId())
+    .connectionConfig(config)
+    .resume();
 
 // Get current status
-SandboxInfo info = sandbox.getInfo();
+SandboxInfo info = resumed.getInfo();
 System.out.println("State: " + info.getStatus().getState());
 System.out.println("Expires: " + info.getExpiresAt()); // null when manual cleanup mode is used
 ```
@@ -104,6 +108,38 @@ Sandbox manual = Sandbox.builder()
     .timeout(null)
     .build();
 ```
+
+Renew on access instead of on a timer (OSEP-0009): `renewalPolicy` moves the expiration to `max(now + extendSeconds, current)` on every observed access, client-validated to 300–86400 seconds. It replaces the deprecated `access.renew.extend.seconds` extensions key, which keeps working through 1.x and is removed in 2.0.
+
+```java
+Sandbox sandbox = Sandbox.builder()
+    .connectionConfig(config)
+    .image("ubuntu")
+    .lifecycle(
+        SandboxLifecycle.builder()
+            .renewalPolicy(RenewalPolicy.builder().extendSeconds(3600).build())
+            .build()
+    )
+    .build();
+```
+
+Auto-pause and wake-on-access (OSEP-0024, fast-sandbox backend only): `idlePolicy` pauses the sandbox after `idleTimeoutSeconds` continuously idle seconds (30–86400, `onIdle` only takes `OnIdleAction.PAUSE` today). Incoming traffic then wakes it:
+
+```java
+Sandbox sandbox = Sandbox.builder()
+    .connectionConfig(config)
+    .image("ubuntu")
+    .lifecycle(
+        SandboxLifecycle.builder()
+            .idlePolicy(
+                IdlePolicy.builder().idleTimeoutSeconds(600).onIdle(OnIdleAction.PAUSE).build()
+            )
+            .build()
+    )
+    .build();
+```
+
+While a paused sandbox restores, the gateway parks the request and answers `503` with an `OpenSandbox-Wake: expired` marker — its presence proves the request was never forwarded, so the SDK resends it for any method after waiting per `Retry-After`, under a bounded budget (`wakeRetryEnabled` / `wakeMaxAttempts` / `wakeOverallDeadline` on `RetryPolicy`; defaults 5 attempts / 60 seconds; bare `503` responses are never affected). When the budget runs out, the request fails with `SandboxWakeTimeoutException`. Note: the request that starts a stream does not wake-retry in Kotlin today — a marked `503` on a stream start fails fast instead.
 
 ### 2. Custom Health Check
 
@@ -183,7 +219,94 @@ files.forEach(f -> System.out.println("Found: " + f.getPath()));
 sandbox.files().deleteFiles(List.of("/tmp/hello.txt"));
 ```
 
-### 5. Sandbox Management (Admin)
+### 5. Snapshots
+
+Capture a sandbox's state and restore new sandboxes from it. Snapshots are administered through `SandboxManager` (the per-sandbox shortcut `sandbox.createSnapshot(name)` also exists):
+
+```java
+SnapshotInfo snapshot = manager.createSnapshot(sandboxId, "pre-migration");
+
+// Poll until Ready — the built-in helper throws SnapshotFailedException on
+// Failed and SandboxReadyTimeoutException past the deadline, so manual
+// state inspection is only needed for custom retry policies
+SnapshotInfo ready = manager.waitForSnapshotReady(snapshot.getId());
+
+// List snapshots (filter fields are all optional)
+PagedSnapshotInfos page = manager.listSnapshots(
+    SnapshotFilter.builder().pageSize(10).page(1).build()
+);
+```
+
+`createSnapshot` takes an optional `mode`: `"full"` (the default) also captures memory and process state, while `"rootfsOnly"` persists only the writable filesystem — restoring boots a fresh sandbox and re-runs the entrypoint, and requires the fast-sandbox backend (a deployment that cannot produce one fails the request instead of silently saving a full snapshot):
+
+```java
+SnapshotInfo rootfs = manager.createSnapshot(
+    sandboxId, "clean-baseline", "rootfsOnly"
+);
+```
+
+Restore by pointing `Sandbox.builder()` at the snapshot — `image(...)` and `snapshotId(...)` are mutually exclusive by construction: setting one clears the other:
+
+```java
+try (Sandbox restored = Sandbox.builder()
+        .connectionConfig(config)
+        .snapshotId(ready.getId())
+        .resource("cpu", "500m")
+        .resource("memory", "512Mi")
+        .build()) {
+    // ... use the restored sandbox
+}
+
+// Only delete the snapshot after the restore has succeeded
+manager.deleteSnapshot(ready.getId());
+```
+
+### 6. Isolated Sessions
+
+Isolated sessions run multi-step code in a hardened, resource-bounded namespace with bind mounts — reachable through `sandbox.isolation()`. The service also offers `runOnce(...)` (create → run → best-effort delete in one call) and `withSession(...) { }` (scoped block with best-effort delete — both catch and log delete failures, so the session can outlive the helper if execd is unavailable) for callers that don't need to keep the session around:
+
+```java
+IsolationSession session = sandbox.isolation().create(
+    new CreateIsolatedSessionRequest(
+        new IsolatedWorkspaceSpec("/workspace", "rw"),  // legacy workspace sugar, prepended
+        List.of(                                        // overlays: path, mode, persist
+            new IsolatedOverlaySpec("/data/scratch", "overlay", false)),
+        "strict",                                       // profile
+        null,                                           // extraWritable
+        List.of(new BindMount("/data", "/data", true)), // binds: source, dest, readonly
+        null,                                           // shareNet
+        null,                                           // envPassthrough
+        null,                                           // uid
+        null,                                           // gid
+        null,                                           // uidMode
+        600                                             // idleTimeoutSeconds (0 disables idle GC)
+    )
+);
+try {
+    // Foreground run — timeoutSeconds applies here only; background runs
+    // are deliberately not time-limited
+    Execution run = session.run(
+        new IsolatedRunRequest("python -c 'print(1+1)'", null, 30)  // code, envs, timeoutSeconds
+    );
+    System.out.println(run.getLogs().getStdout().get(0).getText());
+
+    // Background runs: start, poll until finished, then drain logs
+    IsolatedBackgroundRun bg = session.runBackground("make build");
+    IsolatedRunStatus status = session.getRunStatus(bg.getRunId());
+    while (status.getRunning()) {
+        Thread.sleep(2000);
+        status = session.getRunStatus(bg.getRunId());
+    }
+    IsolatedRunLogs logs = session.getRunLogs(bg.getRunId());
+    System.out.println(logs.getText());
+} finally {
+    session.delete();
+}
+```
+
+`getRunLogs` is cursor-based: each call returns at most 16 MiB, and per-run retention is capped at 16 MiB, so drain incrementally with the returned cursor while the run is active if the output may exceed one page.
+
+### 7. Sandbox Management (Admin)
 
 Use `SandboxManager` for administrative tasks and finding existing sandboxes.
 
@@ -215,7 +338,7 @@ sandboxes.getSandboxInfos().forEach(info -> {
 // manager.close();
 ```
 
-### 6. Sandbox Pool (Client-Side)
+### 8. Sandbox Pool (Client-Side)
 
 Use `SandboxPool` to keep an idle buffer of ready sandboxes and reduce acquire latency.
 
@@ -223,7 +346,9 @@ Use `SandboxPool` to keep an idle buffer of ready sandboxes and reduce acquire l
 
 ```java
 import com.alibaba.opensandbox.sandbox.pool.SandboxPool;
+import com.alibaba.opensandbox.sandbox.pool.SandboxPoolManager;
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolCreationSpec;
+import com.alibaba.opensandbox.sandbox.domain.pool.PoolDestroyOptions;
 import com.alibaba.opensandbox.sandbox.domain.pool.AcquirePolicy;
 import com.alibaba.opensandbox.sandbox.infrastructure.pool.InMemoryPoolStateStore;
 
@@ -231,7 +356,11 @@ SandboxPool pool = SandboxPool.builder()
     .poolName("demo-pool")
     .ownerId("worker-1")
     .maxIdle(3)
+    .warmupCreateQps(10)
     .warmupReadyTimeout(Duration.ofSeconds(45))
+    .warmupHealthCheckInitialDelay(Duration.ofSeconds(2))
+    .warmupPostPrepareHealthCheck(sandbox -> sandbox.ping())
+    .warmupPostPrepareHealthCheckTimeout(Duration.ofSeconds(30))
     .stateStore(new InMemoryPoolStateStore()) // single-node store
     .connectionConfig(config)
     .creationSpec(
@@ -254,18 +383,88 @@ try {
 pool.shutdown(true);
 ```
 
+Use `SandboxPoolManager` for release or operations workflows that need to destroy an old pool namespace without constructing the old `SandboxPool` object:
+
+```java
+SandboxPoolManager poolManager = SandboxPoolManager.builder()
+    .stateStore(redisStore)
+    .connectionConfig(config)
+    .ownerId("deploy-job-123")
+    .build();
+
+poolManager.destroy(
+    "old-pool",
+    new PoolDestroyOptions()
+);
+```
+
 Pool lifecycle semantics:
 - `acquire()` is only allowed when pool state is `RUNNING`.
 - In `DRAINING` / `STOPPED`, `acquire()` throws `PoolNotRunningException`.
-- `maxIdle` is the target/cap for ready idle sandboxes. It is not a global limit
-  on borrowed sandboxes or sandboxes created by `AcquirePolicy.DIRECT_CREATE`.
-- `ownerId` is the lock owner identity (node/process id), not the pool identifier.
-  If omitted, SDK auto-generates a UUID-based default.
-- Use `warmupSandboxPreparer(...)` if you need to prepare a sandbox after warmup readiness succeeds and before it is put into the idle pool.
+- When a pool namespace is being destroyed or has been destroyed, `acquire()` throws `PoolDestroyedException` and does not fall back to direct create.
+- `maxIdle` is the target/cap for ready idle sandboxes. It is not a global limit on borrowed sandboxes or sandboxes created by `AcquirePolicy.DIRECT_CREATE`.
+- `ownerId` is the lock owner identity (node/process id), not the pool identifier. If omitted, SDK auto-generates a UUID-based default.
+- Use `warmupSandboxPreparer(...)` if you need to prepare a sandbox after warmup readiness succeeds and before it is put into the idle pool. An optional `warmupPostPrepareHealthCheck(...)` can validate the prepared sandbox before it becomes idle; retries never rerun the preparer.
+- `warmupCreateQps` caps new warmup creates admitted by each pool during its fixed one-second reconcile tick. `warmupConcurrency` independently bounds active post-create warmup work such as health checks and preparation. Their defaults are `10` and `128`, respectively.
+- Readiness checks start after `warmupHealthCheckInitialDelay` (zero by default). Readiness and post-prepare retries share `warmupHealthCheckPollingInterval`, whose Pool default is `500ms`. Their timeout settings are soft deadlines: a delayed task still receives one final check at or after its deadline.
+- Pool warmup create uses one transport attempt. Direct create, standalone create, acquire, connect, renew, and cleanup retain the configured retry behavior.
+- Reconcile runs once per second. Warmup completion does not trigger an extra tick.
+- With `ConnectionConfig.enableTracing()`, each admitted warmup emits one `pool.warmup` trace. Each health stage is summarized by one span with its attempt count and scheduler delay. Terminal structured logs classify `stage`, `result`, and `reason`; the current primary also emits an active-pool summary every 30 seconds from the existing reconcile thread. Production deployments should configure OpenTelemetry sampling explicitly; tracing is opt-in but the SDK does not override the application's sampler.
+- Graceful shutdown stops admitting new warmups, keeps the primary heartbeat and delayed-stage dispatcher alive while already-admitted warmups finish, and preserves the existing behavior of allowing those warmups to enter idle before shutdown completes.
+- When `ConnectionConfig` carries no custom OkHttp `ConnectionPool`, the pool creates one for direct create and idle connect, sized by `warmupConcurrency` with a 5-minute keep-alive, and evicts it on `shutdown()`. Default staged warmup sandboxes retain their own endpoint pools to avoid accumulating mutually incompatible routes in one large pool. An explicitly user-provided connection pool is honored by every path and is never evicted by the pool.
 
 
-> For distributed deployment, use the optional `com.alibaba.opensandbox:sandbox-pool-redis` module or provide a custom `PoolStateStore` implementation. The Redis module accepts a caller-managed Jedis client, so your application keeps ownership of Redis connection configuration and lifecycle. Nodes sharing the same pool namespace must use the same sandbox creation and warmup definition; use a new `poolName` or namespace when changing that definition. Configure `primaryLockTtl` greater than `warmupReadyTimeout` plus expected warmup preparer time and buffer, otherwise leadership may expire while a node is creating idle sandboxes.
-> In distributed mode, `resize(maxIdle)` can be called from any node. The call returns after the target is stored in the shared state store; the current primary applies replenish or shrink work during periodic reconcile. Use `resize(0)` and wait for `snapshot().idleCount == 0` when you need to drain the distributed idle buffer; `releaseAllIdle()` is only a best-effort cleanup pass.
+> For distributed deployment, use the optional `com.alibaba.opensandbox:sandbox-pool-redis` module or provide a custom `PoolStateStore` implementation. The Redis module accepts a caller-managed Jedis client, so your application keeps ownership of Redis connection configuration and lifecycle. Nodes sharing the same pool namespace must use the same sandbox creation and warmup definition; use a new `poolName` or namespace when changing that definition. The pool renews an owned primary lock independently from warmup execution at an internal interval no greater than `primaryLockTtl / 3`, so one slow warmup does not block leader heartbeats. In distributed mode, `resize(maxIdle)` can be called from any node. The call returns after the target is stored in the shared state store; the current primary applies replenish or shrink work during periodic reconcile. Use `resize(0)` and wait for `snapshot().idleCount == 0` when you need to drain the distributed idle buffer; `releaseAllIdle()` is only a best-effort cleanup pass. `releaseAllIdle()` preserves the original serial cleanup behavior. Use `releaseAllIdle(concurrency)` for bounded parallel cleanup. `concurrency` must be positive; the overload returns only after every ID drained from the store has received a best-effort kill attempt. `SandboxPoolManager.destroy(poolName)` is a stronger administrative operation: it writes a `DESTROYING` fence, drains visible idle IDs, best-effort kills idle sandboxes, clears persistent pool state, and then writes a `DESTROYED` tombstone for the configured TTL to prevent old nodes from recreating the same pool namespace. If drain or persistent-state cleanup cannot complete, `destroy()` throws `PoolDestroyIncompleteException` and leaves the namespace fenced as `DESTROYING`; retry `destroy()` to finish cleanup.
+
+### 9. fsb Templates
+
+Manage fast-sandbox (fsb) golden-image templates. The build is asynchronous: poll `getTemplate` until the phase is `Succeeded`, and treat `Failed` as terminal by surfacing `status.message`. Template management requires a Kubernetes-backed runtime.
+
+```java
+import com.alibaba.opensandbox.sandbox.SandboxManager;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CreateTemplateRequest;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.TemplateFormat;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.TemplateInfo;
+
+SandboxManager manager = SandboxManager.builder()
+    .connectionConfig(config)
+    .build();
+
+TemplateInfo template = manager.createTemplate(
+    CreateTemplateRequest.builder()
+        .image("python:3.11")
+        .publish("s3://bucket/templates/py311")
+        .format(TemplateFormat.NATIVE)
+        .build()
+);
+
+// Poll getTemplate until the build finishes (or fails).
+// In Kotlin: template.status.phase  (dot-access shorthand)
+// In Java:   template.getStatus().getPhase()  (JavaBean getter)
+while (!"Succeeded".equals(template.getStatus().getPhase())
+       && !"Failed".equals(template.getStatus().getPhase())) {
+    Thread.sleep(5000);
+    template = manager.getTemplate(template.getTemplateId());
+}
+if ("Failed".equals(template.getStatus().getPhase())) {
+    throw new IllegalStateException(
+        "template build failed: " + template.getStatus().getMessage());
+}
+```
+
+`format` selects the snapshot storage encoding: `TemplateFormat.NATIVE` publishes raw snapshots to the `s3://` target, while `TemplateFormat.OVERLAYBD` (the default) publishes an overlaybd snapshot set to the `oci://registry/repository` target (repository only, no tag or digest; the immutable published reference is reported in `status.manifestRef`). Boot a sandbox from a built template using the fluent launcher:
+
+```java
+import com.alibaba.opensandbox.sandbox.Sandbox;
+import java.time.Duration;
+
+Sandbox sandbox = Sandbox.fromTemplate()
+    .templateId(template.getTemplateId())
+    .timeout(Duration.ofMinutes(30))
+    .create();
+```
+
+> **Note for Java callers:** Kotlin `val` properties expose JavaBean-style getters (`getStatus()`, `getPhase()`, etc.) rather than direct field access. The examples above use getter syntax for Java compatibility; in pure Kotlin code you can use the dot-access shorthand.
 
 ## Configuration
 
@@ -273,12 +472,16 @@ Pool lifecycle semantics:
 
 The `ConnectionConfig` class manages API server connection settings.
 
+Transfer timeouts:
+
+- `requestTimeout` bounds each transport phase - connecting, waiting for response headers, and waiting for more of a response body - but it never caps a healthy file upload or download that keeps making progress. A transfer that stalls for longer than the timeout, or an upload that gets no response headers within it after the body has been sent, fails instead of hanging (the Go SDK's `ResponseHeaderTimeout` contract). An explicit `RetryPolicy.overallDeadline` still caps the whole transfer.
+
 | Parameter        | Description                                | Default                      | Environment Variable   |
 | ---------------- | ------------------------------------------ | ---------------------------- | ---------------------- |
 | `apiKey`         | API Key for authentication                 | Required                     | `OPEN_SANDBOX_API_KEY` |
 | `domain`         | The endpoint domain of the sandbox service | Required (or localhost:8080) | `OPEN_SANDBOX_DOMAIN`  |
 | `protocol`       | HTTP protocol (http/https)                 | `http`                       | -                      |
-| `requestTimeout` | Timeout for API requests                   | 30 seconds                   | -                      |
+| `requestTimeout` | Timeout for API requests; command, code and isolated-session streams (SSE) wait at most `max(requestTimeout, 30s)` for the response and between stream bytes, with no cap on the whole stream | 30 seconds                   | -                      |
 | `debug`          | Enable debug logging for HTTP requests     | `false`                      | -                      |
 | `headers`        | Custom HTTP headers                        | Empty                        | -                      |
 | `connectionPool` | Shared OKHttp ConnectionPool               | SDK-created per instance     | -                      |
@@ -322,10 +525,10 @@ The `Sandbox.builder()` allows configuring the sandbox environment.
 | `metadata`     | Custom metadata tags                     | Empty                           |
 | `extensions`   | Opaque server-side extension parameters  | Empty                           |
 | `networkPolicy` | Optional outbound network policy (egress) | -                             |
+| `credentialProxy` | Optional Credential Vault proxy startup settings | -                     |
 | `readyTimeout` | Max time to wait for sandbox to be ready | 30 seconds                      |
 
-Note: metadata keys under `opensandbox.io/` are reserved for system-managed
-labels and will be rejected by the server.
+Note: metadata keys under `opensandbox.io/` are reserved for system-managed labels and will be rejected by the server.
 
 ```java
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy;
@@ -335,10 +538,7 @@ Sandbox sandbox = Sandbox.builder()
     .connectionConfig(config)
     .image("python:3.11")
     .timeout(Duration.ofMinutes(30))
-    .resource(map -> {
-        map.put("cpu", "2");
-        map.put("memory", "4Gi");
-    })
+    .resource(Map.of("cpu", "2", "memory", "4Gi"))
     .env("PYTHONPATH", "/app")
     .metadata("project", "demo")
     .extension("storage.id", "dataset-001")
@@ -356,10 +556,29 @@ Sandbox sandbox = Sandbox.builder()
     .build();
 ```
 
+A rule can scope by TCP destination ports instead of a target — `ports` (each 1–65535, at most 256 per rule, no duplicates) may replace `target` entirely, and combining a domain `target` with `ports` is rejected. Docker, Kubernetes, and Fast Sandbox backends all enforce `ports` rules; a targetless `ports` rule matches direct IP connections only, so under a deny-default policy hostname traffic still needs a domain rule alongside it.
+
+```java
+Sandbox sandbox = Sandbox.builder()
+    .connectionConfig(config)
+    .image("python:3.11")
+    .networkPolicy(
+        NetworkPolicy.builder()
+            .defaultAction(NetworkPolicy.DefaultAction.DENY)
+            .addEgress(
+                NetworkRule.builder()
+                    .action(NetworkRule.Action.ALLOW)
+                    .ports(List.of(443, 8443))
+                    .build()
+            )
+            .build()
+    )
+    .build();
+```
+
 ### 3. Runtime Egress Policy Updates
 
-Runtime egress reads and patches go directly to the sandbox egress sidecar.
-The SDK first resolves the sandbox endpoint on port `18080`, then calls the sidecar `/policy` API.
+Runtime egress reads and patches go directly to the sandbox egress sidecar. The SDK first resolves the sandbox endpoint on port `18080`, then calls the sidecar `/policy` API.
 
 Patch uses merge semantics:
 - Incoming rules take priority over existing rules with the same `target`.
@@ -377,3 +596,93 @@ sandbox.patchEgressRules(
     )
 );
 ```
+
+### 4. Credential Vault
+
+Credential Vault injects outbound credentials from the egress sidecar while keeping real secrets out of sandbox environment variables, commands, files, and logs. Create the sandbox with `credentialProxyEnabled(true)`, then write credentials and bindings through `sandbox.credentialVault()`.
+
+```java
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Credential;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialAuth;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialBinding;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialMatch;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialVaultCreateRequest;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule;
+import java.util.List;
+
+Sandbox sandbox = Sandbox.builder()
+    .connectionConfig(config)
+    .image("python:3.11")
+    .networkPolicy(
+        NetworkPolicy.builder()
+            .defaultAction(NetworkPolicy.DefaultAction.DENY)
+            .addEgress(
+                NetworkRule.builder()
+                    .action(NetworkRule.Action.ALLOW)
+                    .target("api.example.com")
+                    .build()
+            )
+            .build()
+    )
+    .credentialProxyEnabled(true)
+    .build();
+
+sandbox.credentialVault().create(
+    CredentialVaultCreateRequest.builder()
+        .credentials(
+            List.of(
+                Credential.builder()
+                    .name("api-token")
+                    .inlineSource("<token>")
+                    .build()
+            )
+        )
+        .bindings(
+            List.of(
+                CredentialBinding.builder()
+                    .name("api-token")
+                    .match(
+                        CredentialMatch.builder()
+                            .schemes(CredentialMatch.Scheme.HTTPS)
+                            .hosts("api.example.com")
+                            .paths("/v1/*")
+                            .build()
+                    )
+                    .auth(CredentialAuth.apiKey("x-api-key", "api-token"))
+                    .build()
+            )
+        )
+        .build()
+);
+```
+
+Exchange-sourced credentials (OSEP-0025) carry no local material: the egress resolves header sets per request from a header-resolver endpoint, and bindings reference them through the typeless exchange auth form.
+
+```java
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.ExchangeCredentialSource;
+
+sandbox.credentialVault().create(
+    CredentialVaultCreateRequest.builder()
+        .credentials(
+            List.of(
+                Credential.builder()
+                    .name("spi-signer")
+                    .exchangeSource("unix:///run/spi/spi.sock")
+                    .build()
+            )
+        )
+        .bindings(
+            List.of(
+                CredentialBinding.builder()
+                    .name("internal-api")
+                    .match(CredentialMatch.builder().hosts("*.internal.example.com").build())
+                    .auth(CredentialAuth.exchange("spi-signer"))
+                    .build()
+            )
+        )
+        .build()
+);
+```
+
+See [Credential Vault](../../../docs/guides/credential-vault.md) for auth types, binding guidance, and Git/curl examples.

@@ -3,18 +3,24 @@ name: Server Tests
 on:
   pull_request:
     branches: [ main ]
-    paths:
-      - 'server/**'
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  changes:
+    uses: ./.github/workflows/detect-changes.yml
+    with:
+      area: server
+
   test:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -32,11 +38,11 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install uv
-        run: |
-          pip install uv
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
 
-      - name: Run tests
+      - name: Run tests (Linux, full suite with coverage)
+        if: runner.os == 'Linux'
         run: |
           cd server
           uv sync --all-groups
@@ -48,6 +54,28 @@ jobs:
             --cov-report=xml:reports/coverage.xml \
             --cov-fail-under=80
 
+      - name: Run tests (Windows, platform-relevant subset)
+        # Windows exists to catch Windows-only breakage (path handling, Windows
+        # profiles, OSSFS mode bits). The full suite is already gated on Linux;
+        # rerunning every OS-independent test here doubles CI time for no
+        # extra signal.
+        if: runner.os == 'Windows'
+        run: |
+          cd server
+          uv sync --all-groups
+          uv run pytest \
+            tests/test_module_imports.py \
+            tests/test_config.py \
+            tests/test_validators.py \
+            tests/test_schema.py \
+            tests/test_docker_service.py \
+            tests/test_docker_windows_profile.py \
+            tests/test_ossfs_mixin.py \
+            tests/k8s/test_k8s_windows_profile.py \
+            tests/k8s/test_batchsandbox_provider.py \
+            tests/k8s/test_agent_sandbox_provider.py \
+            tests/k8s/test_kubernetes_service.py
+
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
@@ -56,6 +84,8 @@ jobs:
           path: server/reports/coverage.xml
 
   docker-smoke:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     strategy:
       matrix:
         network: [host, bridge]
@@ -71,9 +101,8 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install uv
-        run: |
-          pip install uv
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
 
       - name: Set up Docker
         run: |
@@ -107,8 +136,19 @@ jobs:
           # Start server in background
           uv run python -m opensandbox_server.main > app.log 2>&1 &
 
-          # Wait for server to start
-          sleep 10
+          # Wait for the server health endpoint instead of a fixed sleep
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:32888/health > /dev/null 2>&1; then
+              echo "server ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "server did not become ready in 30s"
+              cat app.log
+              exit 1
+            fi
+            sleep 1
+          done
 
           # Run smoke test
           chmod +x tests/smoke.sh
@@ -117,3 +157,68 @@ jobs:
         if: always()
         run: |
           cat server/app.log
+
+  postgresql-integration:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: opensandbox
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d opensandbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      OPENSANDBOX_TEST_POSTGRESQL_DSN: postgresql://postgres:postgres@127.0.0.1:5432/opensandbox
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Run PostgreSQL repository tests
+        working-directory: server
+        run: |
+          uv sync --all-groups
+          uv run pytest -v \
+            tests/test_snapshot_repository_postgresql.py \
+            tests/test_snapshot_migration.py \
+            tests/test_snapshot_ha_postgresql_kubernetes.py
+
+  required:
+    name: Server CI
+    if: always()
+    needs: [changes, test, docker-smoke, postgresql-integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs
+        env:
+          RELEVANT: ${{ needs.changes.outputs.relevant }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          DOCKER_SMOKE_RESULT: ${{ needs.docker-smoke.result }}
+          POSTGRESQL_RESULT: ${{ needs.postgresql-integration.result }}
+        run: |
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Change detection failed: $CHANGES_RESULT"
+            exit 1
+          fi
+          if [[ "$RELEVANT" == "true" ]]; then
+            [[ "$TEST_RESULT" == "success" && "$DOCKER_SMOKE_RESULT" == "success" && "$POSTGRESQL_RESULT" == "success" ]]
+          else
+            [[ "$RELEVANT" == "false" && "$TEST_RESULT" == "skipped" && "$DOCKER_SMOKE_RESULT" == "skipped" && "$POSTGRESQL_RESULT" == "skipped" ]]
+          fi

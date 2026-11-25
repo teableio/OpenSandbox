@@ -97,7 +97,8 @@ kubernetes/
 │   ├── manager/                   # Controller manager deployment
 │   ├── rbac/                      # ClusterRole bindings
 │   └── samples/                   # Example resources
-├── charts/opensandbox-controller/ # Helm chart
+├── ../manifests/charts/           # Helm charts (base, controller, server,
+│                                  #  ingress-gateway, node-agent, opensandbox umbrella)
 ├── test/
 │   ├── e2e/                       # Core e2e tests (Kind-based)
 │   ├── e2e_task/                  # Task-executor e2e tests
@@ -143,7 +144,7 @@ PoolReconciler.Reconcile
 ```
 
 Allocation state is stored in memory (`InMemoryAllocationStore`) and persisted to BatchSandbox annotations:
-- `sandbox.opensandbox.io/alloc-status`: `{"pods":["pod-1","pod-2"]}`
+- `sandbox.opensandbox.io/alloc-status`: current pool allocation. Legacy `{"pods":["pod-1","pod-2"]}` remains accepted and readable. Current controller writes include additive `poolRef` and `generation` fields, for example `{"pods":["pod-1","pod-2"],"poolRef":"pool-a","generation":42}`. `generation` records the BatchSandbox generation associated with the write; it is not an evidence-freshness predicate.
 - `sandbox.opensandbox.io/alloc-release`: `{"pods":["pod-3"]}`
 
 On startup, `InMemoryAllocationStore.Recover` rebuilds the in-memory state from all BatchSandbox annotations.
@@ -183,12 +184,13 @@ To add a custom strategy implementation:
 
 ### Cache Field Indexes
 
-Custom field indexes are registered at startup in `internal/utils/fieldindex/register.go`:
+The shared field indexes are registered at startup in `internal/utils/fieldindex/register.go`. The BatchSandbox reconciler also registers its pooled Pod event index in `SetupWithManager`.
 
 | Index Name | Resource | Purpose |
 |------------|----------|---------|
 | `ownerRefUID` | Pod | List pods by owner UID (used by both reconcilers) |
 | `poolRef` | BatchSandbox | List BatchSandboxes by pool name (used by PoolReconciler) |
+| `allocatedPoolPod` | BatchSandbox | Find allocation candidates by pool and Pod name for a Pod event |
 
 ## Coding Standards
 
@@ -296,7 +298,7 @@ make generate    # DeepCopy methods
 Generated paths:
 - `config/crd/bases/` — CRD YAML from `apis/` type annotations
 - `pkg/client/` — clientset, informer, lister (codegen)
-- `internal/controller/allocator_mock.go` — gomock mocks (regenerate with `mockgen`)
+- `internal/controller/allocator_mock_test.go` — gomock mocks (regenerate with `mockgen`)
 
 ## Testing
 
@@ -387,7 +389,7 @@ mockStore.EXPECT().GetAllocation(gomock.Any(), gomock.Any()).Return(&PoolAllocat
    ```
 3. Implement controller logic to handle the new field
 4. Add unit tests
-5. Update CRD YAML in Helm chart (`charts/opensandbox-controller/templates/crds/`)
+5. Sync CRDs into the base Helm chart (`make -C manifests helm-gen-crds` updates `manifests/charts/base/files/crds.yaml`; `make manifests` runs it automatically)
 
 ### Adding a New Strategy Implementation
 
@@ -408,10 +410,10 @@ The controller communicates allocation state through annotations on BatchSandbox
 
 | Annotation Key | JSON Shape | Writer | Reader |
 |---|---|---|---|
-| `sandbox.opensandbox.io/alloc-status` | `{"pods":["pod-1"]}` | `allocator.go` via `apis.go` | `batchsandbox_controller.go` |
+| `sandbox.opensandbox.io/alloc-status` | Legacy: `{"pods":["pod-1"]}`; current writer: `{"pods":["pod-1"],"poolRef":"pool-a","generation":42}` | `allocator.go` via `apis.go` | `batchsandbox_controller.go` |
 | `sandbox.opensandbox.io/alloc-release` | `{"pods":["pod-3"]}` | `batchsandbox_controller.go` | `allocator.go` |
 
-When changing annotation shapes, update all readers and writers, and add migration logic if the change is not backward-compatible.
+The `poolRef` and `generation` fields in `alloc-status` are additive. Continue to accept and read the legacy pods-only shape. `generation` traces the BatchSandbox generation for the annotation write; do not use it as an evidence-freshness predicate. When changing annotation shapes, update all readers and writers, and add migration logic if the change is not backward-compatible.
 
 ## Build and Deploy
 
@@ -447,15 +449,15 @@ make undeploy    # Remove controller
 ### Deploying with Helm
 
 ```bash
-make helm-install
+make -C manifests helm-install
 # Or with custom values
-helm install opensandbox-controller ./charts/opensandbox-controller \
+helm install opensandbox-controller ../manifests/charts/controller \
   --set controller.image.repository=myregistry/controller \
   --set controller.image.tag=v0.1.0 \
   --namespace opensandbox-system --create-namespace
 ```
 
-See `docs/HELM-DEPLOYMENT.md` for full Helm documentation.
+See `../manifests/HELM-DEPLOYMENT.md` for full Helm documentation.
 
 ### Controller Configuration
 
@@ -466,8 +468,12 @@ Key flags (see `cmd/controller/main.go`):
 | `--metrics-bind-address` | `0` | Metrics endpoint address |
 | `--health-probe-bind-address` | `:8081` | Health probe address |
 | `--leader-elect` | `false` | Enable leader election |
+| `--leader-elect-lease-duration` | `15s` | How long standby replicas wait before taking over the lease |
+| `--leader-elect-renew-deadline` | `10s` | How long the leader retries renewing before giving up leadership; must be less than the lease duration |
+| `--leader-elect-retry-period` | `2s` | Interval between lease acquire and renew attempts; the renew deadline must be more than 1.2 times this value |
 | `--kube-client-qps` | `100` | K8s client QPS |
 | `--kube-client-burst` | `200` | K8s client burst |
+| `--namespaces` | — | Comma-separated namespaces scoping the informer cache; empty watches the whole cluster |
 | `--concurrency` | — | Per-controller concurrency, e.g. `batchsandbox=32;pool=128` |
 | `--enable-file-log` | `false` | Enable file log rotation |
 
@@ -531,6 +537,10 @@ curl -X POST http://localhost:5758/tasks -d '{"name":"test","process":{"command"
 **Allocation recovery fails on startup**: `InMemoryAllocationStore.Recover` reads all BatchSandbox annotations. If annotations are malformed, the controller will exit. Check `sandbox.opensandbox.io/alloc-status` annotation format.
 
 **Scale expectations blocking creates**: If the controller restarts mid-scale, expectations may be stale. They time out after `expectationTimeout` (default 30s).
+
+## Telemetry
+
+The controller emits OpenTelemetry metrics for the pool allocation path and capacity gauges, with OTLP export configured through standard `OTEL_*` environment variables (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`). See [docs/telemetry.md](./docs/telemetry.md) for the signal specification and configuration guide.
 
 ## Contributing
 

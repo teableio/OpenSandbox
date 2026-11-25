@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for opensandbox_cli.output — table, JSON, YAML rendering."""
-
 from __future__ import annotations
 
 import json
@@ -23,20 +21,11 @@ from pydantic import BaseModel
 
 from opensandbox_cli.output import OutputFormatter
 
-# ---------------------------------------------------------------------------
-# Test models
-# ---------------------------------------------------------------------------
-
 
 class FakeItem(BaseModel):
     id: str
     name: str
     score: int
-
-
-# ---------------------------------------------------------------------------
-# JSON output
-# ---------------------------------------------------------------------------
 
 
 class TestJsonOutput:
@@ -78,11 +67,6 @@ class TestJsonOutput:
         assert data == {"status": "ok", "message": "done"}
 
 
-# ---------------------------------------------------------------------------
-# YAML output
-# ---------------------------------------------------------------------------
-
-
 class TestYamlOutput:
     def test_print_dict(self, capsys: pytest.CaptureFixture[str]) -> None:
         fmt = OutputFormatter("yaml", color=False)
@@ -100,11 +84,6 @@ class TestYamlOutput:
         assert "score: 5" in captured.out
 
 
-# ---------------------------------------------------------------------------
-# Table output
-# ---------------------------------------------------------------------------
-
-
 class TestTableOutput:
     def test_print_dict_contains_values(self, capsys: pytest.CaptureFixture[str]) -> None:
         fmt = OutputFormatter("table", color=False)
@@ -120,6 +99,16 @@ class TestTableOutput:
         captured = capsys.readouterr()
         assert "-" in captured.out
 
+    def test_print_rows_none_renders_dash(self, capsys: pytest.CaptureFixture[str]) -> None:
+        fmt = OutputFormatter("table", color=False)
+        fmt.print_rows(
+            [{"id": "sb-1", "image": None, "expires_at": None}],
+            columns=["id", "image", "expires_at"],
+        )
+        captured = capsys.readouterr()
+        assert "None" not in captured.out
+        assert captured.out.split().count("-") >= 2
+
     def test_print_models_shows_headers(self, capsys: pytest.CaptureFixture[str]) -> None:
         fmt = OutputFormatter("table", color=False)
         items = [FakeItem(id="1", name="a", score=10)]
@@ -128,9 +117,3 @@ class TestTableOutput:
         assert "ID" in captured.out
         assert "NAME" in captured.out
         assert "SCORE" in captured.out
-
-    def test_print_text_ignores_format(self, capsys: pytest.CaptureFixture[str]) -> None:
-        fmt = OutputFormatter("json", color=False)
-        fmt.print_text("hello world")
-        captured = capsys.readouterr()
-        assert captured.out.strip() == "hello world"

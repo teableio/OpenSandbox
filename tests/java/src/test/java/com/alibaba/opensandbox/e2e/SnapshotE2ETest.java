@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -250,6 +249,9 @@ public class SnapshotE2ETest extends BaseE2ETest {
         assertEquals(expectedId, snapshot.getId());
         assertEquals(expectedSandboxId, snapshot.getSandboxId());
         assertEquals(expectedName, snapshot.getName());
+        // Every snapshot in this suite uses the default mode; the SDK must
+        // report it (responses predating the field read back as "full").
+        assertEquals("full", snapshot.getMode());
         assertNotNull(snapshot.getStatus());
         assertEquals(expectedState, snapshot.getStatus().getState());
         assertNotNull(snapshot.getCreatedAt(), "snapshot.createdAt should be present");

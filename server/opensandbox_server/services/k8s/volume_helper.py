@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,19 @@ from opensandbox_server.api.schema import Volume
 logger = logging.getLogger(__name__)
 
 
+def _get_pvc_source_read_only_policies(volumes: List[Volume]) -> Dict[str, bool]:
+    """Keep a PVC source read-only only when every mount of that claim is read-only."""
+    policies: Dict[str, bool] = {}
+    for vol in volumes:
+        if vol.pvc is None:
+            continue
+
+        claim_name = vol.pvc.claim_name
+        policies[claim_name] = policies.get(claim_name, True) and vol.read_only
+
+    return policies
+
+
 def apply_volumes_to_pod_spec(
     pod_spec: Dict[str, Any],
     volumes: List[Volume],
@@ -40,6 +53,7 @@ def apply_volumes_to_pod_spec(
 
     existing_volume_names = {v.get("name") for v in pod_volumes if isinstance(v, dict)}
     pvc_to_volume_name: Dict[str, str] = {}
+    pvc_source_read_only = _get_pvc_source_read_only_policies(volumes)
 
     for vol in volumes:
         vol_name = vol.name
@@ -58,6 +72,7 @@ def apply_volumes_to_pod_spec(
                     "name": vol_name,
                     "persistentVolumeClaim": {
                         "claimName": pvc_claim_name,
+                        "readOnly": pvc_source_read_only[pvc_claim_name],
                     },
                 })
                 pvc_to_volume_name[pvc_claim_name] = vol_name
@@ -73,7 +88,9 @@ def apply_volumes_to_pod_spec(
             mounts.append(mount)
 
             logger.info(
-                f"Added PVC volume '{vol_name}' (claim: {pvc_claim_name}) mounted at '{vol.mount_path}' for sandbox"
+                f"Added PVC volume '{pvc_to_volume_name[pvc_claim_name]}' "
+                f"(claim: {pvc_claim_name}, read_only={vol.read_only}) mounted "
+                f"at '{vol.mount_path}' for sandbox"
             )
         elif vol.host is not None:
             host_path = vol.host.path

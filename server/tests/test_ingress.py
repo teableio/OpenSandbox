@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,11 +70,6 @@ def test_format_ingress_endpoint_header():
     assert endpoint is not None
     assert endpoint.endpoint == "gateway.example.com"
     assert endpoint.headers == {OPEN_SANDBOX_INGRESS_HEADER: "sid-8080"}
-
-
-# ============================================================
-# Signed ingress endpoints
-# ============================================================
 
 
 def test_format_signed_ingress_endpoint_wildcard():

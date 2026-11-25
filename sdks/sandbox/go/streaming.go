@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 )
@@ -46,12 +47,16 @@ func streamSSE(ctx context.Context, resp *http.Response, handler EventHandler) e
 	defer resp.Body.Close()
 
 	scanner := bufio.NewScanner(resp.Body)
-	// Increase scanner buffer from default 64KiB to 4MiB to handle large SSE data lines.
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner.Split(splitSSELines())
+	// Do not cap the line length: execd writes each stdout/stderr line of a
+	// command as one event line of unbounded size, and the event is kept in
+	// memory by the handler anyway. The buffer starts at 64KiB and grows.
+	scanner.Buffer(make([]byte, 64*1024), math.MaxInt)
 
 	var current StreamEvent
 	var dataLines []string
 	eventCount := 0
+	firstLine := true
 
 	for {
 		select {
@@ -79,6 +84,12 @@ func streamSSE(ctx context.Context, resp *http.Response, handler EventHandler) e
 		}
 
 		line := scanner.Text()
+		if firstLine {
+			// SSE permits one UTF-8 BOM at the start of the response. Scanner
+			// assembles the line even when the BOM spans multiple body reads.
+			line = strings.TrimPrefix(line, "\ufeff")
+			firstLine = false
+		}
 
 		// Empty line signals end of an event block.
 		if line == "" {
@@ -101,16 +112,24 @@ func streamSSE(ctx context.Context, resp *http.Response, handler EventHandler) e
 		}
 
 		// NDJSON support: if a line starts with '{', treat it as a raw JSON
-		// event. The execd server writes raw JSON blobs separated by blank
-		// lines instead of standard SSE "data:" prefixed lines.
+		// event. The execd server writes raw JSON blobs instead of standard
+		// SSE "data:" prefixed lines. Dispatch each one immediately: command
+		// streams follow it with a blank line, but /metrics/watch writes one
+		// object per line with no blank line, so waiting would never dispatch.
 		if strings.HasPrefix(line, "{") {
-			dataLines = append(dataLines, line)
+			event := current
+			event.Data = line
 			// Extract "type" field to populate Event so downstream handlers
 			// that switch on event.Event work consistently for NDJSON streams.
 			var probe struct{ Type string }
 			if json.Unmarshal([]byte(line), &probe) == nil && probe.Type != "" {
-				current.Event = probe.Type
+				event.Event = probe.Type
 			}
+			if err := handler(event); err != nil {
+				return err
+			}
+			eventCount++
+			current = StreamEvent{}
 			continue
 		}
 
@@ -127,5 +146,34 @@ func streamSSE(ctx context.Context, resp *http.Response, handler EventHandler) e
 		case "id":
 			current.ID = value
 		}
+	}
+}
+
+// splitSSELines recognizes LF, CRLF, and CR as required by the SSE format.
+// Dispatch a line as soon as CR arrives; waiting for a possible LF would stall
+// a complete event when the server keeps the stream open without more data.
+func splitSSELines() bufio.SplitFunc {
+	skipLF := false
+	return func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		start := 0
+		if skipLF && len(data) > 0 {
+			skipLF = false
+			if data[0] == '\n' {
+				start = 1
+			}
+		}
+		for i := start; i < len(data); i++ {
+			switch data[i] {
+			case '\r':
+				skipLF = true
+				return i + 1, data[start:i], nil
+			case '\n':
+				return i + 1, data[start:i], nil
+			}
+		}
+		if atEOF && len(data) > start {
+			return len(data), data[start:], nil
+		}
+		return start, nil, nil
 	}
 }

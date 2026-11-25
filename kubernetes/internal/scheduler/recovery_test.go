@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,8 @@
 package scheduler
 
 import (
+	"errors"
 	"reflect"
-	"sync"
 	"testing"
 	"time"
 
@@ -85,6 +85,7 @@ func Test_recoverOneTaskNode(t *testing.T) {
 				Status:              testTask,
 				IP:                  "1.2.3.4",
 				PodName:             "foo-bar",
+				PodUID:              "bound-pod-uid",
 				tState:              RunningTaskState,
 				tStateLastTransTime: &mockTimeNow,
 			},
@@ -101,6 +102,7 @@ func Test_recoverOneTaskNode(t *testing.T) {
 				Status:              testReleasingTask,
 				IP:                  "1.2.3.4",
 				PodName:             "foo-bar",
+				PodUID:              "bound-pod-uid",
 				sState:              stateReleasing,
 				sStateLastTransTime: &mockTimeNow,
 				tState:              RunningTaskState,
@@ -110,7 +112,11 @@ func Test_recoverOneTaskNode(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			recoverOneTaskNode(tt.args.tNode, tt.args.currentTask, tt.args.ip, tt.args.podName, testLogger)
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: tt.args.podName, UID: "bound-pod-uid"},
+				Status:     corev1.PodStatus{PodIP: tt.args.ip},
+			}
+			recoverOneTaskNode(tt.args.tNode, tt.args.currentTask, pod, testLogger)
 			if tt.expectTaskNode != nil {
 				if !reflect.DeepEqual(tt.expectTaskNode, tt.args.tNode) {
 					t.Errorf("recoverOneTaskNode, want %+v, got %+v", tt.expectTaskNode, tt.args.tNode)
@@ -162,6 +168,7 @@ func Test_defaultTaskScheduler_recoverTaskNodesStatus(t *testing.T) {
 		},
 		Status:              testTask,
 		PodName:             "test-0",
+		PodUID:              "test-pod-uid",
 		IP:                  "1.2.3.4",
 		tState:              RunningTaskState,
 		tStateLastTransTime: &mockTimeNow,
@@ -173,7 +180,6 @@ func Test_defaultTaskScheduler_recoverTaskNodesStatus(t *testing.T) {
 		taskNodes           []*taskNode
 		taskNodeByNameIndex map[string]*taskNode
 		maxConcurrency      int
-		once                sync.Once
 		taskStatusCollector taskStatusCollector
 	}
 	tests := []struct {
@@ -224,7 +230,7 @@ func Test_defaultTaskScheduler_recoverTaskNodesStatus(t *testing.T) {
 				},
 				taskStatusCollector: func() taskStatusCollector {
 					mock := NewMocktaskStatusCollector(ctl)
-					mock.EXPECT().Collect(gomock.Any(), []string{"1.2.3.4"}).Return(map[string]*api.Task{"1.2.3.4": nil}).Times(1)
+					mock.EXPECT().Collect(gomock.Any(), []string{"1.2.3.4"}).Return(map[string]*api.Task{"1.2.3.4": nil}, nil).Times(1)
 					return mock
 				}(),
 			},
@@ -237,15 +243,19 @@ func Test_defaultTaskScheduler_recoverTaskNodesStatus(t *testing.T) {
 			},
 		},
 		{
-			name: "recover successfully, client return running task via endpoint",
+			name: "recover running task without querying terminating Pod",
 			fields: fields{
 				allPods: []*corev1.Pod{{
 					ObjectMeta: v1.ObjectMeta{
 						Name: "test-0",
+						UID:  "test-pod-uid",
 					},
 					Status: corev1.PodStatus{
 						PodIP: "1.2.3.4",
 					},
+				}, {
+					ObjectMeta: v1.ObjectMeta{Name: "terminating-pod", DeletionTimestamp: &testNow},
+					Status:     corev1.PodStatus{PodIP: "1.2.3.5"},
 				}},
 				taskNodes: []*taskNode{testTaskNode},
 				taskNodeByNameIndex: map[string]*taskNode{
@@ -253,7 +263,7 @@ func Test_defaultTaskScheduler_recoverTaskNodesStatus(t *testing.T) {
 				},
 				taskStatusCollector: func() taskStatusCollector {
 					mock := NewMocktaskStatusCollector(ctl)
-					mock.EXPECT().Collect(gomock.Any(), []string{"1.2.3.4"}).Return(map[string]*api.Task{"1.2.3.4": testTask}).Times(1)
+					mock.EXPECT().Collect(gomock.Any(), []string{"1.2.3.4"}).Return(map[string]*api.Task{"1.2.3.4": testTask}, nil).Times(1)
 					return mock
 				}(),
 			},
@@ -283,5 +293,111 @@ func Test_defaultTaskScheduler_recoverTaskNodesStatus(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func Test_defaultTaskScheduler_recoverTaskNodesStatusIsAtomicOnCollectionError(t *testing.T) {
+	ctl := gomock.NewController(t)
+	defer ctl.Finish()
+
+	firstNode := &taskNode{
+		ObjectMeta: v1.ObjectMeta{Name: "task-1"},
+		Status:     &api.Task{Name: "task-1"},
+		IP:         "192.0.2.1",
+		PodName:    "pod-1",
+		tState:     RunningTaskState,
+	}
+	secondNode := &taskNode{
+		ObjectMeta: v1.ObjectMeta{Name: "task-2"},
+		Status:     &api.Task{Name: "task-2"},
+		IP:         "192.0.2.2",
+		PodName:    "pod-2",
+		tState:     RunningTaskState,
+	}
+	firstNodeBefore := *firstNode
+	secondNodeBefore := *secondNode
+	queryErr := errors.New("executor unavailable")
+
+	collector := NewMocktaskStatusCollector(ctl)
+	collector.EXPECT().Collect(gomock.Any(), []string{"192.0.2.1", "192.0.2.2"}).Return(map[string]*api.Task{
+		"192.0.2.1": {Name: "task-1"},
+	}, queryErr).Times(1)
+
+	sch := &defaultTaskScheduler{
+		allPods: []*corev1.Pod{
+			{ObjectMeta: v1.ObjectMeta{Name: "pod-1"}, Status: corev1.PodStatus{PodIP: "192.0.2.1"}},
+			{ObjectMeta: v1.ObjectMeta{Name: "pod-2"}, Status: corev1.PodStatus{PodIP: "192.0.2.2"}},
+		},
+		taskNodes:           []*taskNode{firstNode, secondNode},
+		taskNodeByNameIndex: map[string]*taskNode{"task-1": firstNode, "task-2": secondNode},
+		taskStatusCollector: collector,
+		logger:              testLogger,
+	}
+
+	err := sch.recoverTaskNodesStatus()
+	if !errors.Is(err, queryErr) {
+		t.Fatalf("recoverTaskNodesStatus() error = %v, want wrapped collection error", err)
+	}
+	if !reflect.DeepEqual(firstNodeBefore, *firstNode) {
+		t.Fatalf("first task node changed after failed recovery: before=%+v after=%+v", firstNodeBefore, *firstNode)
+	}
+	if !reflect.DeepEqual(secondNodeBefore, *secondNode) {
+		t.Fatalf("second task node changed after failed recovery: before=%+v after=%+v", secondNodeBefore, *secondNode)
+	}
+}
+
+func Test_defaultTaskScheduler_recoverPropagatesCollectionError(t *testing.T) {
+	ctl := gomock.NewController(t)
+	defer ctl.Finish()
+
+	queryErr := errors.New("executor unavailable")
+	collector := NewMocktaskStatusCollector(ctl)
+	collector.EXPECT().Collect(gomock.Any(), []string{"192.0.2.1"}).Return(nil, queryErr).Times(1)
+
+	sch := &defaultTaskScheduler{
+		allPods: []*corev1.Pod{{
+			ObjectMeta: v1.ObjectMeta{Name: "pod-1"},
+			Status:     corev1.PodStatus{PodIP: "192.0.2.1"},
+		}},
+		taskStatusCollector: collector,
+		logger:              testLogger,
+	}
+	if err := sch.recover(); !errors.Is(err, queryErr) {
+		t.Fatalf("recover() error = %v, want wrapped collection error", err)
+	}
+}
+
+func Test_defaultTaskScheduler_recoverTaskNodesStatusRejectsIncompleteCollection(t *testing.T) {
+	ctl := gomock.NewController(t)
+	defer ctl.Finish()
+
+	firstNode := &taskNode{ObjectMeta: v1.ObjectMeta{Name: "task-1"}}
+	secondNode := &taskNode{ObjectMeta: v1.ObjectMeta{Name: "task-2"}}
+	firstNodeBefore := *firstNode
+	secondNodeBefore := *secondNode
+	collector := NewMocktaskStatusCollector(ctl)
+	collector.EXPECT().Collect(gomock.Any(), []string{"192.0.2.1", "192.0.2.2"}).Return(map[string]*api.Task{
+		"192.0.2.1": {Name: "task-1"},
+	}, nil).Times(1)
+
+	sch := &defaultTaskScheduler{
+		allPods: []*corev1.Pod{
+			{ObjectMeta: v1.ObjectMeta{Name: "pod-1"}, Status: corev1.PodStatus{PodIP: "192.0.2.1"}},
+			{ObjectMeta: v1.ObjectMeta{Name: "pod-2"}, Status: corev1.PodStatus{PodIP: "192.0.2.2"}},
+		},
+		taskNodes:           []*taskNode{firstNode, secondNode},
+		taskNodeByNameIndex: map[string]*taskNode{"task-1": firstNode, "task-2": secondNode},
+		taskStatusCollector: collector,
+		logger:              testLogger,
+	}
+
+	if err := sch.recoverTaskNodesStatus(); err == nil {
+		t.Fatal("recoverTaskNodesStatus() error = nil, want incomplete collection error")
+	}
+	if !reflect.DeepEqual(firstNodeBefore, *firstNode) {
+		t.Fatalf("first task node changed after incomplete recovery: before=%+v after=%+v", firstNodeBefore, *firstNode)
+	}
+	if !reflect.DeepEqual(secondNodeBefore, *secondNode) {
+		t.Fatalf("second task node changed after incomplete recovery: before=%+v after=%+v", secondNodeBefore, *secondNode)
 	}
 }

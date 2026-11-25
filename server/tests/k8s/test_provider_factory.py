@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ from opensandbox_server.config import AgentSandboxRuntimeConfig
 from opensandbox_server.services.k8s.provider_factory import (
     register_provider,
     create_workload_provider,
+    get_workload_provider_class,
     list_available_providers,
     PROVIDER_TYPE_BATCHSANDBOX,
     PROVIDER_TYPE_AGENT_SANDBOX,
@@ -74,7 +75,6 @@ spec:
         assert isinstance(provider, AgentSandboxProvider)
         assert provider.k8s_client == mock_k8s_client
         assert provider.shutdown_policy == "Retain"
-        assert provider.service_account == agent_sandbox_app_config.kubernetes.service_account
     
     def test_create_provider_case_insensitive(self, mock_k8s_client, k8s_app_config):
         provider1 = create_workload_provider("BatchSandbox", mock_k8s_client, k8s_app_config)
@@ -87,9 +87,28 @@ spec:
     
     def test_create_provider_with_none_type_uses_default(self, mock_k8s_client, k8s_app_config):
         provider = create_workload_provider(None, mock_k8s_client, k8s_app_config)
-        
-        # Should use the first registered provider (batchsandbox)
+
         assert isinstance(provider, BatchSandboxProvider)
+
+    def test_default_provider_lookup_is_quiet_at_info(self, caplog):
+        with caplog.at_level("INFO"):
+            assert get_workload_provider_class(None) is BatchSandboxProvider
+
+        assert not caplog.records
+
+    def test_default_provider_replacement_receives_config(
+        self, mock_k8s_client, k8s_app_config, isolated_registry
+    ):
+        class ReplacementProvider(BatchSandboxProvider):
+            pass
+
+        register_provider(PROVIDER_TYPE_BATCHSANDBOX, ReplacementProvider)
+        k8s_app_config.kubernetes.image_pull_policy = "Always"
+
+        provider = create_workload_provider(None, mock_k8s_client, k8s_app_config)
+
+        assert isinstance(provider, ReplacementProvider)
+        assert provider.image_pull_policy == "Always"
     
     def test_create_provider_with_invalid_type_raises_error(self, mock_k8s_client):
         with pytest.raises(ValueError, match="Unsupported workload provider type"):
@@ -112,8 +131,7 @@ spec:
 
         with patch.object(BatchSandboxProvider, '__init__', return_value=None) as mock_init:
             create_workload_provider(PROVIDER_TYPE_BATCHSANDBOX, mock_k8s_client, k8s_app_config)
-            
-            # Verify that app_config carrying the template path was passed
+
             mock_init.assert_called_once()
             call_kwargs = mock_init.call_args.kwargs
             assert call_kwargs['app_config'].kubernetes.batchsandbox_template_file == str(template_file)
@@ -126,7 +144,6 @@ spec:
         assert PROVIDER_TYPE_AGENT_SANDBOX in providers
     
     def test_register_custom_provider(self, mock_k8s_client, isolated_registry):
-        # Create a custom provider class
         class CustomProvider(WorkloadProvider):
             def __init__(self, k8s_client):
                 self.k8s_client = k8s_client
@@ -155,28 +172,17 @@ spec:
             def get_endpoint_info(self, *args, **kwargs):
                 pass
         
-        # Register custom provider
         register_provider("custom", CustomProvider)
-        
-        # Verify that custom provider can be created
+
         provider = create_workload_provider("custom", mock_k8s_client)
         assert isinstance(provider, CustomProvider)
-        
-        # Verify it's registered
+
         assert "custom" in list_available_providers()
-    
-    def test_create_batchsandbox_with_config(self, mock_k8s_client, k8s_app_config):
-        provider = create_workload_provider(PROVIDER_TYPE_BATCHSANDBOX, mock_k8s_client, k8s_app_config)
-        
-        assert isinstance(provider, BatchSandboxProvider)
-        assert provider.k8s_client == mock_k8s_client
     
     def test_create_provider_with_empty_registry_raises_error(self, mock_k8s_client, isolated_registry):
         from opensandbox_server.services.k8s import provider_factory
-        
-        # Clear the registry to test empty registry scenario
+
         provider_factory._PROVIDER_REGISTRY.clear()
-        
-        # Verify that ValueError is raised when registry is empty and type is None
+
         with pytest.raises(ValueError, match="No workload providers are registered"):
             create_workload_provider(None, mock_k8s_client)

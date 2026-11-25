@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,10 +15,12 @@
 """
 Authentication middleware for OpenSandbox Lifecycle API.
 
-This module implements API Key authentication as specified in the OpenAPI spec.
-API keys are configured via config.toml and validated against the OPEN-SANDBOX-API-KEY header.
+Supports two modes:
+- Single-tenant: validates against server.api_key (legacy)
+- Multi-tenant: delegates to a TenantProvider for key→tenant resolution
 """
 
+import logging
 from typing import Callable, Optional
 
 from fastapi import Request, Response, status
@@ -26,6 +28,10 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from opensandbox_server.config import AppConfig, get_config
+from opensandbox_server.tenants.context import set_current_tenant
+from opensandbox_server.tenants.provider import TenantProvider, TenantProviderUnavailable
+
+logger = logging.getLogger(__name__)
 
 SANDBOX_API_KEY_HEADER = "OPEN-SANDBOX-API-KEY"
 
@@ -45,19 +51,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
     # machine API; an unauthenticated one would serve arbitrary sandbox content on the
     # server's own origin. WebSocket upgrades bypass this middleware (BaseHTTPMiddleware
     # only sees HTTP), so api/proxy.py enforces the same check on the websocket routes.
-    EXEMPT_PATHS = ["/health", "/docs", "/redoc", "/openapi.json"]
+    EXEMPT_PATHS = ["/health", "/version", "/docs", "/redoc", "/openapi.json"]
 
-    def __init__(self, app, config: Optional[AppConfig] = None):
-        """
-        Initialize authentication middleware.
-
-        Args:
-            app: FastAPI application instance
-            config: Optional application configuration (for dependency injection)
-        """
+    def __init__(self, app, config: Optional[AppConfig] = None, tenant_provider: Optional[TenantProvider] = None):
         super().__init__(app)
         self.config = config or get_config()
-        # Read the API key directly from config; suitable for dev/test usage
+        self.tenant_provider = tenant_provider
         self.valid_api_keys = self._load_api_keys()
 
     def is_api_key_valid(self, api_key: Optional[str]) -> bool:
@@ -67,42 +66,25 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return bool(api_key) and api_key in self.valid_api_keys
 
     def _load_api_keys(self) -> set:
-        """
-        Load valid API keys from configuration.
-
-        Returns:
-            set: Set of valid API keys
-        """
-        # Supports a single API key from config; extend later for secret managers
         api_key = self.config.server.api_key
-        # Treat empty string as no key configured
         if api_key and api_key.strip():
             return {api_key}
         return set()
 
+    @property
+    def _is_multi_tenant(self) -> bool:
+        return self.tenant_provider is not None
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        """
-        Process each request and validate authentication.
-
-        Args:
-            request: Incoming HTTP request
-            call_next: Next middleware or route handler
-
-        Returns:
-            Response: HTTP response
-        """
-        # Skip authentication for exempt paths
         if any(request.url.path.startswith(path) for path in self.EXEMPT_PATHS):
             return await call_next(request)
 
-        # If no API keys are configured, skip authentication
-        if not self.valid_api_keys:
+        # If no API keys configured AND no tenant provider → skip auth
+        if not self._is_multi_tenant and not self.valid_api_keys:
             return await call_next(request)
 
-        # Extract API key from header
         api_key = request.headers.get(SANDBOX_API_KEY_HEADER)
 
-        # Validate API key
         if not api_key:
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -113,7 +95,46 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        # Enforce strict comparison whenever API keys are configured
+        if self._is_multi_tenant:
+            return await self._authenticate_multi_tenant(api_key, request, call_next)
+        else:
+            return await self._authenticate_single_tenant(api_key, request, call_next)
+
+    async def _authenticate_multi_tenant(
+        self, api_key: str, request: Request, call_next: Callable
+    ) -> Response:
+        import asyncio
+
+        try:
+            tenant = await asyncio.to_thread(self.tenant_provider.lookup, api_key)
+        except TenantProviderUnavailable as e:
+            logger.error(f"Tenant provider unavailable: {e}")
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={
+                    "code": "TENANT_PROVIDER_UNAVAILABLE",
+                    "message": "Tenant authentication service is temporarily unavailable.",
+                },
+            )
+
+        if tenant is None:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={
+                    "code": "INVALID_API_KEY",
+                    "message": "Authentication credentials are invalid. "
+                              "Check your API key and try again.",
+                },
+            )
+
+        set_current_tenant(tenant)
+        request.state.tenant = tenant
+        response = await call_next(request)
+        return response
+
+    async def _authenticate_single_tenant(
+        self, api_key: str, request: Request, call_next: Callable
+    ) -> Response:
         if self.valid_api_keys and api_key not in self.valid_api_keys:
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -124,6 +145,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        # Authentication successful, proceed to next middleware/handler
+        set_current_tenant(None)
         response = await call_next(request)
         return response

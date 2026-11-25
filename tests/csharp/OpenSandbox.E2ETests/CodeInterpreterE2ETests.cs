@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -671,7 +671,7 @@ public sealed class CodeInterpreterE2ETestFixture : IAsyncLifetime
         {
             ConnectionConfig = _baseFixture.ConnectionConfig,
             Image = _baseFixture.DefaultImage,
-            Entrypoint = new[] { "/opt/opensandbox/code-interpreter.sh" },
+            Entrypoint = new[] { "/opt/code-interpreter/code-interpreter.sh" },
             TimeoutSeconds = _baseFixture.DefaultTimeoutSeconds,
             ReadyTimeoutSeconds = _baseFixture.DefaultReadyTimeoutSeconds,
             Resource = new Dictionary<string, string>

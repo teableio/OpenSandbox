@@ -3,20 +3,26 @@ name: Execd Tests
 on:
   pull_request:
     branches: [ main ]
-    paths:
-      - 'components/execd/**'
-      - 'components/internal/**'
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  changes:
+    uses: ./.github/workflows/detect-changes.yml
+    with:
+      area: execd
+
   test:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -24,12 +30,15 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.9'
+          go-version: '1.26.11'
+          cache-dependency-path: components/execd/go.sum
 
       - name: Check gofmt
         working-directory: components/execd
         run: |
-          files="$(gofmt -l . ../internal)"
+          # vendor/ mirrors upstream formatting; go1.26 gofmt enforces stricter
+          # doc-comment indentation than go1.25 did when those files were snapshotted.
+          files="$(gofmt -l . ../internal | grep -v '^vendor/' || true)"
           if [ -n "$files" ]; then
             echo "$files"
             exit 1
@@ -50,6 +59,51 @@ jobs:
         run: |
           go test -v -coverpkg=./... -coverprofile=coverage.out -covermode=atomic ./pkg/...
 
+      - name: Verify process QoS and hardening with race detector
+        working-directory: components/execd/pkg/runtime
+        run: |
+          cc --version
+          go test -race -c -o "${RUNNER_TEMP}/execd-qos.test" .
+          "${RUNNER_TEMP}/execd-qos.test" -test.run '^(TestQoS|TestHardening)' -test.v -test.count=1 -test.timeout=120s
+          sudo "${RUNNER_TEMP}/execd-qos.test" -test.run '^(TestQoS|TestHardening)' -test.v -test.count=1 -test.timeout=120s
+
+      - name: Verify filesystem identity permissions as root
+        working-directory: components/execd
+        run: |
+          go test -c -o /tmp/execd-filesystem-identity.test ./pkg/web
+          sudo /tmp/execd-filesystem-identity.test -test.run "^TestFilesystemIdentity" -test.v -test.timeout 90s
+          go test -c -o /tmp/execd-filesystem-runtime.test ./pkg/runtime
+          sudo /tmp/execd-filesystem-runtime.test -test.run "^TestFilesystem" -test.v -test.timeout 90s
+
+      - name: Verify OOM watcher smoke as root
+        working-directory: components/execd
+        run: |
+          # End-to-end: a helper process joins a memory-limited cgroup, the
+          # kernel OOM killer terminates it, and the execd OOM watcher must
+          # emit its detection log line. Skips itself when cgroup v2 or root
+          # is unavailable.
+          go test -c -o /tmp/execd-oom-smoke.test ./pkg/telemetry
+          sudo /tmp/execd-oom-smoke.test -test.run "^TestOOMSmoke$" -test.v -test.timeout 120s
+
+      - name: Run execd-ebpf variant tests
+        working-directory: components/execd
+        run: |
+          # Regenerate the per-arch bytecode first: the generated files are
+          # build artifacts (not committed), so local tests need them too.
+          # clang ships in the GitHub-hosted ubuntu image; apt is only a
+          # fallback for hosts without a toolchain.
+          command -v clang >/dev/null || sudo apt-get update -qq && sudo apt-get install -y -qq clang >/dev/null
+          make generate-ebpf ARCH=$(go env GOARCH)
+          CGO_ENABLED=1 go test -tags ebpf -count=1 ./pkg/ebpf/
+
+      - name: Upload per-arch vmlinux.h (for bytecode regeneration)
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vmlinux-${{ runner.arch }}
+          path: /tmp/ebpf-dump/vmlinux.h
+          if-no-files-found: ignore
+
       - name: Calculate coverage and generate summary
         working-directory: components/execd
         id: coverage
@@ -69,10 +123,12 @@ jobs:
           echo "*Coverage targets: Core packages >80%, API layer >70%*" >> $GITHUB_STEP_SUMMARY
 
   smoke:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, self-hosted]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -84,7 +140,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.9'
+          go-version: '1.26.11'
+          cache: ${{ matrix.os != 'self-hosted' }}
+          cache-dependency-path: components/execd/go.sum
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -109,6 +167,12 @@ jobs:
 
           sleep 5
           python3 tests/smoke_api.py
+      - name: Runtime init smoke test
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 5
+        working-directory: components/execd
+        run: |
+          bash tests/runtime_init.sh
       - name: SIGTERM forward test
         if: matrix.os == 'ubuntu-latest'
         working-directory: components/execd
@@ -116,9 +180,223 @@ jobs:
           chmod +x tests/sigterm_forward.sh
           ./tests/sigterm_forward.sh
 
+      - name: Lifecycle bootstrap test
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 5
+        working-directory: components/execd
+        run: bash tests/lifecycle.sh
+
+      - name: MITM CA NSS bootstrap test
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: components/execd
+        run: bash tests/mitm_ca_nss.sh
+
+      - name: MITM CA JDK bootstrap test
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 5
+        working-directory: components/execd
+        run: python3 tests/test_mitm_ca_jdk.py
+
+      - name: MITM CA race bootstrap test
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 5
+        working-directory: components/execd
+        run: |
+          chmod +x tests/mitm_ca_race.sh
+          bash tests/mitm_ca_race.sh
+
+      - name: MITM CA rotation watcher bootstrap test
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 5
+        working-directory: components/execd
+        run: |
+          chmod +x tests/mitm_ca_watch.sh
+          bash tests/mitm_ca_watch.sh
+
+      - name: MITM CA egress rotation smoke (full bootstrap)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 5
+        working-directory: components/execd
+        run: |
+          chmod +x tests/mitm_ca_smoke.sh
+          bash tests/mitm_ca_smoke.sh
+
+      - name: Smoke test bwrap (Docker image build + extraction)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          chmod +x components/execd/tests/smoke_bwrap.sh
+          bash components/execd/tests/smoke_bwrap.sh
+
+      - name: Init-mode container regression
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          chmod +x components/execd/tests/init_container.sh
+          bash components/execd/tests/init_container.sh
+
+      - name: Mount tracefs
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # The ubuntu-24.04 runner image 20261025.353.x is inconsistent:
+          # some VMs leave tracefs unmounted, others mount it root-owned
+          # 0700 so the runner user cannot stat through it. The smoke
+          # script's host-side precheck stats /sys/kernel/tracing/events
+          # as the runner user (the container reads tracefs as root), so
+          # ensure it is mounted and traversable either way.
+          if [ ! -e /sys/kernel/tracing/events ]; then
+            sudo mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true
+          fi
+          sudo chmod 0755 /sys/kernel/tracing
+          [ -e /sys/kernel/tracing/events ]
+
+      - name: Execd eBPF bare-container smoke
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          # Runs the execd-ebpf variant in a bare container against THIS
+          # runner's kernel and asserts exec/connect/privilege events land in
+          # the JSONL audit file. GitHub-hosted ubuntu validates the stock CI
+          # kernel; the self-hosted leg is the 5.10 empirical validation
+          # (inline-filename exec-hook fallback). Host prerequisites (BTF,
+          # cgroup v2, tracefs) are prechecked by the script.
+          bash scripts/execd-ebpf-smoke.sh --build
+
       - name: Show logs
         if: always()
         run: |
           set -x
           cat components/execd/startup.log || true
           cat components/execd/execd.log || true
+
+  bwrap-smoke:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.11'
+          cache-dependency-path: components/execd/go.sum
+
+      - name: Build latest bubblewrap (v0.11.2)
+        run: |
+          sudo apt-get install -y meson ninja-build libcap-dev pkg-config
+          git clone --depth 1 --branch v0.11.2 https://github.com/containers/bubblewrap /tmp/bwrap
+          cd /tmp/bwrap
+          meson setup builddir -Dprefix=/usr -Dman=disabled -Dtests=false
+          ninja -C builddir
+          sudo cp builddir/bwrap /usr/local/bin/bwrap
+          bwrap --version
+
+      - name: Multi-overlay mounts smoke test
+        working-directory: components/execd
+        shell: bash
+        run: |
+          chmod +x tests/smoke_overlays.sh
+          SMOKE_OVERLAYS_REQUIRE_ROOT=1 bash tests/smoke_overlays.sh
+
+      - name: Build and install native session workload gate
+        working-directory: components/execd
+        run: |
+          install_root="${RUNNER_TEMP}/execd-session-gate-root"
+          make build-session-gate
+          mkdir -p \
+            "${install_root}/usr/local/libexec" \
+            "${install_root}/opt/opensandbox"
+          chmod 0777 \
+            "${install_root}/usr/local/libexec" \
+            "${install_root}/opt/opensandbox"
+          make install-session-gate DESTDIR="${install_root}"
+          test -x bin/opensandbox-session-gate
+          test -x "${install_root}/usr/local/libexec/opensandbox-session-gate"
+          test -x "${install_root}/opt/opensandbox/opensandbox-session-gate"
+          test "$(stat -c '%a' "${install_root}/usr/local/libexec")" = "755"
+          test "$(stat -c '%a' "${install_root}/opt/opensandbox")" = "755"
+          cmp \
+            bin/opensandbox-session-gate \
+            "${install_root}/usr/local/libexec/opensandbox-session-gate"
+          cmp \
+            bin/opensandbox-session-gate \
+            "${install_root}/opt/opensandbox/opensandbox-session-gate"
+          test "$(stat -c '%a' "${install_root}/usr/local/libexec/opensandbox-session-gate")" = "555"
+          test "$(stat -c '%a' "${install_root}/opt/opensandbox/opensandbox-session-gate")" = "555"
+          file bin/opensandbox-session-gate | grep -q 'statically linked'
+
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0777 /opt/opensandbox
+          sudo make install-session-gate
+          test -x /usr/local/bin/bwrap
+          test -x /usr/local/libexec/opensandbox-session-gate
+          test -x /opt/opensandbox/opensandbox-session-gate
+          test "$(stat -c '%U:%G' /usr/local/libexec)" = "root:root"
+          test "$(stat -c '%U:%G' /opt/opensandbox)" = "root:root"
+          test "$(stat -c '%U:%G' /usr/local/libexec/opensandbox-session-gate)" = "root:root"
+          test "$(stat -c '%U:%G' /opt/opensandbox/opensandbox-session-gate)" = "root:root"
+          test "$(stat -c '%a' /usr/local/libexec)" = "755"
+          test "$(stat -c '%a' /opt/opensandbox)" = "755"
+          test "$(stat -c '%a' /usr/local/libexec/opensandbox-session-gate)" = "555"
+          test "$(stat -c '%a' /opt/opensandbox/opensandbox-session-gate)" = "555"
+
+      - name: Run workload lifecycle integration test
+        working-directory: components/execd
+        run: |
+          # Execd must authenticate a non-root workload without CAP_SYS_PTRACE.
+          sudo -E setpriv --bounding-set=-sys_ptrace env "PATH=$PATH" go test \
+            -v -count=1 -timeout=2m \
+            -run '^TestBwrapLifecycleEndToEnd$' \
+            ./pkg/isolation
+
+      - name: Run namespace pin lifecycle integration test
+        working-directory: components/execd
+        run: |
+          # Pinning must not depend on CAP_SYS_PTRACE in either uid mode.
+          sudo -E setpriv --bounding-set=-sys_ptrace env "PATH=$PATH" go test \
+            -tags="linux,bwrap" -v -count=1 -timeout=2m \
+            -run '^TestPrivateSessionPinsNamespacesBeforeMarkReady$' \
+            ./pkg/runtime
+
+      - name: Run bwrap integration tests
+        working-directory: components/execd
+        run: sudo -E env "PATH=$PATH" go test -tags="linux,bwrap" -v -count=1 -timeout=5m ./pkg/runtime/bwrap_test/
+
+      - name: Run isolated session init-mode reaper integration test
+        working-directory: components/execd
+        run: |
+          # bwrap lifecycle under init-mode reaper dispatch: the pre-reap
+          # barrier must serialize process-group teardown with the reaper's
+          # observe/consume while execd owns wait4.
+          sudo -E env "PATH=$PATH" go test \
+            -tags="linux,bwrap" -v -count=1 -timeout=3m \
+            -run '^TestIsolatedSessionWithInitReaper$' \
+            ./pkg/runtime
+
+  required:
+    name: Execd CI
+    if: always()
+    needs: [changes, test, smoke, bwrap-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs
+        env:
+          RELEVANT: ${{ needs.changes.outputs.relevant }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          BWRAP_SMOKE_RESULT: ${{ needs.bwrap-smoke.result }}
+        run: |
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Change detection failed: $CHANGES_RESULT"
+            exit 1
+          fi
+          if [[ "$RELEVANT" == "true" ]]; then
+            [[ "$TEST_RESULT" == "success" && "$SMOKE_RESULT" == "success" && "$BWRAP_SMOKE_RESULT" == "success" ]]
+          else
+            [[ "$RELEVANT" == "false" && "$TEST_RESULT" == "skipped" && "$SMOKE_RESULT" == "skipped" && "$BWRAP_SMOKE_RESULT" == "skipped" ]]
+          fi

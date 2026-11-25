@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,6 +37,28 @@ interface PoolStateStore {
      * Best-effort FIFO (oldest first).
      */
     fun tryTakeIdle(poolName: String): String?
+
+    /**
+     * Variant of [tryTakeIdle] that skips entries whose remaining TTL is below [minRemainingTtl].
+     *
+     * Atomically removes and returns a [TakeIdleResult] holding the chosen idle sandbox ID (or
+     * null if none satisfied the threshold) and the IDs of any **alive** entries that were
+     * skipped because their remaining TTL fell below [minRemainingTtl]. Already-expired entries
+     * are silently dropped — the server has already reaped them.
+     *
+     * Callers should best-effort terminate every ID in [TakeIdleResult.discardedAliveSandboxIds]
+     * so those sandboxes do not linger past their pool membership and consume quota until
+     * server-side TTL.
+     *
+     * Default implementation delegates to [tryTakeIdle] for source compatibility with stores
+     * that predate this method. Such stores cannot surface near-expiry entries, so the
+     * discarded-alive list is always empty regardless of [minRemainingTtl]. Stores that
+     * genuinely want near-expiry filtering must override this method.
+     */
+    fun tryTakeIdle(
+        poolName: String,
+        minRemainingTtl: Duration,
+    ): TakeIdleResult = TakeIdleResult.of(tryTakeIdle(poolName))
 
     /**
      * Adds a sandbox ID to the idle set for the pool.
@@ -92,6 +114,31 @@ interface PoolStateStore {
     )
 
     /**
+     * Variant of [reapExpiredIdle] that also evicts entries whose remaining TTL is below
+     * [minRemainingTtl]. Reconcile calls this so near-expiry entries are reclaimed proactively
+     * (rather than waiting for them to fully expire), letting the pool replenish them with fresh
+     * sandboxes before a future acquire would discard them.
+     *
+     * Returns the IDs of **alive** entries that were evicted because their remaining TTL fell
+     * below [minRemainingTtl]. Already-expired entries are silently dropped — the server has
+     * already reaped them. Callers should best-effort terminate every returned ID so those
+     * sandboxes do not linger past their pool membership.
+     *
+     * Default implementation delegates to [reapExpiredIdle] for source compatibility with stores
+     * that predate this method. Such stores cannot surface near-expiry entries; they return an
+     * empty list regardless of [minRemainingTtl]. Stores that genuinely want near-expiry
+     * filtering must override this method.
+     */
+    fun reapExpiredIdle(
+        poolName: String,
+        now: Instant,
+        minRemainingTtl: Duration,
+    ): List<String> {
+        reapExpiredIdle(poolName, now)
+        return emptyList()
+    }
+
+    /**
      * Returns a snapshot of counters for the pool (at least idle count).
      * Eventually consistent for distributed stores.
      */
@@ -129,5 +176,41 @@ interface PoolStateStore {
         idleTtl: Duration,
     ) {
         // Default no-op.
+    }
+
+    /**
+     * Returns shared destroy state for this pool namespace.
+     *
+     * Stores that do not support destroy fencing should return ACTIVE. Destroy management APIs
+     * may still reject such stores when they cannot provide the stronger lifecycle semantics.
+     */
+    fun getDestroyState(poolName: String): PoolDestroyState = PoolDestroyState.ACTIVE
+
+    /**
+     * Starts a FORCE destroy operation by writing a DESTROYING fence.
+     */
+    fun beginDestroy(
+        poolName: String,
+        ownerId: String,
+    ) {
+        throw UnsupportedOperationException("Pool destroy is not supported by this PoolStateStore")
+    }
+
+    /**
+     * Clears persistent coordination data for the pool while preserving destroy state.
+     */
+    fun clearPoolState(poolName: String) {
+        throw UnsupportedOperationException("Pool destroy is not supported by this PoolStateStore")
+    }
+
+    /**
+     * Finishes destroy by writing the DESTROYED tombstone.
+     */
+    fun markDestroyed(
+        poolName: String,
+        ownerId: String,
+        tombstoneTtl: Duration?,
+    ) {
+        throw UnsupportedOperationException("Pool destroy is not supported by this PoolStateStore")
     }
 }

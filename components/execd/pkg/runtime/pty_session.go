@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,9 +23,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/alibaba/opensandbox/internal/safego"
 	"github.com/creack/pty"
@@ -40,6 +42,9 @@ import (
 type PTYSession interface {
 	LockWS() bool
 	UnlockWS()
+	TakeoverWS(timeout time.Duration) bool
+	SetEvictHandler(fn func()) uint64
+	ClearEvictHandler(gen uint64)
 	IsRunning() bool
 	IsPTY() bool
 	ExitCode() int
@@ -49,28 +54,21 @@ type PTYSession interface {
 	WriteStdin(p []byte) (int, error)
 	AttachOutput() (io.Reader, io.Reader, func())
 	AttachOutputWithSnapshot(since int64) (io.Reader, io.Reader, func(), []byte, int64)
+	ReadOutput(since int64) ([]byte, int64, <-chan struct{})
 	SendSignal(name string)
 	ResizePTY(cols, rows uint16) error
 }
 
-// IsPTYSessionSupported reports whether PTY sessions are supported on this platform.
 func IsPTYSessionSupported() bool { return true }
 
 func NewPTYSessionID() string {
 	return uuidString()
 }
 
-// ptySession manages a single interactive PTY or pipe-mode bash process.
-//
-// Lifecycle:
-//  1. Create via newPTYSession.
-//  2. Call StartPTY() or StartPipe() from the WS handler (after LockWS).
-//  3. Zero or more clients call AttachOutput() to receive live output.
-//  4. The bash process exits → Done() closes → exit frame sent.
-//  5. Call close() to terminate an early session and release resources.
 type ptySession struct {
-	id  string
-	cwd string
+	id      string
+	cwd     string
+	command string // optional custom command interpreted by the selected shell
 
 	mu      sync.Mutex
 	closing bool
@@ -79,6 +77,8 @@ type ptySession struct {
 	pid          int           // PID of the running bash process (0 = not running)
 	lastExitCode int           // exit code; -1 until process exits
 	doneCh       chan struct{} // closed when process exits (non-nil after Start*)
+	outputDoneCh chan struct{} // closed after output broadcasters finish writing to replay
+	proc         *managedProcess
 
 	// Stdin (PTY master in PTY mode; write end of os.Pipe in pipe mode)
 	stdin io.WriteCloser
@@ -93,6 +93,14 @@ type ptySession struct {
 	// WS exclusive lock: only one WebSocket client at a time.
 	wsConnected atomic.Bool
 
+	// Eviction hook for session takeover. The active WS handler registers a function
+	// that closes its own connection (and stops its pumps) so a newer client can take
+	// over the session. Guarded by evictMu; evictGen lets a handler clear only its own
+	// hook and never a successor's (see SetEvictHandler / ClearEvictHandler).
+	evictMu  sync.Mutex
+	evict    func()
+	evictGen uint64
+
 	// Output broadcast (guards stdoutW / stderrW).
 	// The broadcast goroutine holds outMu only while reading the pointer; writes
 	// to the pipe happen outside the lock to avoid blocking broadcast on slow clients.
@@ -101,10 +109,11 @@ type ptySession struct {
 	stderrW *io.PipeWriter // nil in PTY mode
 }
 
-func newPTYSession(id, cwd string) *ptySession {
+func newPTYSession(id, cwd, command string) *ptySession {
 	return &ptySession{
 		id:           id,
 		cwd:          cwd,
+		command:      command,
 		replay:       newReplayBuffer(),
 		lastExitCode: -1,
 	}
@@ -116,12 +125,63 @@ func (s *ptySession) LockWS() bool {
 	return s.wsConnected.CompareAndSwap(false, true)
 }
 
-// UnlockWS releases the WebSocket connection lock.
 func (s *ptySession) UnlockWS() {
 	s.wsConnected.Store(false)
 }
 
-// IsRunning returns true if the bash process is currently alive.
+// SetEvictHandler registers fn as the current connection's eviction hook and returns
+// a generation token. A newer handler calling this overwrites the previous hook. Pass
+// the returned token to ClearEvictHandler on teardown.
+func (s *ptySession) SetEvictHandler(fn func()) uint64 {
+	s.evictMu.Lock()
+	defer s.evictMu.Unlock()
+	s.evictGen++
+	s.evict = fn
+	return s.evictGen
+}
+
+// ClearEvictHandler removes the eviction hook only if it still belongs to gen, so a
+// handler tearing down never clears a successor's hook (which would race after a
+// takeover hands the session to a new connection).
+func (s *ptySession) ClearEvictHandler(gen uint64) {
+	s.evictMu.Lock()
+	defer s.evictMu.Unlock()
+	if s.evictGen == gen {
+		s.evict = nil
+	}
+}
+
+// triggerEvict invokes the current eviction hook, if any. The hook is expected to be
+// idempotent (closing an already-closed WS is a no-op), so repeated calls are safe.
+func (s *ptySession) triggerEvict() {
+	s.evictMu.Lock()
+	fn := s.evict
+	s.evictMu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// TakeoverWS forcibly acquires the WS lock for a new client. It repeatedly evicts the
+// current holder (closing its WS) and retries LockWS until it wins or timeout elapses.
+// The shell process keeps running throughout; the new client reattaches with replay.
+// Returns true if the lock was acquired.
+func (s *ptySession) TakeoverWS(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if s.LockWS() {
+			return true
+		}
+		s.triggerEvict()
+		if time.Now().After(deadline) {
+			// One last attempt in case the holder released just now.
+			return s.LockWS()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// IsRunning returns true if the shell process is currently alive.
 func (s *ptySession) IsRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -148,12 +208,59 @@ func (s *ptySession) Done() <-chan struct{} {
 	return s.doneCh
 }
 
+// OutputDone closes after all output broadcasters have written their final
+// bytes to the replay buffer. It is non-nil after StartPTY or StartPipe.
+func (s *ptySession) OutputDone() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outputDoneCh
+}
+
 // ReplayBuffer returns the session's replay buffer (thread-safe).
 func (s *ptySession) ReplayBuffer() *replayBuffer {
 	return s.replay
 }
 
-// StartPTY launches bash via pty.StartWithSize.
+// ReadOutput returns replay bytes starting at since and a notification channel
+// that closes when more output is appended. Snapshot and subscription are
+// atomic, so read-only viewers cannot miss output between the two operations.
+func (s *ptySession) ReadOutput(since int64) ([]byte, int64, <-chan struct{}) {
+	return s.replay.ReadFromAndSubscribe(since)
+}
+
+// buildPTYCommand selects Bash when available and otherwise falls back to sh.
+// Bash startup flags must not be passed to sh because they are not portable.
+func buildPTYCommand(command string) *exec.Cmd {
+	var extra []string
+	if command != "" {
+		extra = []string{"-c", command}
+	}
+	shell, args := shellCommand(extra...)
+	return exec.Command(shell, args...)
+}
+
+// defaultPTYTerm backs the TERM default in ptySessionEnv: execd runs as a
+// daemon whose environment normally carries no TERM, which makes interactive
+// programs disable colors and terminfo features.
+const defaultPTYTerm = "xterm-256color"
+
+// ptySessionEnv returns the user process environment with TERM defaulted for
+// the interactive PTY side; pipe mode is not a terminal and gets no default.
+func ptySessionEnv() []string {
+	env := UserProcessEnvironment()
+	for i, kv := range env {
+		if name, value, ok := strings.Cut(kv, "="); ok && name == "TERM" {
+			if value != "" {
+				return env
+			}
+			env[i] = "TERM=" + defaultPTYTerm
+			return env
+		}
+	}
+	return append(env, "TERM="+defaultPTYTerm)
+}
+
+// StartPTY launches the preferred shell via pty.StartWithSize.
 // Must be called with the WS lock held.
 func (s *ptySession) StartPTY() error {
 	s.mu.Lock()
@@ -166,32 +273,48 @@ func (s *ptySession) StartPTY() error {
 		return errors.New("pty session is closing")
 	}
 
-	cmd := exec.Command("bash", "--norc", "--noprofile")
-	cmd.Env = os.Environ()
+	cmd := buildPTYCommand(s.command)
+	// Resolve through the shared user-env layering (sandbox binding envs from
+	// /init < EXECD_ENVS file) instead of inheriting execd's raw environment.
+	cmd.Env = ptySessionEnv()
 	if s.cwd != "" {
 		cmd.Dir = s.cwd
 	}
 	// Do NOT set Setpgid: pty.StartWithSize sets Setsid+Setctty internally.
 	// Combining Setsid+Setpgid causes EPERM (setpgid is illegal for a session leader).
 
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: 80, Rows: 24})
+	var ptmx *os.File
+	mp, err := launchManagedWith(cmd, func() error {
+		var perr error
+		ptmx, perr = pty.StartWithSize(cmd, &pty.Winsize{Cols: 80, Rows: 24})
+		return perr
+	})
 	if err != nil {
+		if ptmx != nil {
+			_ = ptmx.Close()
+		}
 		return fmt.Errorf("pty.StartWithSize: %w", err)
 	}
 
 	s.ptmx = ptmx
 	s.isPTY = true
 	s.pid = cmd.Process.Pid
+	s.proc = mp
 	s.doneCh = make(chan struct{})
-	s.stdin = ptmx // write to the PTY master to feed stdin
+	outputDoneCh := make(chan struct{})
+	s.outputDoneCh = outputDoneCh
+	s.stdin = ptmx
 
-	safego.Go(func() { s.broadcastPTY() })
-	safego.Go(func() { s.waitAndExit(cmd, ptmx) })
+	safego.Go(func() {
+		defer close(outputDoneCh)
+		s.broadcastPTY(ptmx)
+	})
+	safego.Go(func() { s.waitAndExit(mp, ptmx, outputDoneCh) })
 
 	return nil
 }
 
-// StartPipe launches bash with plain stdin/stdout/stderr os.Pipes.
+// StartPipe launches the preferred shell with plain stdin/stdout/stderr os.Pipes.
 // Must be called with the WS lock held.
 func (s *ptySession) StartPipe() error {
 	s.mu.Lock()
@@ -223,8 +346,8 @@ func (s *ptySession) StartPipe() error {
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
-	cmd := exec.Command("bash", "--norc", "--noprofile")
-	cmd.Env = os.Environ()
+	cmd := buildPTYCommand(s.command)
+	cmd.Env = UserProcessEnvironment()
 	if s.cwd != "" {
 		cmd.Dir = s.cwd
 	}
@@ -233,7 +356,8 @@ func (s *ptySession) StartPipe() error {
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 
-	if err := cmd.Start(); err != nil {
+	mp, err := launchManagedWith(cmd, cmd.Start)
+	if err != nil {
 		_ = stdinR.Close()
 		_ = stdinW.Close()
 		_ = stdoutR.Close()
@@ -250,21 +374,36 @@ func (s *ptySession) StartPipe() error {
 
 	s.isPTY = false
 	s.pid = cmd.Process.Pid
+	s.proc = mp
 	s.doneCh = make(chan struct{})
+	outputDoneCh := make(chan struct{})
+	s.outputDoneCh = outputDoneCh
 	s.stdin = stdinW
 
-	safego.Go(func() { s.broadcastPipe(stdoutR, true) })
-	safego.Go(func() { s.broadcastPipe(stderrR, false) })
-	safego.Go(func() { s.waitAndExitPipe(cmd, stdinW, stdoutR, stderrR) })
+	var outputWg sync.WaitGroup
+	outputWg.Add(2)
+	safego.Go(func() {
+		defer outputWg.Done()
+		s.broadcastPipe(stdoutR, true)
+	})
+	safego.Go(func() {
+		defer outputWg.Done()
+		s.broadcastPipe(stderrR, false)
+	})
+	safego.Go(func() {
+		outputWg.Wait()
+		close(outputDoneCh)
+	})
+	safego.Go(func() { s.waitAndExitPipe(mp, stdinW, stdoutR, stderrR) })
 
 	return nil
 }
 
 // broadcastPTY reads from the PTY master and fans out to replay + active WS client.
-func (s *ptySession) broadcastPTY() {
+func (s *ptySession) broadcastPTY(ptmx *os.File) {
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := s.ptmx.Read(buf)
+		n, err := ptmx.Read(buf)
 		if n > 0 {
 			s.writeAndFanout(buf[:n], true)
 		}
@@ -290,12 +429,7 @@ func (s *ptySession) broadcastPipe(r *os.File, isStdout bool) {
 	_ = r.Close()
 }
 
-// writeAndFanout writes chunk to the replay buffer and delivers it to the
-// active per-connection pipe, atomically under outMu.
-//
-// Holding outMu across both operations closes the window where bytes written
-// to replay after ReadFrom but before AttachOutput would be silently dropped.
-// Lock order is always outMu → replay.mu (both paths), so no deadlock is possible.
+// Replay insertion and fanout selection share outMu with snapshot attachment; pipe writes remain outside it.
 func (s *ptySession) writeAndFanout(chunk []byte, isStdout bool) {
 	s.outMu.Lock()
 	s.replay.write(chunk) // acquires replay.mu inside (outMu → replay.mu)
@@ -310,43 +444,51 @@ func (s *ptySession) writeAndFanout(chunk []byte, isStdout bool) {
 	if w != nil {
 		if _, err := w.Write(chunk); err != nil {
 			// Pipe was closed (client detached) — ignore.
-			log.Warning("pty fanout write: %v", err)
+			log.Warn("pty: fanout write: %v", err)
 		}
 	}
 }
 
+// ptyDrainTimeout bounds how long the session waits for buffered PTY output
+// after the shell exits, in case an attached client stopped reading.
+const ptyDrainTimeout = 2 * time.Second
+
 // waitAndExit waits for the PTY-mode process and updates session state on exit.
-func (s *ptySession) waitAndExit(cmd *exec.Cmd, ptmx *os.File) {
-	_ = cmd.Wait()
+func (s *ptySession) waitAndExit(mp *managedProcess, ptmx *os.File, outputDone <-chan struct{}) {
+	_ = mp.Wait()
 
-	// Close the PTY master to unblock the broadcast goroutine.
-	_ = ptmx.Close()
-
+	// The shell is reaped and its PID may be reused, so stop signalling it
+	// before waiting for its output below.
 	s.mu.Lock()
-	exitCode := 0
-	if cmd.ProcessState != nil {
-		exitCode = cmd.ProcessState.ExitCode()
-	}
+	exitCode := mp.ExitCode()
 	s.lastExitCode = exitCode
 	s.pid = 0
 	doneCh := s.doneCh
 	s.mu.Unlock()
+
+	// Output the shell wrote before exiting can still be buffered in the
+	// master, and closing it discards that output. The broadcast goroutine
+	// stops once it has read everything (the master then returns EIO), so
+	// wait for it, but not past ptyDrainTimeout: it blocks while an attached
+	// client is not reading.
+	select {
+	case <-outputDone:
+	case <-time.After(ptyDrainTimeout):
+	}
+	_ = ptmx.Close()
 
 	close(doneCh)
 }
 
 // waitAndExitPipe waits for the pipe-mode process and updates session state on exit.
-func (s *ptySession) waitAndExitPipe(cmd *exec.Cmd, stdinW, stdoutR, stderrR *os.File) {
-	_ = cmd.Wait()
+func (s *ptySession) waitAndExitPipe(mp *managedProcess, stdinW, stdoutR, stderrR *os.File) {
+	_ = mp.Wait()
 
 	// Close stdin write-end so the child (if still running) sees EOF.
 	_ = stdinW.Close()
 
 	s.mu.Lock()
-	exitCode := 0
-	if cmd.ProcessState != nil {
-		exitCode = cmd.ProcessState.ExitCode()
-	}
+	exitCode := mp.ExitCode()
 	s.lastExitCode = exitCode
 	s.pid = 0
 	doneCh := s.doneCh
@@ -355,28 +497,25 @@ func (s *ptySession) waitAndExitPipe(cmd *exec.Cmd, stdinW, stdoutR, stderrR *os
 	close(doneCh)
 }
 
-// WriteStdin writes p to bash stdin (PTY master or pipe write-end).
+// WriteStdin writes p to shell stdin (PTY master or pipe write-end).
+// Input that arrives once the shell is reaped is dropped, as a terminal would:
+// while the output drains the master is still open, and a write to it would
+// block once the tty input queue is full and then fail.
 func (s *ptySession) WriteStdin(p []byte) (int, error) {
 	s.mu.Lock()
 	w := s.stdin
+	exited := s.pid == 0
 	s.mu.Unlock()
 	if w == nil {
 		return 0, errors.New("session not started")
 	}
+	if exited {
+		return len(p), nil
+	}
 	return w.Write(p)
 }
 
-// AttachOutput creates a fresh per-connection io.Pipe and swaps it into the
-// broadcast fanout path.
-//
-// Ordering guarantee (no duplicates on reconnect):
-//   - Caller must snapshot the replay buffer BEFORE calling AttachOutput.
-//   - Bytes produced between the snapshot and AttachOutput are delivered via
-//     the live pipe only (not in the snapshot), so each byte arrives exactly once.
-//
-// Returns (stdout reader, stderr reader [nil in PTY mode], detach func).
-// Calling detach() closes the writers, sending EOF to the readers and
-// unblocking all pump goroutines.
+// Separate replay reads and attachment can lose output; use AttachOutputWithSnapshot for an atomic handoff.
 func (s *ptySession) AttachOutput() (io.Reader, io.Reader, func()) {
 	stdoutR, stdoutW := io.Pipe()
 
@@ -412,16 +551,7 @@ func (s *ptySession) AttachOutput() (io.Reader, io.Reader, func()) {
 	return stdoutR, stderrR, detach
 }
 
-// AttachOutputWithSnapshot atomically snapshots the replay buffer and attaches
-// the per-connection output pipe, eliminating the output-loss window that exists
-// when ReadFrom and AttachOutput are called separately.
-//
-// Must be used together with writeAndFanout (which holds outMu during both
-// replay.write and the fanout pointer read).
-//
-// Lock order is always outMu → replay.mu (both paths), so no deadlock is possible.
-//
-// Returns (stdoutR, stderrR [nil in PTY mode], detach, snapshotBytes, snapshotOffset).
+// Atomic replay/live handoff with writeAndFanout uses outMu → replay.mu; stderr is nil in PTY mode.
 func (s *ptySession) AttachOutputWithSnapshot(since int64) (io.Reader, io.Reader, func(), []byte, int64) {
 	stdoutR, stdoutW := io.Pipe()
 	var stderrR io.Reader
@@ -465,7 +595,7 @@ func (s *ptySession) SendSignal(name string) {
 
 	sig := parseSignalName(name)
 	if sig == 0 {
-		log.Warning("ptySession.SendSignal: unknown signal %q", name)
+		log.Warn("pty: send signal: unknown signal %q", name)
 		return
 	}
 
@@ -473,7 +603,7 @@ func (s *ptySession) SendSignal(name string) {
 	// In pipe mode (Setpgid), pgid is also == pid.
 	// Either way, Kill(-pid, sig) sends to the process group.
 	if err := syscall.Kill(-pid, sig); err != nil {
-		log.Warning("ptySession.SendSignal kill(-%d, %v): %v", pid, sig, err)
+		log.Warn("pty: send signal kill(-%d, %v): %v", pid, sig, err)
 	}
 }
 
@@ -505,6 +635,30 @@ func (s *ptySession) ResizePTY(cols, rows uint16) error {
 	return pty.Setsize(ptmx, &pty.Winsize{Cols: cols, Rows: rows})
 }
 
+// ptyHangUpGrace bounds how long close waits for the shell to exit after
+// SIGHUP before killing its process group.
+const ptyHangUpGrace = 500 * time.Millisecond
+
+// hangUp sends SIGHUP to the PTY shell, as closing a terminal does, and waits
+// up to ptyHangUpGrace for it to exit. Interactive bash passes SIGHUP on to its
+// jobs, which job control puts in their own process groups; killing the
+// shell's group alone leaves them running and holding the terminal open.
+func (s *ptySession) hangUp(pid int) {
+	if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
+		return
+	}
+	deadline := time.Now().Add(ptyHangUpGrace)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		exited := s.pid != pid
+		s.mu.Unlock()
+		if exited {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // close terminates the session and releases all resources.
 // Safe to call multiple times.
 func (s *ptySession) close() {
@@ -517,9 +671,15 @@ func (s *ptySession) close() {
 	pid := s.pid
 	ptmx := s.ptmx
 	stdin := s.stdin
+	isPTY := s.isPTY
 	s.mu.Unlock()
 
 	if pid != 0 {
+		if isPTY {
+			s.hangUp(pid)
+		}
+		// Kill whatever is left in the shell's group even if the shell has
+		// exited: a group id is not reused while any member is alive.
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 	}
 	if ptmx != nil {
@@ -544,7 +704,7 @@ func (s *ptySession) close() {
 }
 
 // CreatePTYSession creates a new PTY session and stores it in the map.
-func (c *Controller) CreatePTYSession(id, cwd string) (PTYSession, error) {
+func (c *Controller) CreatePTYSession(id, cwd, command string) (PTYSession, error) {
 	resolvedCwd, err := pathutil.ExpandPath(cwd)
 	if err != nil {
 		return nil, fmt.Errorf("error resolving PTY session work directory: %w", err)
@@ -555,9 +715,9 @@ func (c *Controller) CreatePTYSession(id, cwd string) (PTYSession, error) {
 			return nil, fmt.Errorf("error creating PTY session work directory: %w", err)
 		}
 	}
-	s := newPTYSession(id, resolvedCwd)
+	s := newPTYSession(id, resolvedCwd, command)
 	c.ptySessionMap.Store(id, s)
-	log.Info("created pty session %s", id)
+	log.Info("pty: created session %s", id)
 	return s, nil
 }
 
@@ -590,11 +750,10 @@ func (c *Controller) DeletePTYSession(id string) error {
 	}
 	s.close()
 	c.ptySessionMap.Delete(id)
-	log.Info("deleted pty session %s", id)
+	log.Info("pty: deleted session %s", id)
 	return nil
 }
 
-// GetPTYSessionStatus returns status information for a PTY session.
 func (c *Controller) GetPTYSessionStatus(id string) (running bool, outputOffset int64, err error) {
 	s := c.getPTYSession(id)
 	if s == nil {

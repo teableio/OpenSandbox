@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
@@ -26,12 +27,11 @@ import (
 // recover reconstructs the task scheduler state from existing pods and their endpoints
 // This function is used to restore the scheduler state after a restart
 func (sch *defaultTaskScheduler) recover() error {
-	var err error
-	sch.once.Do(func() {
-		sch.recoverTaskNodesStatus()
-		sch.logger.Info("task scheduler recovered", "scheduler", sch.name, "task_nodes", len(sch.taskNodes), "all_pods", len(sch.allPods))
-	})
-	return err
+	if err := sch.recoverTaskNodesStatus(); err != nil {
+		return err
+	}
+	sch.logger.Info("task scheduler recovered", "scheduler", sch.name, "task_nodes", len(sch.taskNodes), "all_pods", len(sch.allPods))
+	return nil
 }
 
 func (sch *defaultTaskScheduler) recoverTaskNodesStatus() error {
@@ -39,7 +39,7 @@ func (sch *defaultTaskScheduler) recoverTaskNodesStatus() error {
 	pods := make([]*v1.Pod, 0, len(sch.allPods)/2)
 	for i := range sch.allPods {
 		pod := sch.allPods[i]
-		if pod.Status.PodIP == "" {
+		if !hasTaskEndpoint(pod) {
 			continue
 		}
 		ips = append(ips, pod.Status.PodIP)
@@ -52,7 +52,15 @@ func (sch *defaultTaskScheduler) recoverTaskNodesStatus() error {
 	// the recovery may complete after the agent has already finished stopping the task and returned an empty task list.
 	// This could cause the scheduler to be unable to determine whether the task was never executed or has already completed.
 	// It might lead to duplicate execution, but it ensures at-least-once delivery semantics.
-	tasks := sch.taskStatusCollector.Collect(context.Background(), ips)
+	tasks, err := sch.taskStatusCollector.Collect(context.Background(), ips)
+	if err != nil {
+		return fmt.Errorf("collect task status during recovery: %w", err)
+	}
+	for _, ip := range ips {
+		if _, ok := tasks[ip]; !ok {
+			return fmt.Errorf("collect task status during recovery: missing result for pod IP %s", ip)
+		}
+	}
 	for i := range ips {
 		ip := ips[i]
 		pod := pods[i]
@@ -61,7 +69,7 @@ func (sch *defaultTaskScheduler) recoverTaskNodesStatus() error {
 			continue
 		}
 		if tNode := sch.taskNodeByNameIndex[task.Name]; tNode != nil {
-			recoverOneTaskNode(tNode, task, pod.Status.PodIP, pod.Name, sch.logger)
+			recoverOneTaskNode(tNode, task, pod, sch.logger)
 		} else {
 		}
 		// TODO do we need to stop tasks not belong us? e.g users ScaleIn []*sandboxv1alpha1.Task
@@ -69,11 +77,12 @@ func (sch *defaultTaskScheduler) recoverTaskNodesStatus() error {
 	return nil
 }
 
-func recoverOneTaskNode(tNode *taskNode, currentTask *api.Task, ip string, podName string, log logr.Logger) {
+func recoverOneTaskNode(tNode *taskNode, currentTask *api.Task, pod *v1.Pod, log logr.Logger) {
 	tNode.Status = currentTask
 	tNode.transTaskState(parseTaskState(currentTask), log)
-	tNode.IP = ip
-	tNode.PodName = podName
+	tNode.IP = pod.Status.PodIP
+	tNode.PodName = pod.Name
+	tNode.PodUID = pod.UID
 	if currentTask.DeletionTimestamp != nil {
 		tNode.transSchState(stateReleasing, log)
 	}

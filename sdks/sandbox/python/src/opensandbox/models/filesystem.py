@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,10 +19,85 @@ Filesystem-related data models.
 Models for file operations, directory listings, and filesystem metadata.
 """
 
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from io import IOBase
+from typing import Generic, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+_BodyT = TypeVar("_BodyT")
+
+
+@dataclass(frozen=True)
+class ByteRange:
+    """Parsed Content-Range response header."""
+
+    start: int
+    end: int
+    total: int
+    raw: str
+
+
+@dataclass(frozen=True)
+class ReadBytesResponse(Generic[_BodyT]):
+    """Downloaded body and its HTTP response metadata.
+
+    Content length and range describe the HTTP representation, which may be
+    encoded. Total size is the decoded file size, or -1 if unknown.
+    """
+
+    body: _BodyT
+    status_code: int
+    content_type: str | None
+    content_disposition: str | None
+    content_length: int
+    total_size: int
+    content_range: ByteRange | None
+
+    @property
+    def is_partial(self) -> bool:
+        """Whether the server returned 206 Partial Content."""
+        return self.status_code == 206
+
+
+class ReadBytesStream(Protocol):
+    """Closeable synchronous download body."""
+
+    def __iter__(self) -> Iterator[bytes]: ...
+
+    def __next__(self) -> bytes: ...
+
+    def close(self) -> None: ...
+
+    def __enter__(self) -> "ReadBytesStream": ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object | None,
+    ) -> None: ...
+
+
+class AsyncReadBytesStream(Protocol):
+    """Closeable asynchronous download body."""
+
+    def __aiter__(self) -> AsyncIterator[bytes]: ...
+
+    async def __anext__(self) -> bytes: ...
+
+    async def aclose(self) -> None: ...
+
+    async def __aenter__(self) -> "AsyncReadBytesStream": ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object | None,
+    ) -> None: ...
 
 
 class EntryInfo(BaseModel):
@@ -34,6 +109,7 @@ class EntryInfo(BaseModel):
     """
 
     path: str = Field(description="Absolute path of the file or directory")
+    entry_type: str | None = Field(default=None, description="Entry type", alias="type")
     mode: int = Field(description="Unix file mode/permissions as integer (e.g., 644)")
     owner: str = Field(description="Owner username of the file or directory")
     group: str = Field(description="Group name of the file or directory")
@@ -87,6 +163,29 @@ class WriteEntry(BaseModel):
     def encoding_must_not_be_empty(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("Encoding cannot be blank")
+        return v
+
+
+class DirectoryListEntry(BaseModel):
+    """Request to list directory contents with optional depth control."""
+
+    path: str = Field(description="Directory path to list")
+    depth: int | None = Field(
+        default=None, description="Maximum child depth to include"
+    )
+
+    @field_validator("path")
+    @classmethod
+    def path_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Path cannot be blank")
+        return v
+
+    @field_validator("depth")
+    @classmethod
+    def depth_must_be_non_negative(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("Depth must be non-negative")
         return v
 
 
@@ -175,6 +274,15 @@ class ContentReplaceEntry(BaseModel):
         return v
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+class ContentReplaceResult(BaseModel):
+    """
+    Result of a content replacement operation on a single file.
+    """
+
+    path: str = Field(description="File path where replacement was performed")
+    replaced_count: int = Field(description="Number of occurrences replaced. 0 means old content was not found.")
 
 
 class SearchEntry(BaseModel):

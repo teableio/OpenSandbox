@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,7 +29,9 @@ from opensandbox.adapters.diagnostics_adapter import DiagnosticsAdapter
 from opensandbox.adapters.egress_adapter import EgressAdapter
 from opensandbox.adapters.filesystem_adapter import FilesystemAdapter
 from opensandbox.adapters.health_adapter import HealthAdapter
+from opensandbox.adapters.isolated_adapter import IsolatedSessionsAdapter
 from opensandbox.adapters.metrics_adapter import MetricsAdapter
+from opensandbox.adapters.network_policy_adapter import NetworkPolicyAdapter
 from opensandbox.adapters.sandboxes_adapter import SandboxesAdapter
 from opensandbox.config import ConnectionConfig
 from opensandbox.models.sandboxes import SandboxEndpoint
@@ -38,6 +40,7 @@ from opensandbox.services.diagnostics import Diagnostics
 from opensandbox.services.egress import Egress
 from opensandbox.services.filesystem import Filesystem
 from opensandbox.services.health import Health
+from opensandbox.services.isolated import IsolationService
 from opensandbox.services.metrics import Metrics
 from opensandbox.services.sandbox import Sandboxes
 
@@ -102,6 +105,15 @@ class AdapterFactory:
         """Create a direct egress service for runtime egress policy operations."""
         return EgressAdapter(self.connection_config, endpoint)
 
+    def create_network_policy_service(self, sandbox_id: str) -> Egress:
+        """Create a lifecycle control-plane network policy service.
+
+        Used for sandboxes created from fsb templates: policy intent is
+        persisted via ``/sandboxes/{sandboxId}/networkpolicy`` instead of the
+        sandbox-side egress sidecar.
+        """
+        return NetworkPolicyAdapter(self.connection_config, sandbox_id)
+
     def create_health_service(self, endpoint: SandboxEndpoint) -> Health:
         """Create a health monitoring service for sandbox status checks.
 
@@ -123,3 +135,16 @@ class AdapterFactory:
             Service for collecting sandbox resource usage metrics
         """
         return MetricsAdapter(self.connection_config, endpoint)
+
+    def create_isolated_session_service(
+        self, endpoint: SandboxEndpoint
+    ) -> IsolationService:
+        """Create an isolated session service for namespace-isolated execution.
+
+        Args:
+            endpoint: Sandbox endpoint information for isolated session operations
+
+        Returns:
+            Service for managing isolated bash sessions
+        """
+        return IsolatedSessionsAdapter(self.connection_config, endpoint)

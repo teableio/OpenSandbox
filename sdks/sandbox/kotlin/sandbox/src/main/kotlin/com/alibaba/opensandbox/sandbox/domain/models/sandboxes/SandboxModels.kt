@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -262,11 +262,17 @@ class PlatformSpec private constructor(
  * Egress rule for matching network targets.
  *
  * @property action Whether to allow or deny matching targets.
- * @property target FQDN or wildcard domain (e.g., "example.com", "*.example.com")
+ * @property target FQDN, wildcard domain (e.g., "example.com", "*.example.com"), IP address, or
+ * CIDR. May be null when [ports] is set; otherwise required.
+ * @property ports Restricts this rule to specific TCP destination ports (1-65535, max 256, no
+ * duplicates). A null [target] with [ports] set applies to all IPv4/IPv6 destinations. A domain
+ * [target] combined with [ports] is rejected by the server/sidecar: domain rules are evaluated at
+ * the DNS layer, which has no port dimension.
  */
 class NetworkRule private constructor(
     val action: Action,
-    val target: String,
+    val target: String?,
+    val ports: List<Int>?,
 ) {
     enum class Action {
         ALLOW,
@@ -274,13 +280,30 @@ class NetworkRule private constructor(
     }
 
     companion object {
+        private const val MAX_PORTS_PER_RULE = 256
+
         @JvmStatic
         fun builder(): Builder = Builder()
+
+        /**
+         * Lenient wire-shape factory for READ-BACK paths only (policy
+         * GET/EffectiveOf results): it skips the write-path validation so
+         * contract drift on the server can never turn a policy read into an
+         * uncaught [IllegalArgumentException]. Callers normalize wire
+         * artifacts first (blank target, empty ports list) — see the
+         * model converters.
+         */
+        internal fun fromWire(
+            action: Action,
+            target: String?,
+            ports: List<Int>?,
+        ): NetworkRule = NetworkRule(action = action, target = target, ports = ports)
     }
 
     class Builder {
         private var action: Action? = null
         private var target: String? = null
+        private var ports: List<Int>? = null
 
         fun action(action: Action): Builder {
             this.action = action
@@ -293,13 +316,82 @@ class NetworkRule private constructor(
             return this
         }
 
+        fun ports(ports: List<Int>): Builder {
+            require(ports.isNotEmpty()) { "Ports cannot be empty" }
+            require(ports.size <= MAX_PORTS_PER_RULE) { "Ports cannot exceed $MAX_PORTS_PER_RULE entries" }
+            require(ports.toSet().size == ports.size) { "Ports cannot contain duplicates" }
+            for (port in ports) {
+                require(port in 1..65535) { "Port $port out of range 1-65535" }
+            }
+            // Snapshot at set time: later caller mutation must not bypass
+            // the checks above.
+            this.ports = ports.toList()
+            return this
+        }
+
         fun build(): NetworkRule {
             val actionValue = action ?: throw IllegalArgumentException("Action must be specified")
-            val targetValue = target ?: throw IllegalArgumentException("Target must be specified")
+            val targetValue = target
+            val portsValue = ports
+            require(targetValue != null || portsValue != null) { "Either target or ports must be specified" }
+            if (portsValue != null && targetValue != null && !isIpOrCidr(targetValue)) {
+                throw IllegalArgumentException(
+                    "Ports are not supported for domain targets: \"$targetValue\" " +
+                        "(domain rules are evaluated at the DNS layer, which has no port dimension)",
+                )
+            }
             return NetworkRule(
                 action = actionValue,
                 target = targetValue,
+                ports = portsValue?.toList(),
             )
+        }
+
+        /**
+         * Mirrors the sidecar's netip-based IP-vs-domain classification,
+         * on the trimmed target.
+         */
+        private fun isIpOrCidr(target: String): Boolean {
+            val t = target.trim()
+            if (t.count { it == '/' } > 1) return false
+            val addr = t.substringBefore('/')
+            val prefix = t.substringAfter('/', missingDelimiterValue = "")
+            if (prefix.isNotEmpty()) {
+                if (t.contains('%')) return false // scoped prefixes: netip rejects
+                if (prefix.any { it !in '0'..'9' }) return false
+                val limit = if (addr.contains(':')) 128 else 32
+                if (prefix.toInt() > limit) return false
+            }
+            return if (addr.contains(':')) isIpv6Literal(addr) else isIpv4Literal(addr)
+        }
+
+        private fun isIpv4Literal(addr: String): Boolean {
+            val octets = addr.split('.')
+            return octets.size == 4 &&
+                octets.all { octet ->
+                    // Leading zeros are rejected (server-side too).
+                    octet.length in 1..3 && octet.all { it in '0'..'9' } &&
+                        (octet.length == 1 || octet[0] != '0') && octet.toInt() <= 255
+                }
+        }
+
+        private fun isIpv6Literal(addr: String): Boolean {
+            val host = addr.substringBefore('%')
+            if (host.isEmpty() || host.contains(":::")) return false
+            val halves = host.split("::")
+            if (halves.size > 2) return false
+            var groups = halves.flatMap { half -> half.split(':').filter(String::isNotEmpty) }
+            if (groups.lastOrNull()?.contains('.') == true) {
+                // Embedded IPv4 tail counts as two groups.
+                if (!isIpv4Literal(groups.last())) return false
+                groups = groups.dropLast(1) + listOf("0", "0")
+            }
+            if (groups.any { group -> group.length > 4 || group.any { ch -> ch !in '0'..'9' && ch !in 'a'..'f' && ch !in 'A'..'F' } }) {
+                return false
+            }
+            // "::" compresses one or more all-zero groups; without it the
+            // address must carry exactly eight groups.
+            return if (halves.size == 2) groups.size <= 7 else groups.size == 8
         }
     }
 }
@@ -347,15 +439,11 @@ class NetworkPolicy private constructor(
         fun build(): NetworkPolicy {
             return NetworkPolicy(
                 defaultAction = defaultAction,
-                egress = if (egress.isEmpty()) null else egress.toList(),
+                egress = egress.toList(),
             )
         }
     }
 }
-
-// ============================================================================
-// Volume Models
-// ============================================================================
 
 /**
  * Host path bind mount backend.
@@ -406,7 +494,7 @@ class Host private constructor(
  * @property claimName Name of the platform volume. In Kubernetes this is the PVC name;
  * in Docker this is the named volume name.
  * @property createIfNotExists When true (default), auto-create volume if absent.
- * @property deleteOnSandboxTermination When true, delete auto-created Docker volume on sandbox deletion.
+ * @property deleteOnSandboxTermination When true, delete the auto-created volume (Docker named volume or Kubernetes PVC) on sandbox deletion. Pre-existing volumes are never removed.
  * @property storageClass Kubernetes StorageClass for auto-created PVCs. Null means default class.
  * @property storage PVC storage request for auto-created PVCs (e.g. "1Gi").
  * @property accessModes Access modes for auto-created PVCs (e.g. ["ReadWriteOnce"]).
@@ -714,6 +802,8 @@ class Volume private constructor(
  * @property image Image specification used to create this sandbox
  * @property platform Effective platform used for sandbox provisioning
  * @property metadata Custom metadata attached to the sandbox
+ * @property extensions Opaque extension data returned by the server
+ * @property allocation Current runtime-confirmed pool allocation, when available
  */
 class SandboxInfo(
     val id: String,
@@ -725,6 +815,46 @@ class SandboxInfo(
     val snapshotId: String? = null,
     val platform: PlatformSpec? = null,
     val metadata: Map<String, String>? = null,
+    val extensions: Map<String, String>? = null,
+    val allocation: SandboxAllocation? = null,
+) {
+    constructor(
+        id: String,
+        status: SandboxStatus,
+        entrypoint: List<String>,
+        expiresAt: OffsetDateTime?,
+        createdAt: OffsetDateTime,
+        image: SandboxImageSpec?,
+        snapshotId: String?,
+        platform: PlatformSpec?,
+        metadata: Map<String, String>?,
+        extensions: Map<String, String>?,
+    ) : this(
+        id = id,
+        status = status,
+        entrypoint = entrypoint,
+        expiresAt = expiresAt,
+        createdAt = createdAt,
+        image = image,
+        snapshotId = snapshotId,
+        platform = platform,
+        metadata = metadata,
+        extensions = extensions,
+        allocation = null,
+    )
+}
+
+/**
+ * Current runtime-confirmed pool allocation for a sandbox.
+ *
+ * @property mode Confirmed allocation mode. Currently always `pool`.
+ * @property poolRef Concrete pool reference currently allocated to the sandbox.
+ * @property state Current confirmed allocation state. Currently always `allocated`.
+ */
+class SandboxAllocation(
+    val mode: String,
+    val poolRef: String,
+    val state: String,
 )
 
 /**
@@ -747,11 +877,55 @@ class SandboxStatus(
  *
  * @property id Unique identifier of the newly created sandbox
  * @property platform Effective platform used for sandbox provisioning
+ * @property extensions Opaque extension data returned by the server
  */
 class SandboxCreateResponse(
     val id: String,
     val platform: PlatformSpec? = null,
+    val extensions: Map<String, String>? = null,
 )
+
+/**
+ * Lifecycle state of a snapshot.
+ *
+ * Common state values:
+ * - Creating: Snapshot is being captured from the sandbox
+ * - Ready: Snapshot has been captured and can be used to restore a sandbox
+ * - Failed: Snapshot capture encountered a critical error
+ * - Deleting: Snapshot is being deleted
+ *
+ * State transitions:
+ * - Creating → Ready (capture completes successfully)
+ * - Creating → Failed (on error)
+ *
+ * Note: New state values may be added in future versions.
+ * Clients should handle unknown state values gracefully.
+ */
+object SnapshotState {
+    const val CREATING = "Creating"
+    const val READY = "Ready"
+    const val FAILED = "Failed"
+    const val DELETING = "Deleting"
+    const val UNKNOWN = "Unknown"
+}
+
+/**
+ * Artifact class of a snapshot.
+ *
+ * [FULL] is the runtime's most complete capture: memory and process state on
+ * the fast-sandbox backend (restoring resumes in place); Docker and Kubernetes
+ * snapshots capture the filesystem only and do not restore running processes.
+ * [ROOTFS_ONLY] preserves only the writable filesystem, so restoring boots a
+ * fresh sandbox and re-runs the entrypoint. It requires the fast-sandbox
+ * backend and is rejected by other backends; an unqualified fast-sandbox node
+ * fails the snapshot instead of silently producing a full artifact.
+ *
+ * Note: snapshots created before the mode field existed report [FULL].
+ */
+object SnapshotMode {
+    const val FULL = "full"
+    const val ROOTFS_ONLY = "rootfsOnly"
+}
 
 class SnapshotStatus(
     val state: String,
@@ -766,10 +940,34 @@ class SnapshotInfo(
     val name: String? = null,
     val status: SnapshotStatus,
     val createdAt: OffsetDateTime,
-)
+) {
+    /**
+     * Artifact class of the snapshot. Snapshots created before the mode field
+     * existed report [SnapshotMode.FULL].
+     */
+    var mode: String = SnapshotMode.FULL
+        private set
+
+    /**
+     * Mode-aware constructor. The five-parameter primary constructor keeps the
+     * published ABI — including the compiler-generated default-argument bridge
+     * for callers that omit [name] — intact for pre-upgrade binaries.
+     */
+    constructor(
+        id: String,
+        sandboxId: String,
+        name: String?,
+        status: SnapshotStatus,
+        createdAt: OffsetDateTime,
+        mode: String,
+    ) : this(id, sandboxId, name, status, createdAt) {
+        this.mode = mode
+    }
+}
 
 class SnapshotFilter private constructor(
     val sandboxId: String?,
+    val name: String?,
     val states: List<String>?,
     val pageSize: Int?,
     val page: Int?,
@@ -781,12 +979,18 @@ class SnapshotFilter private constructor(
 
     class Builder {
         private var sandboxId: String? = null
+        private var name: String? = null
         private var states: List<String>? = null
         private var pageSize: Int? = null
         private var page: Int? = null
 
         fun sandboxId(sandboxId: String): Builder {
             this.sandboxId = sandboxId
+            return this
+        }
+
+        fun name(name: String): Builder {
+            this.name = name
             return this
         }
 
@@ -812,7 +1016,7 @@ class SnapshotFilter private constructor(
             return this
         }
 
-        fun build(): SnapshotFilter = SnapshotFilter(sandboxId, states, pageSize, page)
+        fun build(): SnapshotFilter = SnapshotFilter(sandboxId, name, states, pageSize, page)
     }
 }
 
@@ -835,10 +1039,12 @@ class SandboxRenewResponse(
  *
  * @property endpoint Sandbox endpoint
  * @property headers Headers that must be included on every request targeting this endpoint (e.g. when the server requires them for routing or auth). Empty if not required.
+ * @property origin Server-reported sandbox origin (see [SandboxOrigin]); null when the server does not report one. Only endpoint lookups carry it.
  */
 class SandboxEndpoint(
     val endpoint: String,
     val headers: Map<String, String> = emptyMap(),
+    val origin: String? = null,
 )
 
 /**

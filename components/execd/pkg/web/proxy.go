@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,20 @@ import (
 
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 )
+
+// proxyTransport is shared by every proxied request. A Transport owns its
+// keep-alive pool, so building one per request opened a new upstream
+// connection each time and left it idle in an unreachable pool until
+// IdleConnTimeout.
+var proxyTransport = &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout:   600 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	MaxIdleConns:        100,
+	MaxIdleConnsPerHost: 100,
+	IdleConnTimeout:     600 * time.Second,
+}
 
 func ProxyMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -85,22 +99,14 @@ func ProxyMiddleware() gin.HandlerFunc {
 			}
 		}
 
-		proxy.Transport = &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   600 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     600 * time.Second,
-		}
+		proxy.Transport = proxyTransport
 
 		proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-			log.Error("Proxy error: %v, request: %s %s", err, req.Method, req.RequestURI)
+			log.Error("proxy: %v (request: %s %s)", err, req.Method, req.RequestURI)
 			http.Error(rw, "Bad Gateway", http.StatusBadGateway)
 		}
 
-		log.Info("Proxy: %s %s -> %s (WebSocket: %v)", r.Method, r.RequestURI, target.Host, isWebSocket)
+		log.Info("proxy: %s %s -> %s (websocket=%v)", r.Method, r.RequestURI, target.Host, isWebSocket)
 
 		proxy.ServeHTTP(w, r)
 		c.Abort()

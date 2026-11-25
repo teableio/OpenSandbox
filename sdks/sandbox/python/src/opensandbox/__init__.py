@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,18 +27,17 @@ from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.sandboxes import SandboxImageSpec
 
 async def main():
-    # Create a sandbox instance.
-    #
-    # Note on lifecycle:
-    # - Exiting the context manager will call `sandbox.close()` (local HTTP resources only).
-    # - You must still call `sandbox.kill()` to terminate the remote sandbox instance.
-    async with await Sandbox.create("python:3.11") as sandbox:
+    sandbox = await Sandbox.create("python:3.11")
+    try:
         # Write a file
         await sandbox.files.write_file("hello.py", "print('Hello World')")
 
         # Execute a command
         result = await sandbox.commands.run("python hello.py")
         print(result.logs.stdout[0].text)  # Hello World
+    finally:
+        # Terminate the remote sandbox and close local HTTP resources.
+        await sandbox.destroy()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -85,8 +84,7 @@ async def main():
         print(f"Memory usage: {metrics.memory_used_in_mib}MB")
 
     finally:
-        await sandbox.kill()
-        await sandbox.close()
+        await sandbox.destroy()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -102,12 +100,23 @@ from importlib.metadata import version as _pkg_version
 from opensandbox.manager import SandboxManager
 from opensandbox.pool import (
     AcquirePolicy,
+    AsyncPooledSandboxCreator,
     AsyncSandboxPool,
     InMemoryAsyncPoolStateStore,
     InMemoryPoolStateStore,
     PoolCreationSpec,
+    PoolDestroyOptions,
+    PoolDestroyResult,
+    PoolDestroyState,
+    PoolDestroyStrategy,
+    PooledSandboxCreateContext,
+    PooledSandboxCreateReason,
+    PooledSandboxCreator,
     SandboxPool,
     SandboxPoolAsync,
+    SandboxPoolManager,
+    SandboxPoolManagerAsync,
+    SandboxPoolManagerSync,
 )
 from opensandbox.sandbox import Sandbox
 from opensandbox.sync import SandboxManagerSync, SandboxPoolSync, SandboxSync
@@ -128,7 +137,18 @@ __all__ = [
     "AsyncSandboxPool",
     "SandboxPool",
     "AcquirePolicy",
+    "AsyncPooledSandboxCreator",
+    "PooledSandboxCreateContext",
+    "PooledSandboxCreateReason",
+    "PooledSandboxCreator",
     "PoolCreationSpec",
+    "PoolDestroyOptions",
+    "PoolDestroyResult",
+    "PoolDestroyState",
+    "PoolDestroyStrategy",
     "InMemoryAsyncPoolStateStore",
     "InMemoryPoolStateStore",
+    "SandboxPoolManager",
+    "SandboxPoolManagerAsync",
+    "SandboxPoolManagerSync",
 ]

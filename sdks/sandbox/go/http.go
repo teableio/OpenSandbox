@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,18 @@ package opensandbox
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,6 +36,13 @@ import (
 // long-lived SSE streaming connections. Use per-request context deadlines
 // instead to control individual call timeouts.
 const defaultTimeout = 0
+
+// streamResponseHeaderTimeout bounds how long an SSE request waits for the
+// server to send response headers after the connection is established. It does
+// NOT bound reading the (potentially long-lived) event stream body. Without it,
+// a server that accepts the connection but never sends headers would hang the
+// stream forever for callers using context.Background().
+const streamResponseHeaderTimeout = 30 * time.Second
 
 // Client is the base HTTP client shared by LifecycleClient and EgressClient.
 type Client struct {
@@ -38,6 +53,102 @@ type Client struct {
 	timeout    *time.Duration // stored separately, applied after all options
 	headers    map[string]string
 	retry      *RetryConfig
+
+	// streamClient is a dedicated HTTP client for SSE streaming, created lazily.
+	// It disables connection pooling/keep-alive and has no overall request
+	// timeout (see streamHTTPClient).
+	streamClient *http.Client
+	streamOnce   sync.Once
+
+	// transferClient is a dedicated HTTP client for file uploads and downloads,
+	// created lazily. Like streamClient it has no overall request timeout, but
+	// it keeps connection pooling (see transferHTTPClient).
+	transferClient *http.Client
+	transferOnce   sync.Once
+}
+
+func (c *Client) cloneWithBaseURL(baseURL string) *Client {
+	// Streaming state contains sync.Once and must never be copied from a live client.
+	cloned := &Client{
+		baseURL:    baseURL,
+		apiKey:     c.apiKey,
+		authHeader: c.authHeader,
+		httpClient: c.httpClient,
+		timeout:    c.timeout,
+		retry:      c.retry,
+	}
+	if c.headers != nil {
+		cloned.headers = make(map[string]string, len(c.headers))
+		for k, v := range c.headers {
+			cloned.headers[k] = v
+		}
+	}
+	return cloned
+}
+
+// streamHTTPClient returns a dedicated HTTP client for SSE streaming.
+//
+// Streaming differs from normal requests in two ways that make the shared
+// httpClient unsuitable:
+//   - It must not be bounded by an overall request timeout (http.Client.Timeout),
+//     because that timeout also covers reading the response body and would kill
+//     a long-running command's event stream mid-flight.
+//   - It must not reuse pooled keep-alive connections: a connection silently
+//     dropped by a load balancer while idle would stall the stream until it
+//     times out. Each stream therefore uses a fresh, non-pooled connection.
+//
+// Connection setup is still bounded by the transport's DialTimeout,
+// TLSHandshakeTimeout, and ResponseHeaderTimeout (the wait for response
+// headers); only the (unbounded) body read is uncapped.
+//
+// The dedicated client is a shallow copy of the configured httpClient, so any
+// caller-provided CookieJar / CheckRedirect policy still applies to streams;
+// only Timeout (cleared) and Transport (replaced) differ.
+func (c *Client) streamHTTPClient() *http.Client {
+	c.streamOnce.Do(func() {
+		sc := *c.httpClient // shallow copy: keep Jar, CheckRedirect, etc.
+		sc.Timeout = 0      // no overall request timeout for long-lived streams
+		if tr, ok := c.httpClient.Transport.(*http.Transport); ok && tr != nil {
+			clone := tr.Clone()
+			clone.DisableKeepAlives = true // do not pool/reuse stream connections
+			// Bound only the "connected -> first response header" phase.
+			// DialTimeout/TLSHandshakeTimeout do not cover waiting for response
+			// headers, so without this a server that accepts the connection but
+			// never sends headers would hang forever for context.Background()
+			// callers. The SSE body read stays uncapped (Client.Timeout == 0).
+			// Only set it when unset, to preserve an explicit caller value.
+			if clone.ResponseHeaderTimeout == 0 {
+				clone.ResponseHeaderTimeout = streamResponseHeaderTimeout
+			}
+			sc.Transport = clone
+		}
+		// else: custom RoundTripper is kept as-is via the shallow copy
+		// (cannot toggle keep-alives on an unknown transport).
+		c.streamClient = &sc
+	})
+	return c.streamClient
+}
+
+// transferHTTPClient returns the HTTP client for file uploads and downloads.
+//
+// http.Client.Timeout covers the whole exchange, including sending the request
+// body and reading the response body, so the shared httpClient would cut off
+// any transfer that takes longer than the request timeout. Like
+// streamHTTPClient, this client has no overall timeout and bounds only the wait
+// for response headers; callers can still bound a transfer through ctx. Unlike
+// streams, transfers keep connection pooling.
+func (c *Client) transferHTTPClient() *http.Client {
+	c.transferOnce.Do(func() {
+		tc := *c.httpClient // shallow copy: keep Jar, CheckRedirect, etc.
+		tc.Timeout = 0
+		if tr, ok := c.httpClient.Transport.(*http.Transport); ok && tr != nil && tr.ResponseHeaderTimeout == 0 {
+			clone := tr.Clone()
+			clone.ResponseHeaderTimeout = streamResponseHeaderTimeout
+			tc.Transport = clone
+		}
+		c.transferClient = &tc
+	})
+	return c.transferClient
 }
 
 // Option configures a Client.
@@ -59,7 +170,9 @@ func WithTimeout(d time.Duration) Option {
 }
 
 // WithHeaders adds custom HTTP headers to all requests. These are applied
-// before the auth and content-type headers, so they cannot override those.
+// before the content-type and accept headers, so they cannot override those.
+// An entry matching the auth header name (case-insensitively) takes
+// precedence over the configured API key.
 func WithHeaders(headers map[string]string) Option {
 	return func(cl *Client) {
 		if cl.headers == nil {
@@ -69,6 +182,14 @@ func WithHeaders(headers map[string]string) Option {
 			cl.headers[k] = v
 		}
 	}
+}
+
+// hasHeaderName reports whether headers already carries a value for name,
+// matched case-insensitively via MIME canonicalization. A present-but-empty
+// value counts as present.
+func hasHeaderName(headers http.Header, name string) bool {
+	_, ok := headers[http.CanonicalHeaderKey(name)]
+	return ok
 }
 
 // WithAuthHeader overrides the default auth header name. Use this when the
@@ -101,34 +222,149 @@ func NewClient(baseURL, apiKey, authHeader string, opts ...Option) *Client {
 			Timeout:   defaultTimeout,
 			Transport: DefaultTransport(),
 		}
-	} else if c.httpClient.Transport == nil {
-		// Clone the caller's client to avoid mutating shared instances
-		// (e.g. http.DefaultClient) which would leak the SDK's transport
-		// settings into unrelated traffic in the same process.
-		cloned := *c.httpClient
-		cloned.Transport = DefaultTransport()
-		c.httpClient = &cloned
 	}
+	// Keep SDK redirect and timeout settings local, even when the caller's
+	// client already has a transport and is shared with unrelated traffic.
+	cloned := *c.httpClient
+	c.httpClient = &cloned
+	if c.httpClient.Transport == nil {
+		c.httpClient.Transport = DefaultTransport()
+	}
+	c.httpClient.CheckRedirect = protectedHeaderRedirectPolicy(c.httpClient.CheckRedirect, authHeader, c.authHeader)
 	// Apply deferred timeout after all options so it works regardless of
 	// WithHTTPClient ordering and guards against a nil httpClient.
 	if c.timeout != nil {
 		c.httpClient.Timeout = *c.timeout
 	}
+	// Best-effort: attach the SDK host's own IP so the server can see the
+	// client's self-reported address. Never overrides a user-supplied value
+	// and is skipped silently when the IP cannot be determined.
+	c.headers = applyClientIP(c.headers, detectedClientIP())
 	return c
+}
+
+// redirectOrigin normalizes the URL components that define an HTTP origin.
+func redirectOrigin(u *url.URL) [3]string {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return [3]string{scheme, strings.ToLower(u.Hostname()), port}
+}
+
+func protectedHeaderRedirectPolicy(policy func(*http.Request, []*http.Request) error, authHeaders ...string) func(*http.Request, []*http.Request) error {
+	protectedAuthHeaders := make(map[string]bool, len(authHeaders))
+	for _, name := range authHeaders {
+		if name != "" {
+			protectedAuthHeaders[strings.ToUpper(name)] = true
+		}
+	}
+	return func(req *http.Request, via []*http.Request) error {
+		// Save the initial origin before a caller callback can change requests.
+		origin := redirectOrigin(via[0].URL)
+		if policy != nil {
+			if err := policy(req, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			// Match net/http's default policy when no custom policy was supplied.
+			return errors.New("stopped after 10 redirects")
+		}
+		if redirectOrigin(req.URL) != origin {
+			// net/http copies the initial request's headers on every hop. Check
+			// each destination, including later hops on the foreign origin.
+			for name := range req.Header {
+				upper := strings.ToUpper(name)
+				if protectedAuthHeaders[upper] || strings.HasPrefix(upper, "OPEN-SANDBOX-") || strings.HasPrefix(upper, "OPENSANDBOX-") {
+					delete(req.Header, name)
+				}
+			}
+		}
+		return nil
+	}
 }
 
 // doRequest executes an HTTP request with JSON encoding and auth headers,
 // retrying on transient errors if a RetryConfig is set.
 // If body is nil, no request body is sent. If result is non-nil, the
 // response body is decoded into it.
+//
+// For idempotent requests (GET/HEAD) it also transparently recovers from a
+// stale pooled connection: some load balancers silently drop idle keep-alive
+// connections without sending a FIN, so a reused connection can hang until the
+// request timeout. When such a failure happens on a REUSED pooled connection
+// the client purges idle connections and retries once on a fresh connection.
+// The retry is gated on the failed attempt having reused a pooled connection
+// (observed via httptrace), so a slow server hit over a brand-new connection is
+// not retried and cannot double the effective timeout. This is always on and
+// independent of the opt-in RetryConfig.
 func (c *Client) doRequest(ctx context.Context, method, path string, body any, result any) error {
-	return c.withRetry(ctx, func() error {
-		return c.doRequestOnce(ctx, method, path, body, result)
+	return c.doRequestCapture(ctx, method, path, body, result, nil)
+}
+
+// doRequestCapture behaves like doRequest and additionally invokes capture
+// with the response headers of the successful response when capture is
+// non-nil. It exists for callers that need server-reported response metadata
+// (e.g. the OPEN-SANDBOX-ORIGIN header) that is not part of the JSON body.
+func (c *Client) doRequestCapture(ctx context.Context, method, path string, body, result any, capture func(http.Header)) error {
+	return c.withRetryMethod(ctx, method, func(ctx context.Context) error {
+		var reused bool
+		err := c.doRequestOnce(ctx, method, path, body, result, &reused, capture)
+		if err != nil && reused && c.shouldRetryOnFreshConn(ctx, method, err) {
+			// The reused pooled connection was likely silently dropped by an
+			// intermediary. Drop idle connections so the retry dials a new one.
+			c.httpClient.CloseIdleConnections()
+			err = c.doRequestOnce(ctx, method, path, body, result, nil, capture)
+		}
+		return err
 	})
 }
 
-// doRequestOnce is the single-attempt implementation of doRequest.
-func (c *Client) doRequestOnce(ctx context.Context, method, path string, body any, result any) error {
+// shouldRetryOnFreshConn reports whether a failed request should be retried once
+// on a fresh connection. It targets connection-level failures (timeouts waiting
+// for response headers, connection resets/EOF) that typically mean a reused
+// pooled connection was already dead. It is restricted to idempotent methods
+// and never fires when the caller's context is done (respecting cancellation)
+// or when the server actually responded with an error status. The caller
+// additionally gates this on the failed attempt having reused a pooled
+// connection.
+func (c *Client) shouldRetryOnFreshConn(ctx context.Context, method string, err error) bool {
+	if err == nil {
+		return false
+	}
+	if method != http.MethodGet && method != http.MethodHead {
+		return false
+	}
+	// Respect caller cancellation / deadline: the caller gave up, don't retry.
+	if ctx.Err() != nil {
+		return false
+	}
+	// The server responded (4xx/5xx): not a connection problem.
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return false
+	}
+	// Network-level timeout (incl. http.Client.Timeout awaiting headers) or a
+	// connection error (reset, closed) surfaced as a net.Error.
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// Idle connection closed by the peer between pooling and reuse.
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// doRequestOnce is the single-attempt implementation of doRequest. If reused is
+// non-nil it is set to whether this attempt was carried over a reused pooled
+// connection (observed via httptrace GotConn). If capture is non-nil it is
+// invoked with the response headers once the response is deemed successful.
+func (c *Client) doRequestOnce(ctx context.Context, method, path string, body any, result any, reused *bool, capture func(http.Header)) error {
 	var bodyReader io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
@@ -137,6 +373,34 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body an
 		}
 		bodyReader = bytes.NewReader(buf)
 	}
+
+	var sent atomic.Bool
+	var traceStarted atomic.Bool
+	var gotConn atomic.Bool
+	var tlsHandshakeFailed atomic.Bool
+	trace := &httptrace.ClientTrace{
+		GetConn: func(string) {
+			traceStarted.Store(true)
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			gotConn.Store(true)
+			if reused != nil {
+				*reused = info.Reused
+			}
+		},
+		WroteHeaders: func() {
+			sent.Store(true)
+		},
+		GotFirstResponseByte: func() {
+			sent.Store(true)
+		},
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			if err != nil {
+				tlsHandshakeFailed.Store(true)
+			}
+		},
+	}
+	ctx = httptrace.WithClientTrace(ctx, trace)
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
@@ -147,7 +411,9 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body an
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
-	if c.apiKey != "" {
+	// A caller-supplied auth header entry (any casing, including empty)
+	// takes precedence over the configured API key.
+	if c.apiKey != "" && !hasHeaderName(req.Header, c.authHeader) {
 		req.Header.Set(c.authHeader, c.apiKey)
 	}
 	if body != nil {
@@ -155,14 +421,23 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body an
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := doAttempt(c.httpClient, req)
 	if err != nil {
+		if sent.Load() {
+			err = &requestSentError{err: err}
+		} else if (traceStarted.Load() && !gotConn.Load()) || tlsHandshakeFailed.Load() {
+			err = &preSendError{err: err}
+		}
 		return fmt.Errorf("opensandbox: do request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		return handleError(resp)
+	}
+
+	if capture != nil {
+		capture(resp.Header)
 	}
 
 	// No content (e.g. 204)
@@ -179,13 +454,18 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body an
 }
 
 // doStreamRequest builds an HTTP request, executes it, and streams SSE events
-// through handler. Connection setup is retried on transient errors; once
-// streaming begins, errors are not retried (partial data may have been
-// delivered to the handler).
+// through handler. SSE bootstraps bypass the generic retry loop: the stream may
+// already have delivered partial data or submitted a command, and OSEP-0017
+// requires the bootstrap to stay unwrapped by it. The OSEP-0024 wake retry
+// still applies, as it does to every other request: the marker proves the
+// gateway parked the bootstrap and never forwarded it, so replaying it cannot
+// run anything twice, and older behavior that failed the call fast left the
+// primary execution path unable to wake an auto-paused sandbox. Once streaming
+// begins, errors are not retried.
 func (c *Client) doStreamRequest(ctx context.Context, method, path string, body any, handler EventHandler) error {
 	var resp *http.Response
 
-	connectErr := c.withRetry(ctx, func() error {
+	connectErr := c.withWakeRetry(ctx, method, func(ctx context.Context) error {
 		var bodyReader io.Reader
 		if body != nil {
 			buf, err := json.Marshal(body)
@@ -204,7 +484,9 @@ func (c *Client) doStreamRequest(ctx context.Context, method, path string, body 
 		for k, v := range c.headers {
 			req.Header.Set(k, v)
 		}
-		if c.apiKey != "" {
+		// A caller-supplied auth header entry (any casing, including empty)
+		// takes precedence over the configured API key.
+		if c.apiKey != "" && !hasHeaderName(req.Header, c.authHeader) {
 			req.Header.Set(c.authHeader, c.apiKey)
 		}
 		if body != nil {
@@ -212,7 +494,10 @@ func (c *Client) doStreamRequest(ctx context.Context, method, path string, body 
 		}
 		req.Header.Set("Accept", "text/event-stream")
 
-		r, err := c.httpClient.Do(req)
+		// SSE uses a dedicated non-pooled, timeout-free client so long streams
+		// are not killed by the overall request timeout and are never carried
+		// over a stale pooled connection.
+		r, err := doAttempt(c.streamHTTPClient(), req)
 		if err != nil {
 			return fmt.Errorf("opensandbox: do request: %w", err)
 		}
@@ -222,6 +507,7 @@ func (c *Client) doStreamRequest(ctx context.Context, method, path string, body 
 			return handleError(r)
 		}
 
+		r.Body = keepAttemptBody(ctx, r.Body)
 		resp = r
 		return nil
 	})
@@ -233,12 +519,25 @@ func (c *Client) doStreamRequest(ctx context.Context, method, path string, body 
 }
 
 // handleError reads the response body and returns an *APIError.
-// It captures the Retry-After header for use by the retry loop.
+// It captures the Retry-After header for use by the retry loop and the
+// gateway-owned OSEP-0024 wake marker for the wake retry contract.
 func handleError(resp *http.Response) error {
+	retryAfter, retryAfterPresent := parseRetryAfterValue(resp.Header.Get("Retry-After"))
+	wakeExpired := resp.StatusCode == http.StatusServiceUnavailable &&
+		resp.Header.Get(wakeMarkerHeader) == wakeMarkerExpired
+	// The marker only proves that the final hop never forwarded the request.
+	// When the client followed a redirect first, an earlier hop already
+	// received the request (and may have processed it), so replaying the
+	// original request is no longer provably free of a second execution.
+	if wakeExpired && resp.Request != nil && resp.Request.Response != nil {
+		wakeExpired = false
+	}
 	apiErr := &APIError{
-		StatusCode: resp.StatusCode,
-		RequestID:  resp.Header.Get("X-Request-Id"),
-		RetryAfter: parseRetryAfter(resp),
+		StatusCode:        resp.StatusCode,
+		RequestID:         resp.Header.Get("X-Request-Id"),
+		RetryAfter:        retryAfter,
+		RetryAfterPresent: retryAfterPresent,
+		WakeExpired:       wakeExpired,
 	}
 	data, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {

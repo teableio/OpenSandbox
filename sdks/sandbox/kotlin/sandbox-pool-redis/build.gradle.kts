@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ dependencies {
     testRuntimeOnly(libs.junit.platform.launcher)
 }
 
-// Configure test tasks to use JDK 17
 tasks.withType<Test> {
     javaLauncher.set(
         javaToolchains.launcherFor {
@@ -32,7 +31,6 @@ tasks.withType<Test> {
     useJUnitPlatform()
 }
 
-// Configure test compilation to use JDK 17
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
     if (name.contains("test", ignoreCase = true)) {
         compilerOptions {

@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,13 +21,20 @@ dependencies {
 
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging)
-    implementation(libs.bundles.serialization)
+    implementation(libs.opentelemetry.api)
+    compileOnly(libs.bundles.serialization)
 
     testImplementation(libs.bundles.testing)
+    testImplementation(libs.bundles.serialization)
+    testImplementation(libs.opentelemetry.sdk.testing)
+    testImplementation(libs.logback.classic)
     testRuntimeOnly(libs.junit.platform.launcher)
 }
 
-// Configure test tasks to use JDK 17
+tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar") {
+    configurations = emptyList()
+}
+
 tasks.withType<Test> {
     javaLauncher.set(
         javaToolchains.launcherFor {
@@ -37,7 +44,6 @@ tasks.withType<Test> {
     useJUnitPlatform()
 }
 
-// Configure test compilation to use JDK 17
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
     if (name.contains("test", ignoreCase = true)) {
         compilerOptions {

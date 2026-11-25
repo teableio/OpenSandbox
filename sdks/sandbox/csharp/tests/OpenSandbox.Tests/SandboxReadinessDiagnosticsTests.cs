@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ using OpenSandbox.Core;
 using OpenSandbox.Factory;
 using OpenSandbox.Models;
 using OpenSandbox.Services;
+using System.Diagnostics;
 using Xunit;
 
 namespace OpenSandbox.Tests;
@@ -26,9 +27,37 @@ namespace OpenSandbox.Tests;
 public class SandboxReadinessDiagnosticsTests
 {
     [Fact]
-    public async Task WaitUntilReadyAsync_WhenHealthCheckThrows_IncludesLastErrorAndConnectionContext()
+    public async Task WaitUntilReadyAsync_WhenTimeoutIsShorterThanPollingInterval_DoesNotOvershoot()
     {
-        // Arrange
+        var healthMock = new Mock<IExecdHealth>();
+        healthMock
+            .Setup(x => x.PingAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        var sandbox = await CreateSandboxForReadinessTestAsync(healthMock, useServerProxy: true);
+        var stopwatch = Stopwatch.StartNew();
+
+        try
+        {
+            Func<Task> action = async () =>
+                await sandbox.WaitUntilReadyAsync(new WaitUntilReadyOptions
+                {
+                    ReadyTimeoutSeconds = 1,
+                    PollingIntervalMillis = 5_000
+                });
+
+            await action.Should().ThrowAsync<SandboxReadyTimeoutException>();
+            stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(3));
+        }
+        finally
+        {
+            await sandbox.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task WaitUntilReadyAsync_WhenHealthCheckThrows_OmitsNetworkConfigurationHints()
+    {
         var healthMock = new Mock<IExecdHealth>();
         healthMock
             .Setup(x => x.PingAsync(It.IsAny<CancellationToken>()))
@@ -36,7 +65,6 @@ public class SandboxReadinessDiagnosticsTests
 
         var sandbox = await CreateSandboxForReadinessTestAsync(healthMock, useServerProxy: false);
 
-        // Act
         Func<Task> action = async () =>
             await sandbox.WaitUntilReadyAsync(new WaitUntilReadyOptions
             {
@@ -44,7 +72,6 @@ public class SandboxReadinessDiagnosticsTests
                 PollingIntervalMillis = 1
             });
 
-        // Assert
         try
         {
             var ex = await action.Should().ThrowAsync<SandboxReadyTimeoutException>();
@@ -52,8 +79,10 @@ public class SandboxReadinessDiagnosticsTests
             ex.Which.Message.Should().Contain("Last health check error");
             ex.Which.Message.Should().Contain("domain=localhost:8080");
             ex.Which.Message.Should().Contain("useServerProxy=False");
-            ex.Which.Message.Should().Contain("useServerProxy=true");
-            ex.Which.Message.Should().Contain("[docker].host_ip");
+            ex.Which.Message.Should().NotContainEquivalentOf("consider enabling useServerProxy=true");
+            ex.Which.Message.Should().NotContainEquivalentOf("Docker bridge");
+            ex.Which.Message.Should().NotContainEquivalentOf("remote-network");
+            ex.Which.Message.Should().NotContain("[docker].host_ip");
         }
         finally
         {
@@ -64,7 +93,6 @@ public class SandboxReadinessDiagnosticsTests
     [Fact]
     public async Task WaitUntilReadyAsync_WhenHealthCheckReturnsFalse_UsesFalseContinuouslyHint()
     {
-        // Arrange
         var healthMock = new Mock<IExecdHealth>();
         healthMock
             .Setup(x => x.PingAsync(It.IsAny<CancellationToken>()))
@@ -72,7 +100,6 @@ public class SandboxReadinessDiagnosticsTests
 
         var sandbox = await CreateSandboxForReadinessTestAsync(healthMock, useServerProxy: true);
 
-        // Act
         Func<Task> action = async () =>
             await sandbox.WaitUntilReadyAsync(new WaitUntilReadyOptions
             {
@@ -80,7 +107,6 @@ public class SandboxReadinessDiagnosticsTests
                 PollingIntervalMillis = 1
             });
 
-        // Assert
         try
         {
             var ex = await action.Should().ThrowAsync<SandboxReadyTimeoutException>();
@@ -126,7 +152,8 @@ public class SandboxReadinessDiagnosticsTests
                 Commands = Mock.Of<IExecdCommands>(),
                 Files = Mock.Of<ISandboxFiles>(),
                 Health = healthMock.Object,
-                Metrics = Mock.Of<IExecdMetrics>()
+                Metrics = Mock.Of<IExecdMetrics>(),
+                Isolation = Mock.Of<IIsolatedSessions>()
             });
 
         adapterFactoryMock

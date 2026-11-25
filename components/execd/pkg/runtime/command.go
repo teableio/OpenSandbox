@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,16 +34,63 @@ import (
 
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
-	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
 )
 
-// getShell returns the preferred shell, falling back to sh if bash is not available.
-// This is needed for Alpine-based Docker images that only have sh by default.
-func getShell() string {
-	if _, err := exec.LookPath("bash"); err == nil {
-		return "bash"
+const bashShell = "bash"
+
+var forwardSignals = []os.Signal{
+	syscall.SIGINT,
+	syscall.SIGTERM,
+	syscall.SIGHUP,
+	syscall.SIGQUIT,
+	syscall.SIGUSR1,
+	syscall.SIGUSR2,
+	syscall.SIGWINCH,
+}
+
+// Init mode reserves application signals for the entrypoint; another subscription would also forward them to unrelated commands.
+func subscribeCommandSignals() (chan os.Signal, func()) {
+	if initModeActive() {
+		return nil, func() {}
 	}
-	return "sh"
+	signals := make(chan os.Signal, len(forwardSignals)+1)
+	signal.Notify(signals, forwardSignals...)
+	return signals, func() {
+		signal.Stop(signals)
+		close(signals)
+	}
+}
+
+// getShell returns "bash" if available, otherwise "sh". The result is cached
+// for the process lifetime; tests that mutate PATH must call
+// resetShellCacheForTest.
+var (
+	shellCacheOnce sync.Once
+	shellCacheVal  string
+)
+
+func getShell() string {
+	shellCacheOnce.Do(func() {
+		if _, err := exec.LookPath(bashShell); err == nil {
+			shellCacheVal = bashShell
+		} else {
+			shellCacheVal = "sh"
+		}
+	})
+	return shellCacheVal
+}
+
+// shellCommand returns (shell, argv) for launching the preferred shell,
+// prepending --noprofile --norc when Bash is selected. Extra positional
+// arguments (script path, or "-c" + code) are appended after.
+func shellCommand(extra ...string) (string, []string) {
+	shell := getShell()
+	args := make([]string, 0, 2+len(extra))
+	if shell == bashShell {
+		args = append(args, "--noprofile", "--norc")
+	}
+	args = append(args, extra...)
+	return shell, args
 }
 
 func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
@@ -51,13 +98,18 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 		return nil, nil //nolint:nilnil
 	}
 
+	// An explicit uid/gid matching the identity execd already runs as needs
+	// no credential switch: return nil so the launch stays on the plain exec
+	// path, which is also what the no-uid request already does (#1802).
+	if sameIdentityRequest(uid, gid) {
+		return nil, nil //nolint:nilnil
+	}
+
 	cred := &syscall.Credential{}
 	if uid != nil {
 		cred.Uid = *uid
-		// Load user info to get primary GID and supplemental groups
 		u, err := user.LookupId(strconv.FormatUint(uint64(*uid), 10))
 		if err == nil {
-			// Set primary GID if not explicitly provided
 			if gid == nil {
 				primaryGid, err := strconv.ParseUint(u.Gid, 10, 32)
 				if err == nil {
@@ -65,7 +117,6 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 				}
 			}
 
-			// Load supplemental groups
 			gids, err := u.GroupIds()
 			if err == nil {
 				for _, g := range gids {
@@ -78,72 +129,75 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 		}
 	}
 
-	// Override Gid if explicitly provided
 	if gid != nil {
 		cred.Gid = *gid
-	}
-
-	// Requesting the identity we already run as is a no-op switch, and doing it
-	// anyway breaks unprivileged sandboxes: the child calls setgroups(2), which
-	// always requires CAP_SETGID, and a container running as a non-root user has
-	// an empty effective capability set. The fork would fail with EPERM
-	// ("fork/exec /usr/bin/bash: operation not permitted") even though no
-	// privilege change was ever needed. Inheriting the current credentials
-	// yields exactly the requested identity.
-	if credentialIsCurrentProcess(cred) {
-		return nil, nil //nolint:nilnil
 	}
 
 	return cred, nil
 }
 
-// credentialIsCurrentProcess reports whether inheriting our credentials gives
-// the child everything cred asks for. Real and effective IDs must both match,
-// so a process that is mid-switch (or on a platform without POSIX IDs, where
-// these return -1) still takes the explicit path.
-//
-// The requested groups must be a subset of ours. Equal sets are the common
-// case. Where they are not, this is a deliberate policy choice rather than a
-// strict equivalence: the child may keep supplemental groups the request did
-// not name. Those come from how the container was started, and every process
-// in it — including the caller issuing this request — already carries them,
-// so the command gains nothing its own container does not already have. A
-// requested group we do *not* hold is the opposite case and would be lost by
-// inheriting, so it takes the explicit path and fails loudly rather than
-// silently running with less access than asked for.
-func credentialIsCurrentProcess(cred *syscall.Credential) bool {
-	uid, gid := os.Getuid(), os.Getgid()
-	if uid < 0 || gid < 0 {
-		return false
+// sameIdentityRequest reports whether the requested uid/gid matches the
+// identity execd already runs with, making the credential machinery a
+// provable no-op. A non-nil Credential always makes the child call setgroups
+// (even when every id matches), and setgroups requires CAP_SETGID no matter
+// what values are requested — so same-identity credentials fail with
+// "fork/exec ...: operation not permitted" inside sandboxes that drop
+// capabilities (#1802). A uid-only request skips the switch only when the
+// user entry's primary GID and supplemental groups match the daemon's own.
+func sameIdentityRequest(uid, gid *uint32) bool {
+	currentUID := uint32(os.Getuid())
+	currentGID := uint32(os.Getgid())
+	if (uid == nil || *uid == currentUID) && (gid == nil || *gid == currentGID) {
+		if gid != nil || uid == nil {
+			return true
+		}
+		return sameProcessGroups(*uid)
 	}
-	if uid != os.Geteuid() || gid != os.Getegid() {
-		return false
-	}
-	if cred.Uid != uint32(uid) || cred.Gid != uint32(gid) {
-		return false
-	}
+	return false
+}
 
-	current, err := os.Getgroups()
+// credentialStartHint annotates command launch failures that happen while
+// switching identity. With capabilities dropped the kernel rejects the
+// child's setgroups/setgid/setuid calls, and the raw error surfaces as a
+// bare "fork/exec ...: operation not permitted" that gives the caller no
+// way to discover the missing grant (#1802).
+func credentialStartHint(err error, cred *syscall.Credential) error {
+	if cred == nil || !errors.Is(err, os.ErrPermission) {
+		return err
+	}
+	return fmt.Errorf(
+		"%w (switching to uid=%d gid=%d requires CAP_SETUID/CAP_SETGID, which this sandbox may not have — check the server's docker.drop_capabilities configuration; dropping these capabilities makes every identity switch fail)",
+		err, cred.Uid, cred.Gid,
+	)
+}
+
+// sameProcessGroups reports whether the given uid's user entry resolves to
+// the primary GID and supplemental groups the daemon already runs with, i.e.
+// whether building a credential for that uid would be a no-op group-wise.
+func sameProcessGroups(uid uint32) bool {
+	u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10))
 	if err != nil {
 		return false
 	}
-	return groupsAreSubset(cred.Groups, current, cred.Gid)
-}
-
-// groupsAreSubset reports whether every group in requested is one we hold.
-// The primary gid counts as held on both sides: getgroups(2) is not required
-// to list it, and the caller may or may not include it in the request.
-func groupsAreSubset(requested []uint32, current []int, primaryGid uint32) bool {
-	held := make(map[uint32]struct{}, len(current)+1)
-	held[primaryGid] = struct{}{}
-	for _, g := range current {
-		if g < 0 {
-			return false
-		}
-		held[uint32(g)] = struct{}{}
+	primaryGid, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil || uint32(primaryGid) != uint32(os.Getgid()) {
+		return false
 	}
-	for _, g := range requested {
-		if _, ok := held[g]; !ok {
+	entryGroups, err := u.GroupIds()
+	if err != nil {
+		return false
+	}
+	processGroups, err := syscall.Getgroups()
+	if err != nil || len(entryGroups) != len(processGroups) {
+		return false
+	}
+	seen := make(map[uint32]bool, len(processGroups))
+	for _, g := range processGroups {
+		seen[uint32(g)] = true
+	}
+	for _, g := range entryGroups {
+		id, err := strconv.ParseUint(g, 10, 32)
+		if err != nil || !seen[uint32(id)] {
 			return false
 		}
 	}
@@ -152,33 +206,30 @@ func groupsAreSubset(requested []uint32, current []int, primaryGid uint32) bool 
 
 // runCommand executes shell commands and streams their output.
 func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest) error {
-	session := c.newContextID()
+	session := c.newCommandID(request)
 
-	signals := make(chan os.Signal, 1)
-	defer close(signals)
-	signal.Notify(signals)
-	defer signal.Reset()
+	signals, stopSignals := subscribeCommandSignals()
+	defer stopSignals()
 
 	stdout, stderr, err := c.stdLogDescriptor(session)
 	if err != nil {
 		return fmt.Errorf("failed to get stdlog descriptor: %w", err)
 	}
-	defer stdout.Close()
-	defer stderr.Close()
 	stdoutPath := c.stdoutFileName(session)
 	stderrPath := c.stderrFileName(session)
+	defer func() {
+		_ = stdout.Close()
+		_ = stderr.Close()
+		removeCommandOutputFilesWithID(session, stdoutPath, stderrPath)
+	}()
 
 	startAt := time.Now()
-	log.Info("received command: %v", log.SanitizeCommand(request.Code))
-	shell := getShell()
-	cmd := exec.CommandContext(ctx, shell, "-c", request.Code)
-	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
-	cwd, err := pathutil.ExpandPathWithEnv(request.Cwd, extraEnv)
+	log.InfoWithCommandID(session, "command: received %v", log.SanitizeCommand(request.commandContent()))
+	cmd, err := prepareCommand(ctx, request)
 	if err != nil {
 		return fmt.Errorf("resolve request cwd %s: %w", request.Cwd, err)
 	}
 
-	// Configure credentials and process group
 	cred, err := buildCredential(request.Uid, request.Gid)
 	if err != nil {
 		return fmt.Errorf("failed to build credential: %w", err)
@@ -188,10 +239,12 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 		Credential: cred,
 	}
 
+	// The group watcher owns cancellation, including timeout classification.
+	// Disable the competing exec.Cmd watcher, which kills only the leader.
+	cmd.Cancel = nil
+
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	cmd.Env = mergeEnvs(os.Environ(), extraEnv)
-	cmd.Dir = cwd
 
 	done := make(chan struct{}, 1)
 	var wg sync.WaitGroup
@@ -205,17 +258,18 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 		c.tailStdPipe(stderrPath, request.Hooks.OnExecuteStderr, done)
 	})
 
-	err = cmd.Start()
+	mp, err := launchManaged(cmd)
 	if err != nil {
 		close(done)
 		wg.Wait()
+		startErr := credentialStartHint(err, cred)
 		request.Hooks.OnExecuteInit(session)
 		request.Hooks.OnExecuteError(&execute.ErrorOutput{
 			EName:     "CommandExecError",
-			EValue:    err.Error(),
-			Traceback: []string{err.Error()},
+			EValue:    startErr.Error(),
+			Traceback: []string{startErr.Error()},
 		})
-		log.Error("CommandExecError: error starting commands: %v", err)
+		log.ErrorWithCommandID(session, "command: start failed: %v", startErr)
 		return nil
 	}
 
@@ -225,13 +279,15 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 		stderrPath:   stderrPath,
 		startedAt:    startAt,
 		running:      true,
-		content:      request.Code,
+		content:      request.commandContent(),
 		isBackground: false,
 	}
 	c.storeCommandKernel(session, kernel)
-	request.Hooks.OnExecuteInit(session)
 
+	var timedOut bool
+	watcherDone := make(chan struct{})
 	safego.Go(func() {
+		defer close(watcherDone)
 		for {
 			select {
 			case <-done:
@@ -257,9 +313,11 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 				// Genuine cancellation (timeout, client disconnect,
 				// Interrupt). Kill the whole process group so children
 				// don't outlive the cancelled context.
-				if cmd.Process != nil {
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				}
+				deadline := errors.Is(ctx.Err(), context.DeadlineExceeded)
+				killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				// Record delivered cancellation, not a deadline observed after Wait.
+				// An independent exit can still coincide with a successful signal.
+				timedOut = deadline && killErr == nil
 				return
 			case sig := <-signals:
 				if sig == nil {
@@ -273,46 +331,60 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 		}
 	})
 
-	err = cmd.Wait()
-	close(done)
+	waitErr := errors.New("command wait did not complete")
+	safego.Go(func() {
+		defer close(done)
+		// Observe exit independently of blocked init or output callbacks.
+		waitErr = mp.Wait()
+	})
+
+	request.Hooks.OnExecuteInit(session)
+	<-done
+	<-watcherDone
 	wg.Wait()
-	if err != nil {
-		var eName, eValue string
-		var eCode int
-		var traceback []string
-
-		var exitError *exec.ExitError
-		if errors.As(err, &exitError) {
-			exitCode := exitError.ExitCode()
-			eName = "CommandExecError"
-			eValue = strconv.Itoa(exitCode)
-			eCode = exitCode
-		} else {
-			eName = "CommandExecError"
-			eValue = err.Error()
-			eCode = 1
-		}
-		traceback = []string{err.Error()}
-
-		request.Hooks.OnExecuteError(&execute.ErrorOutput{
-			EName:     eName,
-			EValue:    eValue,
-			Traceback: traceback,
-		})
-
-		log.Error("CommandExecError: error running commands: %v", err)
-		c.markCommandFinished(session, eCode, err.Error())
+	if waitErr == nil {
+		c.markCommandFinished(session, 0, "")
+		request.Hooks.OnExecuteComplete(time.Since(startAt))
 		return nil
 	}
 
-	c.markCommandFinished(session, 0, "")
-	request.Hooks.OnExecuteComplete(time.Since(startAt))
+	var eName, eValue string
+	var eCode int
+	var exitCodePtr *int
+
+	var exitCodeErr exitCoder
+	if errors.As(waitErr, &exitCodeErr) {
+		exitCode := exitCodeErr.ExitCode()
+		eName = "CommandExecError"
+		eValue = strconv.Itoa(exitCode)
+		eCode = exitCode
+		exitCodePtr = &exitCode
+	} else {
+		eName = "CommandExecError"
+		eValue = waitErr.Error()
+		eCode = 1
+	}
+	errorMessage := waitErr.Error()
+	if timedOut {
+		eName = "CommandTimeout"
+		errorMessage = fmt.Sprintf("command timed out after %s: %s", request.Timeout, errorMessage)
+	}
+
+	request.Hooks.OnExecuteError(&execute.ErrorOutput{
+		EName:     eName,
+		EValue:    eValue,
+		Traceback: []string{errorMessage},
+		ExitCode:  exitCodePtr,
+	})
+
+	log.ErrorWithCommandID(session, "command: run failed: %s", errorMessage)
+	c.markCommandFinished(session, eCode, errorMessage)
 	return nil
 }
 
 // runBackgroundCommand executes shell commands in detached mode.
 func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.CancelFunc, request *ExecuteCodeRequest) error {
-	session := c.newContextID()
+	session := c.newCommandID(request)
 	request.Hooks.OnExecuteInit(session)
 
 	pipe, err := c.combinedOutputDescriptor(session)
@@ -323,26 +395,24 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 	stdoutPath := c.combinedOutputFileName(session)
 	stderrPath := c.combinedOutputFileName(session)
 
-	signals := make(chan os.Signal, 1)
-	defer close(signals)
-	signal.Notify(signals)
-	defer signal.Reset()
+	// Classic-mode signal subscription (no-op in init mode; the channel is
+	// never consumed, keeping today's behavior of not dying on SIGHUP etc.).
+	_, stopSignals := subscribeCommandSignals()
+	defer stopSignals()
 
 	startAt := time.Now()
-	log.Info("received command: %v", log.SanitizeCommand(request.Code))
-	shell := getShell()
-	cmd := exec.CommandContext(ctx, shell, "-c", request.Code)
-	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
-	cwd, err := pathutil.ExpandPathWithEnv(request.Cwd, extraEnv)
+	log.InfoWithCommandID(session, "command: received %v", log.SanitizeCommand(request.commandContent()))
+	cmd, err := prepareCommand(ctx, request)
 	if err != nil {
 		cancel()
+		_ = pipe.Close()
 		return fmt.Errorf("resolve cwd: %w", err)
 	}
-	cmd.Dir = cwd
-	// Configure credentials and process group
+
 	cred, err := buildCredential(request.Uid, request.Gid)
 	if err != nil {
 		cancel()
+		_ = pipe.Close()
 		return fmt.Errorf("build credential: %w", err)
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -352,7 +422,6 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 
 	cmd.Stdout = pipe
 	cmd.Stderr = pipe
-	cmd.Env = mergeEnvs(os.Environ(), extraEnv)
 
 	// use DevNull as stdin so interactive programs exit immediately.
 	devNull, err := os.Open(os.DevNull)
@@ -361,40 +430,47 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 		defer devNull.Close()
 	}
 
-	err = cmd.Start()
+	mp, err := launchManaged(cmd)
 	kernel := &commandKernel{
 		pid:          -1,
 		stdoutPath:   stdoutPath,
 		stderrPath:   stderrPath,
 		startedAt:    startAt,
 		running:      true,
-		content:      request.Code,
+		content:      request.commandContent(),
 		isBackground: true,
 	}
 	if err != nil {
 		cancel()
-		log.Error("CommandExecError: error starting commands: %v", err)
+		_ = pipe.Close()
+		startErr := credentialStartHint(err, cred)
+		log.ErrorWithCommandID(session, "command: start failed: %v", startErr)
 		kernel.running = false
 		c.storeCommandKernel(session, kernel)
-		c.markCommandFinished(session, 255, err.Error())
-		return fmt.Errorf("failed to start commands: %w", err)
+		c.markCommandFinished(session, 255, startErr.Error())
+		return fmt.Errorf("failed to start commands: %w", startErr)
 	}
 
+	// Register the kernel synchronously so that GetCommandStatus callers
+	// can find the session immediately after Execute returns. Previously
+	// this happened inside the goroutine, creating a race where the HTTP
+	// handler could return before the kernel was stored.
+	kernel.pid = cmd.Process.Pid
+	c.storeCommandKernel(session, kernel)
+
+	done := make(chan struct{})
 	safego.Go(func() {
 		defer pipe.Close()
 
-		kernel.running = true
-		kernel.pid = cmd.Process.Pid
-		c.storeCommandKernel(session, kernel)
-
-		err = cmd.Wait()
+		err = mp.Wait()
+		close(done)
 		cancel()
 		if err != nil {
-			log.Error("CommandExecError: error running commands: %v", err)
+			log.ErrorWithCommandID(session, "command: run failed: %v", err)
 			exitCode := 1
-			var exitError *exec.ExitError
-			if errors.As(err, &exitError) {
-				exitCode = exitError.ExitCode()
+			var exitCodeErr exitCoder
+			if errors.As(err, &exitCodeErr) {
+				exitCode = exitCodeErr.ExitCode()
 			}
 			c.markCommandFinished(session, exitCode, err.Error())
 			return
@@ -404,12 +480,29 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 
 	// ensure we kill the whole process group if the context is cancelled (e.g., timeout).
 	safego.Go(func() {
-		<-ctx.Done()
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // best-effort
+		select {
+		case <-done:
+			// The command exited on its own (the cancel() above also fires
+			// ctx). Leave the group alone, as the foreground path does: its
+			// children keep running, and an empty group's pgid may be reused.
+			return
+		case <-ctx.Done():
+			// Re-check done: mp.Wait() may have returned concurrently.
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // best-effort
+			}
 		}
 	})
 
 	request.Hooks.OnExecuteComplete(time.Since(startAt))
 	return nil
+}
+
+func newShellCommand(ctx context.Context, code string) *exec.Cmd {
+	return exec.CommandContext(ctx, getShell(), "-c", code)
 }

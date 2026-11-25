@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -80,7 +80,8 @@ class ExecutionEventDispatcher:
             timestamp=timestamp,
             is_error=False,
         )
-        self.execution.logs.add_stdout(message)
+        if not (self.handlers and self.handlers.skip_accumulation):
+            self.execution.logs.add_stdout(message)
         if self.handlers and self.handlers.on_stdout:
             await self.handlers.on_stdout(message)
 
@@ -91,7 +92,8 @@ class ExecutionEventDispatcher:
             timestamp=timestamp,
             is_error=True,
         )
-        self.execution.logs.add_stderr(message)
+        if not (self.handlers and self.handlers.skip_accumulation):
+            self.execution.logs.add_stderr(message)
         if self.handlers and self.handlers.on_stderr:
             await self.handlers.on_stderr(message)
 
@@ -115,6 +117,7 @@ class ExecutionEventDispatcher:
             value=error_data.value or "",
             timestamp=timestamp,
             traceback=error_data.traceback,
+            exit_code=error_data.exit_code,
         )
         self.execution.error = error
         if self.handlers and self.handlers.on_error:

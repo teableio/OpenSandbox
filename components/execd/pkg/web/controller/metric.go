@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,18 +18,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"runtime"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/mem"
 
 	"github.com/alibaba/opensandbox/execd/pkg/log"
+	"github.com/alibaba/opensandbox/execd/pkg/resources"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// MetricController handles system metrics requests
 type MetricController struct {
 	*basicController
 }
@@ -38,7 +35,6 @@ func NewMetricController(ctx *gin.Context) *MetricController {
 	return &MetricController{basicController: newBasicController(ctx)}
 }
 
-// GetMetrics returns current system metrics
 func (c *MetricController) GetMetrics() {
 	metrics, err := c.readMetrics()
 	if err != nil {
@@ -53,15 +49,25 @@ func (c *MetricController) GetMetrics() {
 	c.RespondSuccess(metrics)
 }
 
-// WatchMetrics streams system metrics via SSE
 func (c *MetricController) WatchMetrics() {
 	c.setupSSEResponse()
 
+	// readMetrics samples CPU usage over a second, so an update is due one
+	// second after the previous one started, not one second after it ended;
+	// the wait only matters when a read returned early, such as a failure
+	// before the sample.
+	next := time.Now()
 	for {
 		select {
 		case <-c.ctx.Request.Context().Done():
 			return
-		case <-time.After(time.Second * 1):
+		case <-time.After(time.Until(next)):
+			// The timer is usually due already, so it can win the select
+			// against a disconnect; check for one before sampling again.
+			if c.ctx.Request.Context().Err() != nil {
+				return
+			}
+			next = time.Now().Add(time.Second)
 			func() {
 				if flusher, ok := c.ctx.Writer.(http.Flusher); ok {
 					defer flusher.Flush()
@@ -73,13 +79,13 @@ func (c *MetricController) WatchMetrics() {
 					})
 					_, err = c.ctx.Writer.Write(append(msg, '\n'))
 					if err != nil {
-						log.Error("WatchMetrics write data %s error: %v", string(msg), err)
+						log.Error("metrics: write %s: %v", string(msg), err)
 					}
 				} else {
 					msg, _ := json.Marshal(metrics) //nolint:errchkjson
 					_, err = c.ctx.Writer.Write(append(msg, '\n'))
 					if err != nil {
-						log.Error("WatchMetrics write data %s error: %v", string(msg), err)
+						log.Error("metrics: write %s: %v", string(msg), err)
 					}
 				}
 			}()
@@ -87,25 +93,22 @@ func (c *MetricController) WatchMetrics() {
 	}
 }
 
-// readMetrics collects current CPU and memory metrics
 func (c *MetricController) readMetrics() (*model.Metrics, error) {
 	metric := model.NewMetrics()
 
-	metric.CpuCount = float64(runtime.GOMAXPROCS(-1))
-	cpuPercent, err := cpu.Percent(time.Second, false)
+	metric.CpuCount = resources.CPUCount()
+	cpuPercent, err := resources.CPUPercent(time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get CPU percent: %w", err)
 	}
-	if len(cpuPercent) > 0 {
-		metric.CpuUsedPct = cpuPercent[0]
-	}
+	metric.CpuUsedPct = cpuPercent
 
-	vmStat, err := mem.VirtualMemory()
+	memStats, err := resources.MemoryStats()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get memory info: %w", err)
 	}
-	metric.MemTotalMiB = float64(vmStat.Total) / 1024 / 1024
-	metric.MemUsedMiB = float64(vmStat.Used) / 1024 / 1024
+	metric.MemTotalMiB = float64(memStats.TotalBytes) / 1024 / 1024
+	metric.MemUsedMiB = float64(memStats.UsedBytes) / 1024 / 1024
 
 	return metric, nil
 }

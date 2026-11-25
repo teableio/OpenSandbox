@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package manager
 import (
 	"context"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,16 +31,32 @@ import (
 	api "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/task-executor"
 )
 
+func postStopFinished(task *types.Task) bool {
+	if task == nil {
+		return false
+	}
+	return statusHasPostStopFinished(task.Status)
+}
+
 type fakeExecutor struct {
+	mu      sync.Mutex
 	inspect map[string]*types.Status
 	starts  int
+	stops   int
+	stopErr error
+	stopCh  chan string
 }
 
 func newFakeExecutor() *fakeExecutor {
-	return &fakeExecutor{inspect: make(map[string]*types.Status)}
+	return &fakeExecutor{
+		inspect: make(map[string]*types.Status),
+		stopCh:  make(chan string, 10),
+	}
 }
 
 func (f *fakeExecutor) Start(_ context.Context, task *types.Task) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.starts++
 	f.inspect[task.Name] = &types.Status{
 		State: types.TaskStateRunning,
@@ -51,6 +68,8 @@ func (f *fakeExecutor) Start(_ context.Context, task *types.Task) error {
 }
 
 func (f *fakeExecutor) Inspect(_ context.Context, task *types.Task) (*types.Status, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if status, ok := f.inspect[task.Name]; ok {
 		return status, nil
 	}
@@ -63,8 +82,44 @@ func (f *fakeExecutor) Inspect(_ context.Context, task *types.Task) (*types.Stat
 	}, nil
 }
 
-func (f *fakeExecutor) Stop(_ context.Context, _ *types.Task) error {
-	return nil
+func (f *fakeExecutor) Stop(_ context.Context, task *types.Task) error {
+	f.mu.Lock()
+	f.stops++
+	f.mu.Unlock()
+	if task != nil {
+		f.stopCh <- task.Name
+	}
+	return f.stopErr
+}
+
+func (f *fakeExecutor) StartCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.starts
+}
+
+func (f *fakeExecutor) StopCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stops
+}
+
+func activeTaskCount(m *taskManager) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.countActiveTasks()
+}
+
+func taskStatusSnapshot(m *taskManager, name string) (types.Status, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	task, ok := m.tasks[name]
+	if !ok {
+		return types.Status{}, false
+	}
+	status := task.Status
+	status.SubStatuses = append([]types.SubStatus(nil), task.Status.SubStatuses...)
+	return status, true
 }
 
 func setupTestManager(t *testing.T) (TaskManager, *config.Config) {
@@ -104,6 +159,14 @@ func cleanupTask(t *testing.T, mgr TaskManager, name string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Logf("Task %s not deleted within timeout during cleanup", name)
+}
+
+// skipIfBinaryMissing skips the test when the given command is not available
+// on the host (e.g. running on a non-Linux/Unix system without sh).
+func skipIfBinaryMissing(t *testing.T, cmd string) {
+	if _, err := exec.LookPath(cmd); err != nil {
+		t.Skipf("%s not found, skipping task manager test", cmd)
+	}
 }
 
 func TestNewTaskManager(t *testing.T) {
@@ -241,14 +304,12 @@ func TestTaskManager_CreateDuplicate(t *testing.T) {
 		},
 	}
 
-	// First create should succeed
 	_, err := mgr.Create(ctx, task)
 	if err != nil {
 		t.Fatalf("First Create() failed: %v", err)
 	}
 	defer cleanupTask(t, mgr, task.Name)
 
-	// Second create should fail
 	_, err = mgr.Create(ctx, task)
 	if err == nil {
 		t.Error("Create() should fail for duplicate task")
@@ -269,7 +330,6 @@ func TestTaskManager_CreateMaxConcurrentTasks(t *testing.T) {
 		},
 	}
 
-	// Create first task
 	_, err := mgr.Create(ctx, task1)
 	if err != nil {
 		t.Fatalf("First Create() failed: %v", err)
@@ -305,14 +365,12 @@ func TestTaskManager_Get(t *testing.T) {
 		},
 	}
 
-	// Create task
 	_, err := mgr.Create(ctx, task)
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
 	}
 	defer cleanupTask(t, mgr, task.Name)
 
-	// Get task
 	got, err := mgr.Get(ctx, task.Name)
 	if err != nil {
 		t.Fatalf("Get() failed: %v", err)
@@ -347,7 +405,10 @@ func TestTaskManager_List(t *testing.T) {
 	mgr, _ := setupTestManager(t)
 	ctx := context.Background()
 
-	// Initially empty
+	// Start the manager so task deletion is finalized before t.TempDir cleanup.
+	mgr.Start(ctx)
+	defer mgr.Stop()
+
 	tasks, err := mgr.List(ctx)
 	if err != nil {
 		t.Fatalf("List() failed: %v", err)
@@ -356,7 +417,6 @@ func TestTaskManager_List(t *testing.T) {
 		t.Errorf("List() initial count = %d, want 0", len(tasks))
 	}
 
-	// Create a task
 	task := &types.Task{
 		Name: "list-task",
 		Process: &api.Process{
@@ -368,9 +428,8 @@ func TestTaskManager_List(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
 	}
-	defer mgr.Delete(ctx, task.Name)
+	defer cleanupTask(t, mgr, task.Name)
 
-	// List should return 1 task
 	tasks, err = mgr.List(ctx)
 	if err != nil {
 		t.Fatalf("List() failed: %v", err)
@@ -385,7 +444,6 @@ func TestTaskManager_List(t *testing.T) {
 
 func TestTaskManager_Delete(t *testing.T) {
 	mgr, _ := setupTestManager(t)
-	// Start the manager to enable the reconcile loop
 	mgr.Start(context.Background())
 	defer mgr.Stop()
 
@@ -398,7 +456,6 @@ func TestTaskManager_Delete(t *testing.T) {
 		},
 	}
 
-	// Create task
 	_, err := mgr.Create(ctx, task)
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
@@ -410,7 +467,6 @@ func TestTaskManager_Delete(t *testing.T) {
 		t.Errorf("Delete() failed: %v", err)
 	}
 
-	// Verify task is marked for deletion but still exists
 	got, err := mgr.Get(ctx, task.Name)
 	if err != nil {
 		t.Fatalf("Get() should succeed after Delete() (soft delete): %v", err)
@@ -419,13 +475,11 @@ func TestTaskManager_Delete(t *testing.T) {
 		t.Error("DeletionTimestamp should be set after Delete()")
 	}
 
-	// Wait for task to be finalized
 	timeout := 5 * time.Second
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		_, err := mgr.Get(ctx, task.Name)
 		if err != nil {
-			// Task is gone, success
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -446,41 +500,37 @@ func TestTaskManager_DeleteNonExistent(t *testing.T) {
 
 func TestTaskManager_SyncRestartsRecoveredActiveTaskWhenRuntimeStateIsLost(t *testing.T) {
 	ctx := context.Background()
-	cfg := &config.Config{
-		DataDir:           t.TempDir(),
-		EnableSidecarMode: false,
-		ReconcileInterval: time.Hour,
-	}
+	cfg := &config.Config{DataDir: t.TempDir(), ReconcileInterval: time.Hour}
 	taskStore, err := store.NewFileStore(cfg.DataDir)
 	require.NoError(t, err)
-
-	persisted := &types.Task{
+	desired := &types.Task{
 		Name: "resume-task",
 		Process: &api.Process{
 			Command: []string{"sleep", "3600"},
-		},
-		Status: types.Status{
-			State: types.TaskStateRunning,
+			Lifecycle: &api.ProcessLifecycle{PostStop: &api.LifecycleHandler{
+				Exec: &api.ExecAction{Command: []string{"true"}},
+			}},
 		},
 	}
-	require.NoError(t, taskStore.Create(ctx, persisted))
-
 	exec := newFakeExecutor()
-	mgrIface, err := NewTaskManager(cfg, taskStore, exec)
+	mgr, err := NewTaskManager(cfg, taskStore, exec)
 	require.NoError(t, err)
+	mgr.Start(ctx)
+	_, err = mgr.Create(ctx, desired)
+	require.NoError(t, err)
+	mgr.Stop()
+	assert.Zero(t, exec.StopCount(), "executor shutdown must not finish a still-desired task")
 
-	mgr := mgrIface.(*taskManager)
-	require.NoError(t, mgr.recoverTasks(ctx))
-
-	tasks, err := mgr.Sync(ctx, []*types.Task{{
-		Name: "resume-task",
-		Process: &api.Process{
-			Command: []string{"sleep", "3600"},
-		},
-	}})
+	// A restarted executor sees the lost process but retains the same file store.
+	exec = newFakeExecutor()
+	mgr, err = NewTaskManager(cfg, taskStore, exec)
+	require.NoError(t, err)
+	mgr.Start(ctx)
+	defer mgr.Stop()
+	tasks, err := mgr.Sync(ctx, []*types.Task{desired})
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
-	assert.Equal(t, 1, exec.starts, "sync should recreate an active task whose recovered runtime state was lost")
+	assert.Equal(t, 1, exec.StartCount(), "sync should recreate an active task whose recovered runtime state was lost")
 	assert.Equal(t, types.TaskStateRunning, tasks[0].Status.State)
 }
 
@@ -526,19 +576,589 @@ func TestTaskManager_SyncKeepsRecoveredSucceededTask(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
-	assert.Equal(t, 0, exec.starts, "sync should not recreate tasks that were already completed before recovery")
+	assert.Equal(t, 0, exec.StartCount(), "sync should not recreate tasks that were already completed before recovery")
 	assert.Equal(t, types.TaskStateSucceeded, tasks[0].Status.State)
+}
+
+func TestTaskManager_RecoverPreservesPersistedFailedStartStatus(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{
+		DataDir:           t.TempDir(),
+		EnableSidecarMode: false,
+		ReconcileInterval: time.Hour,
+	}
+	taskStore, err := store.NewFileStore(cfg.DataDir)
+	require.NoError(t, err)
+
+	finishedAt := time.Now()
+	persisted := &types.Task{
+		Name: "prestart-failed-task",
+		Process: &api.Process{
+			Command: []string{"echo", "should-not-run"},
+		},
+		Status: types.Status{
+			State: types.TaskStateFailed,
+			SubStatuses: []types.SubStatus{{
+				Reason:     types.ReasonPreStartHookFailed,
+				Message:    "preStart hook failed",
+				ExitCode:   1,
+				FinishedAt: &finishedAt,
+			}},
+		},
+	}
+	require.NoError(t, taskStore.Create(ctx, persisted))
+
+	exec := newFakeExecutor()
+	exec.inspect[persisted.Name] = &types.Status{
+		State: types.TaskStatePending,
+		SubStatuses: []types.SubStatus{{
+			Reason: "Pending",
+		}},
+	}
+	mgrIface, err := NewTaskManager(cfg, taskStore, exec)
+	require.NoError(t, err)
+
+	mgr := mgrIface.(*taskManager)
+	require.NoError(t, mgr.recoverTasks(ctx))
+
+	got, err := mgr.Get(ctx, persisted.Name)
+	require.NoError(t, err)
+	assert.Equal(t, types.TaskStateFailed, got.Status.State)
+	require.NotEmpty(t, got.Status.SubStatuses)
+	assert.Equal(t, types.ReasonPreStartHookFailed, got.Status.SubStatuses[0].Reason)
+}
+
+func TestTaskManager_DeleteTerminalTaskRunsPostStopBeforeFinalizing(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{
+		DataDir:           t.TempDir(),
+		EnableSidecarMode: false,
+		ReconcileInterval: time.Hour,
+	}
+	taskStore, err := store.NewFileStore(cfg.DataDir)
+	require.NoError(t, err)
+
+	now := time.Now()
+	persisted := &types.Task{
+		Name:              "terminal-with-poststop",
+		DeletionTimestamp: &now,
+		Process: &api.Process{
+			Command: []string{"echo", "done"},
+			Lifecycle: &api.ProcessLifecycle{
+				PostStop: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"true"},
+					},
+				},
+			},
+		},
+		Status: types.Status{
+			State: types.TaskStateSucceeded,
+			SubStatuses: []types.SubStatus{{
+				Reason:     "Completed",
+				ExitCode:   0,
+				FinishedAt: &now,
+			}},
+		},
+	}
+	require.NoError(t, taskStore.Create(ctx, persisted))
+
+	exec := newFakeExecutor()
+	exec.inspect[persisted.Name] = &types.Status{
+		State: types.TaskStateSucceeded,
+		SubStatuses: []types.SubStatus{{
+			Reason:     "Completed",
+			ExitCode:   0,
+			FinishedAt: &now,
+		}},
+	}
+	mgrIface, err := NewTaskManager(cfg, taskStore, exec)
+	require.NoError(t, err)
+
+	mgr := mgrIface.(*taskManager)
+	require.NoError(t, mgr.recoverTasks(ctx))
+
+	mgr.reconcileTasks(ctx)
+	select {
+	case name := <-exec.stopCh:
+		assert.Equal(t, persisted.Name, name)
+	case <-time.After(time.Second):
+		t.Fatal("expected postStop to run before terminal task deletion")
+	}
+
+	require.Eventually(t, func() bool {
+		mgr.reconcileTasks(ctx)
+		_, err = mgr.Get(ctx, persisted.Name)
+		return err != nil
+	}, time.Second, 10*time.Millisecond, "task should be finalized after postStop succeeds")
+	assert.Equal(t, 1, exec.StopCount(), "postStop should only run once")
+}
+
+func TestTaskManager_RetainedTerminalTaskRunsPostStopOnce(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{
+		DataDir:           t.TempDir(),
+		EnableSidecarMode: false,
+		ReconcileInterval: time.Hour,
+	}
+	taskStore, err := store.NewFileStore(cfg.DataDir)
+	require.NoError(t, err)
+
+	now := time.Now()
+	persisted := &types.Task{
+		Name: "retained-terminal-with-poststop",
+		Process: &api.Process{
+			Command: []string{"echo", "done"},
+			Lifecycle: &api.ProcessLifecycle{
+				PostStop: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"true"},
+					},
+				},
+			},
+		},
+		Status: types.Status{
+			State: types.TaskStateSucceeded,
+			SubStatuses: []types.SubStatus{{
+				Reason:     "Completed",
+				ExitCode:   0,
+				FinishedAt: &now,
+			}},
+		},
+	}
+	require.NoError(t, taskStore.Create(ctx, persisted))
+
+	exec := newFakeExecutor()
+	exec.inspect[persisted.Name] = &types.Status{
+		State: types.TaskStateSucceeded,
+		SubStatuses: []types.SubStatus{{
+			Reason:     "Completed",
+			ExitCode:   0,
+			FinishedAt: &now,
+		}},
+	}
+	mgrIface, err := NewTaskManager(cfg, taskStore, exec)
+	require.NoError(t, err)
+
+	mgr := mgrIface.(*taskManager)
+	require.NoError(t, mgr.recoverTasks(ctx))
+
+	mgr.reconcileTasks(ctx)
+	select {
+	case name := <-exec.stopCh:
+		assert.Equal(t, persisted.Name, name)
+	case <-time.After(time.Second):
+		t.Fatal("expected retained terminal task to run postStop")
+	}
+
+	require.Eventually(t, func() bool {
+		mgr.mu.RLock()
+		defer mgr.mu.RUnlock()
+		got, ok := mgr.tasks[persisted.Name]
+		return ok && postStopFinished(got) && !mgr.stopping[persisted.Name]
+	}, time.Second, 10*time.Millisecond, "postStop completion should be persisted before the next reconcile")
+
+	mgr.reconcileTasks(ctx)
+
+	got, err := mgr.Get(ctx, persisted.Name)
+	require.NoError(t, err, "retained terminal task should not be finalized")
+	assert.True(t, postStopFinished(got))
+	assert.Equal(t, 1, exec.StopCount(), "postStop should only run once")
+}
+
+func TestDecideTaskStop_TerminalTaskWithPostStop(t *testing.T) {
+	task := &types.Task{
+		Process: &api.Process{
+			Lifecycle: &api.ProcessLifecycle{
+				PostStop: &api.LifecycleHandler{
+					Exec: &api.ExecAction{Command: []string{"true"}},
+				},
+			},
+		},
+	}
+
+	for _, state := range []types.TaskState{
+		types.TaskStateSucceeded,
+		types.TaskStateFailed,
+		types.TaskStateNotFound,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			decision := decideTaskStop(task, observedTaskStatus{
+				status: types.Status{State: state},
+				state:  state,
+			}, false)
+
+			assert.True(t, decision.shouldStop)
+			assert.Equal(t, "terminal task completed", decision.reason)
+		})
+	}
+}
+
+func TestDeletingTaskWithFinishedPostStopWaitsForTerminalState(t *testing.T) {
+	now := time.Now()
+	task := &types.Task{
+		DeletionTimestamp: &now,
+		Process: &api.Process{
+			Lifecycle: &api.ProcessLifecycle{
+				PostStop: &api.LifecycleHandler{
+					Exec: &api.ExecAction{Command: []string{"true"}},
+				},
+			},
+		},
+	}
+	running := observedTaskStatus{
+		status: types.Status{
+			State: types.TaskStateRunning,
+			SubStatuses: []types.SubStatus{{
+				Reason: reasonPostStopHookCompleted,
+			}},
+		},
+		state: types.TaskStateRunning,
+	}
+
+	assert.False(t, decideTaskStop(task, running, false).shouldStop,
+		"a completed postStop hook must not be executed again while runtime status converges")
+	assert.False(t, shouldFinalizeTaskDeletion(task, running, false))
+
+	terminal := running
+	terminal.status.State = types.TaskStateFailed
+	terminal.state = types.TaskStateFailed
+	assert.False(t, decideTaskStop(task, terminal, false).shouldStop)
+	assert.True(t, shouldFinalizeTaskDeletion(task, terminal, false))
+}
+
+func TestTaskManager_RetainedFailedTaskPreservesFailureAfterPostStop(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{
+		DataDir:           t.TempDir(),
+		EnableSidecarMode: false,
+		ReconcileInterval: time.Hour,
+	}
+	taskStore, err := store.NewFileStore(cfg.DataDir)
+	require.NoError(t, err)
+
+	now := time.Now()
+	persisted := &types.Task{
+		Name: "retained-prestart-failed-with-poststop",
+		Process: &api.Process{
+			Command: []string{"echo", "should-not-run"},
+			Lifecycle: &api.ProcessLifecycle{
+				PostStop: &api.LifecycleHandler{
+					Exec: &api.ExecAction{Command: []string{"true"}},
+				},
+			},
+		},
+		Status: types.Status{
+			State: types.TaskStateFailed,
+			SubStatuses: []types.SubStatus{{
+				Reason:     types.ReasonPreStartHookFailed,
+				Message:    "preStart hook failed",
+				ExitCode:   1,
+				FinishedAt: &now,
+			}},
+		},
+	}
+	require.NoError(t, taskStore.Create(ctx, persisted))
+
+	exec := newFakeExecutor()
+	exec.inspect[persisted.Name] = &types.Status{
+		State: types.TaskStatePending,
+		SubStatuses: []types.SubStatus{{
+			Reason: "Pending",
+		}},
+	}
+	mgrIface, err := NewTaskManager(cfg, taskStore, exec)
+	require.NoError(t, err)
+	mgr := mgrIface.(*taskManager)
+	require.NoError(t, mgr.recoverTasks(ctx))
+
+	mgr.reconcileTasks(ctx)
+	select {
+	case name := <-exec.stopCh:
+		assert.Equal(t, persisted.Name, name)
+	case <-time.After(time.Second):
+		t.Fatal("expected failed retained task to run postStop")
+	}
+
+	require.Eventually(t, func() bool {
+		mgr.mu.RLock()
+		defer mgr.mu.RUnlock()
+		task, ok := mgr.tasks[persisted.Name]
+		return ok && statusHasPostStopFinished(task.Status) && !mgr.stopping[persisted.Name]
+	}, time.Second, 10*time.Millisecond)
+
+	status, ok := taskStatusSnapshot(mgr, persisted.Name)
+	require.True(t, ok)
+	assert.Equal(t, types.TaskStateFailed, status.State)
+	require.NotEmpty(t, status.SubStatuses)
+	assert.Equal(t, types.ReasonPreStartHookFailed, status.SubStatuses[0].Reason)
+}
+
+func TestTaskManager_StopFailureReplacesVisibleSubStatus(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{
+		DataDir:           t.TempDir(),
+		EnableSidecarMode: false,
+		ReconcileInterval: time.Hour,
+	}
+	taskStore, err := store.NewFileStore(cfg.DataDir)
+	require.NoError(t, err)
+
+	startedAt := time.Now().Add(-time.Minute)
+	persisted := &types.Task{
+		Name: "timeout-poststop-fails",
+		Process: &api.Process{
+			Command: []string{"sleep", "30"},
+			Lifecycle: &api.ProcessLifecycle{
+				PostStop: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"false"},
+					},
+				},
+			},
+		},
+		Status: types.Status{
+			State: types.TaskStateTimeout,
+			SubStatuses: []types.SubStatus{{
+				Reason:    "TaskTimeout",
+				Message:   "Task exceeded timeout",
+				StartedAt: &startedAt,
+			}},
+		},
+	}
+	require.NoError(t, taskStore.Create(ctx, persisted))
+
+	exec := newFakeExecutor()
+	exec.stopErr = &types.StopError{
+		Reason:  types.ReasonPostStopHookFailed,
+		Message: "postStop hook failed: copy failed",
+	}
+	exec.inspect[persisted.Name] = &persisted.Status
+	mgrIface, err := NewTaskManager(cfg, taskStore, exec)
+	require.NoError(t, err)
+
+	mgr := mgrIface.(*taskManager)
+	require.NoError(t, mgr.recoverTasks(ctx))
+
+	mgr.reconcileTasks(ctx)
+	select {
+	case <-exec.stopCh:
+	case <-time.After(time.Second):
+		t.Fatal("expected timeout task to be stopped")
+	}
+
+	require.Eventually(t, func() bool {
+		status, ok := taskStatusSnapshot(mgr, persisted.Name)
+		if !ok || status.State != types.TaskStateFailed || len(status.SubStatuses) == 0 {
+			return false
+		}
+		return status.SubStatuses[0].Reason == types.ReasonPostStopHookFailed
+	}, time.Second, 10*time.Millisecond)
+
+	status, ok := taskStatusSnapshot(mgr, persisted.Name)
+	require.True(t, ok)
+	require.NotEmpty(t, status.SubStatuses)
+	assert.Equal(t, 137, status.SubStatuses[0].ExitCode)
+}
+
+func TestTaskManager_RecoverPreservesPostStopCompletionMarker(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{
+		DataDir:           t.TempDir(),
+		EnableSidecarMode: false,
+		ReconcileInterval: time.Hour,
+	}
+	taskStore, err := store.NewFileStore(cfg.DataDir)
+	require.NoError(t, err)
+
+	now := time.Now()
+	persisted := &types.Task{
+		Name:              "poststop-completed-task",
+		DeletionTimestamp: &now,
+		Process: &api.Process{
+			Command: []string{"echo", "done"},
+			Lifecycle: &api.ProcessLifecycle{
+				PostStop: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"true"},
+					},
+				},
+			},
+		},
+		Status: types.Status{
+			State: types.TaskStateSucceeded,
+			SubStatuses: []types.SubStatus{
+				{
+					Reason:     "Completed",
+					ExitCode:   0,
+					FinishedAt: &now,
+				},
+				{
+					Reason:     reasonPostStopHookCompleted,
+					FinishedAt: &now,
+				},
+			},
+		},
+	}
+	require.NoError(t, taskStore.Create(ctx, persisted))
+
+	exec := newFakeExecutor()
+	exec.inspect[persisted.Name] = &types.Status{
+		State: types.TaskStateSucceeded,
+		SubStatuses: []types.SubStatus{{
+			Reason:     "Completed",
+			ExitCode:   0,
+			FinishedAt: &now,
+		}},
+	}
+	mgrIface, err := NewTaskManager(cfg, taskStore, exec)
+	require.NoError(t, err)
+
+	mgr := mgrIface.(*taskManager)
+	require.NoError(t, mgr.recoverTasks(ctx))
+
+	got, err := mgr.Get(ctx, persisted.Name)
+	require.NoError(t, err)
+	assert.True(t, postStopFinished(got), "recovery should preserve persisted postStop completion marker")
+
+	mgr.reconcileTasks(ctx)
+	_, err = mgr.Get(ctx, persisted.Name)
+	assert.Error(t, err, "task should be finalized without rerunning postStop")
+	assert.Equal(t, 0, exec.StopCount(), "postStop should not run again after recovery")
+}
+
+func TestTaskManager_RecoverMergesPostStopMarkerFromNonTerminalStatus(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{
+		DataDir:           t.TempDir(),
+		EnableSidecarMode: false,
+		ReconcileInterval: time.Hour,
+	}
+	taskStore, err := store.NewFileStore(cfg.DataDir)
+	require.NoError(t, err)
+
+	now := time.Now()
+	persisted := &types.Task{
+		Name:              "deleting-running-poststop-completed",
+		DeletionTimestamp: &now,
+		Process: &api.Process{
+			Command: []string{"sleep", "30"},
+			Lifecycle: &api.ProcessLifecycle{
+				PostStop: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"true"},
+					},
+				},
+			},
+		},
+		Status: types.Status{
+			State: types.TaskStateRunning,
+			SubStatuses: []types.SubStatus{
+				{
+					Reason: "Running",
+				},
+				{
+					Reason:     reasonPostStopHookCompleted,
+					FinishedAt: &now,
+				},
+			},
+		},
+	}
+	require.NoError(t, taskStore.Create(ctx, persisted))
+
+	exec := newFakeExecutor()
+	exec.inspect[persisted.Name] = &types.Status{
+		State: types.TaskStateSucceeded,
+		SubStatuses: []types.SubStatus{{
+			Reason:     "Completed",
+			ExitCode:   0,
+			FinishedAt: &now,
+		}},
+	}
+	mgrIface, err := NewTaskManager(cfg, taskStore, exec)
+	require.NoError(t, err)
+
+	mgr := mgrIface.(*taskManager)
+	require.NoError(t, mgr.recoverTasks(ctx))
+
+	got, err := mgr.Get(ctx, persisted.Name)
+	require.NoError(t, err)
+	assert.Equal(t, types.TaskStateSucceeded, got.Status.State)
+	assert.True(t, postStopFinished(got), "recovery should merge postStop marker onto recovered status")
+
+	mgr.reconcileTasks(ctx)
+
+	_, err = mgr.Get(ctx, persisted.Name)
+	assert.Error(t, err, "deleting terminal task should finalize without rerunning postStop")
+	assert.Equal(t, 0, exec.StopCount(), "postStop should not run again after recovery")
+}
+
+func TestTaskManager_ReconcilePreservesPostStopFailureStatus(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{
+		DataDir:           t.TempDir(),
+		EnableSidecarMode: false,
+		ReconcileInterval: time.Hour,
+	}
+	taskStore, err := store.NewFileStore(cfg.DataDir)
+	require.NoError(t, err)
+
+	now := time.Now()
+	persisted := &types.Task{
+		Name: "poststop-failed-visible",
+		Process: &api.Process{
+			Command: []string{"sleep", "30"},
+			Lifecycle: &api.ProcessLifecycle{
+				PostStop: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"false"},
+					},
+				},
+			},
+		},
+		Status: types.Status{
+			State: types.TaskStateFailed,
+			SubStatuses: []types.SubStatus{{
+				Reason:     types.ReasonPostStopHookFailed,
+				Message:    "postStop hook failed: copy failed",
+				ExitCode:   1,
+				FinishedAt: &now,
+			}},
+		},
+	}
+	require.NoError(t, taskStore.Create(ctx, persisted))
+
+	exec := newFakeExecutor()
+	exec.inspect[persisted.Name] = &types.Status{
+		State: types.TaskStateFailed,
+		SubStatuses: []types.SubStatus{{
+			Reason:     "ProcessCrashed",
+			Message:    "process exited",
+			ExitCode:   137,
+			FinishedAt: &now,
+		}},
+	}
+	mgrIface, err := NewTaskManager(cfg, taskStore, exec)
+	require.NoError(t, err)
+
+	mgr := mgrIface.(*taskManager)
+	require.NoError(t, mgr.recoverTasks(ctx))
+	mgr.reconcileTasks(ctx)
+
+	got, err := mgr.Get(ctx, persisted.Name)
+	require.NoError(t, err)
+	require.NotEmpty(t, got.Status.SubStatuses)
+	assert.Equal(t, types.ReasonPostStopHookFailed, got.Status.SubStatuses[0].Reason)
+	assert.Contains(t, got.Status.SubStatuses[0].Message, "copy failed")
 }
 
 func TestTaskManager_Sync(t *testing.T) {
 	mgr, _ := setupTestManager(t)
-	// Start the manager to enable the reconcile loop
 	mgr.Start(context.Background())
 	defer mgr.Stop()
 
 	ctx := context.Background()
 
-	// Create initial task
 	task1 := &types.Task{
 		Name: "sync-task-1",
 		Process: &api.Process{
@@ -566,7 +1186,6 @@ func TestTaskManager_Sync(t *testing.T) {
 	}
 	defer mgr.Delete(ctx, task2.Name)
 
-	// Verify task1 is marked for deletion in the returned list
 	var task1Found bool
 	for _, t1 := range current {
 		if t1.Name == task1.Name {
@@ -581,7 +1200,6 @@ func TestTaskManager_Sync(t *testing.T) {
 		t.Log("task1 not found in Sync result (maybe already deleted?)")
 	}
 
-	// Verify task2 is created
 	var task2Found bool
 	for _, t2 := range current {
 		if t2.Name == task2.Name {
@@ -598,7 +1216,6 @@ func TestTaskManager_Sync(t *testing.T) {
 	for time.Now().Before(deadline) {
 		_, err := mgr.Get(ctx, task1.Name)
 		if err != nil {
-			// Task is gone, success
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -632,17 +1249,14 @@ func TestTaskManager_AsyncStopOnDelete(t *testing.T) {
 		},
 	}
 
-	// Create task
 	created, err := mgr.Create(ctx, task)
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
 	}
 	defer cleanupTask(t, mgr, task.Name)
 
-	// Verify task is running
 	assert.Equal(t, types.TaskStateRunning, created.Status.State)
 
-	// Record the time before delete
 	beforeDelete := time.Now()
 
 	// Delete task (should trigger async stop)
@@ -651,7 +1265,6 @@ func TestTaskManager_AsyncStopOnDelete(t *testing.T) {
 		t.Fatalf("Delete() failed: %v", err)
 	}
 
-	// Verify DeletionTimestamp is set immediately (soft delete)
 	got, err := mgr.Get(ctx, task.Name)
 	if err != nil {
 		t.Fatalf("Get() after Delete failed: %v", err)
@@ -660,18 +1273,15 @@ func TestTaskManager_AsyncStopOnDelete(t *testing.T) {
 		t.Error("DeletionTimestamp should be set immediately after Delete()")
 	}
 
-	// Verify Delete returned quickly (not blocked by Stop)
 	deleteDuration := time.Since(beforeDelete)
 	if deleteDuration > 500*time.Millisecond {
 		t.Errorf("Delete() took too long (%v), should be fast (async stop)", deleteDuration)
 	}
 
-	// Wait for task to be finalized
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		_, err := mgr.Get(ctx, task.Name)
 		if err != nil {
-			// Task is gone, success
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -680,9 +1290,7 @@ func TestTaskManager_AsyncStopOnDelete(t *testing.T) {
 }
 
 func TestTaskManager_TimeoutHandling(t *testing.T) {
-	if _, err := exec.LookPath("sh"); err != nil {
-		t.Skip("sh not found, skipping timeout test")
-	}
+	skipIfBinaryMissing(t, "sh")
 
 	mgr, _ := setupTestManager(t)
 	mgr.Start(context.Background())
@@ -690,7 +1298,6 @@ func TestTaskManager_TimeoutHandling(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create task with short timeout
 	timeoutSec := int64(2)
 	task := &types.Task{
 		Name: "timeout-task",
@@ -709,18 +1316,15 @@ func TestTaskManager_TimeoutHandling(t *testing.T) {
 	// Wait for timeout to be detected and async stop triggered
 	time.Sleep(3 * time.Second)
 
-	// Check task status - should be Timeout or Failed (after stop)
 	got, err := mgr.Get(ctx, task.Name)
 	if err != nil {
 		t.Fatalf("Get() failed: %v", err)
 	}
 
-	// State should be Timeout (during stop) or Failed (after stop completes)
 	if got.Status.State != types.TaskStateTimeout && got.Status.State != types.TaskStateFailed {
 		t.Errorf("Expected Timeout or Failed state, got: %s", got.Status.State)
 	}
 
-	// If in Timeout state, verify reason
 	if got.Status.State == types.TaskStateTimeout {
 		assert.NotEmpty(t, got.Status.SubStatuses)
 		assert.Equal(t, "TaskTimeout", got.Status.SubStatuses[0].Reason)
@@ -748,13 +1352,11 @@ func TestTaskManager_CountActiveTasks(t *testing.T) {
 	defer mgr.Stop()
 	ctx := context.Background()
 
-	// Initially empty
-	activeCount := mgr.(*taskManager).countActiveTasks()
+	activeCount := activeTaskCount(mgr.(*taskManager))
 	if activeCount != 0 {
 		t.Errorf("Initial active count = %d, want 0", activeCount)
 	}
 
-	// Create a short-lived task that will complete quickly
 	task1 := &types.Task{
 		Name: "quick-task-1",
 		Process: &api.Process{
@@ -767,16 +1369,11 @@ func TestTaskManager_CountActiveTasks(t *testing.T) {
 	}
 	defer mgr.Delete(ctx, task1.Name)
 
-	// Wait for task1 to complete
-	time.Sleep(500 * time.Millisecond)
+	// Reconciliation observes process exit asynchronously; fixed sleeps race under CI load.
+	require.Eventually(t, func() bool {
+		return activeTaskCount(mgr.(*taskManager)) == 0
+	}, 5*time.Second, 10*time.Millisecond, "task1 should become inactive once it completes")
 
-	// Should have 0 active tasks after task1 completes
-	activeCount = mgr.(*taskManager).countActiveTasks()
-	if activeCount != 0 {
-		t.Errorf("Active count after task1 completion = %d, want 0", activeCount)
-	}
-
-	// Create a running task
 	task2 := &types.Task{
 		Name: "active-task-2",
 		Process: &api.Process{
@@ -789,8 +1386,7 @@ func TestTaskManager_CountActiveTasks(t *testing.T) {
 	}
 	defer mgr.Delete(ctx, task2.Name)
 
-	// Should have 1 active task
-	activeCount = mgr.(*taskManager).countActiveTasks()
+	activeCount = activeTaskCount(mgr.(*taskManager))
 	if activeCount != 1 {
 		t.Errorf("Active count after create = %d, want 1", activeCount)
 	}

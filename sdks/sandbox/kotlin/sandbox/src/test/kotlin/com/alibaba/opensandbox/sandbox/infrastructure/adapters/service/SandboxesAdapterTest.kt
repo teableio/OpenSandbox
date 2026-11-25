@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,15 +18,24 @@ package com.alibaba.opensandbox.sandbox.infrastructure.adapters.service
 
 import com.alibaba.opensandbox.sandbox.HttpClientProvider
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
+import com.alibaba.opensandbox.sandbox.domain.exceptions.InvalidArgumentException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.ActivityProbe
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialProxyConfig
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.IdlePolicy
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.LifecycleHook
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.OSSFS
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.OnIdleAction
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PeriodicLifecycleHook
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PlatformSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxFilter
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxImageSpec
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxLifecycle
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxState
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotFilter
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotMode
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -74,7 +83,6 @@ class SandboxesAdapterTest {
 
     @Test
     fun `createSandbox should send correct request and parse response`() {
-        // Mock response
         val responseBody =
             """
             {
@@ -88,7 +96,6 @@ class SandboxesAdapterTest {
             """.trimIndent()
         mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(201))
 
-        // Execute
         val spec = SandboxImageSpec.builder().image("ubuntu:latest").build()
         val extensions = mapOf("storage.id" to "abc123", "debug" to "true")
         val networkPolicy =
@@ -119,9 +126,25 @@ class SandboxesAdapterTest {
                 volumes = null,
                 secureAccess = true,
                 snapshotId = null,
+                credentialProxy = CredentialProxyConfig.enabled(),
+                lifecycle =
+                    SandboxLifecycle.builder()
+                        .preStart(
+                            LifecycleHook.builder()
+                                .command("/opt/hooks/restore.sh")
+                                .timeoutSeconds(30)
+                                .build(),
+                        )
+                        .periodic(
+                            PeriodicLifecycleHook.builder()
+                                .name("checkpoint")
+                                .schedule("*/5 * * * *")
+                                .command("/opt/hooks/checkpoint.sh")
+                                .build(),
+                        )
+                        .build(),
             )
 
-        // Verify request
         val request = mockWebServer.takeRequest()
         assertEquals("POST", request.method)
         assertEquals("/v1/sandboxes", request.path)
@@ -138,6 +161,15 @@ class SandboxesAdapterTest {
         val gotDefaultAction = gotNetworkPolicy!!["defaultAction"]
         assertNotNull(gotDefaultAction, "defaultAction should be present in networkPolicy")
         assertEquals("deny", gotDefaultAction!!.jsonPrimitive.content)
+        val gotLifecycle = payload["lifecycle"]!!.jsonObject
+        assertEquals(
+            "/opt/hooks/restore.sh",
+            gotLifecycle["preStart"]!!.jsonObject["command"]!!.jsonArray[0].jsonPrimitive.content,
+        )
+        assertEquals(
+            "checkpoint",
+            gotLifecycle["periodic"]!!.jsonArray[0].jsonObject["name"]!!.jsonPrimitive.content,
+        )
         val egressArray = gotNetworkPolicy["egress"]!!.jsonArray
         assertEquals(1, egressArray.size)
         val rule = egressArray[0].jsonObject
@@ -147,11 +179,65 @@ class SandboxesAdapterTest {
         assertNotNull(gotPlatform, "platform should be present in createSandbox request")
         assertEquals("linux", gotPlatform!!["os"]!!.jsonPrimitive.content)
         assertEquals("arm64", gotPlatform["arch"]!!.jsonPrimitive.content)
+        val gotCredentialProxy = payload["credentialProxy"]?.jsonObject
+        assertNotNull(gotCredentialProxy, "credentialProxy should be present in createSandbox request")
+        assertEquals("true", gotCredentialProxy!!["enabled"]!!.jsonPrimitive.content)
         assertEquals("true", payload["secureAccess"]!!.jsonPrimitive.content)
 
-        // Verify response
         assertEquals("550e8400-e29b-41d4-a716-446655440000", result.id)
         assertEquals("amd64", result.platform?.arch)
+    }
+
+    @Test
+    fun `createSandbox should send an empty egress array when the policy carries no rules`() {
+        // A policy with no rules is the natural shape when the platform enforces the
+        // real rules itself and the caller only needs the sidecar injected. Serializing
+        // the empty list as null made the server reject the request with 422.
+        val responseBody =
+            """
+            {
+                "id": "no-rule-policy-sandbox",
+                "status": { "state": "Running" },
+                "platform": { "os": "linux", "arch": "amd64" },
+                "expiresAt": "2023-01-01T11:00:00Z",
+                "createdAt": "2023-01-01T10:00:00Z",
+                "entrypoint": ["bash"]
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(201))
+
+        val networkPolicy =
+            NetworkPolicy.builder()
+                .defaultAction(NetworkPolicy.DefaultAction.ALLOW)
+                .build()
+        assertEquals(emptyList<NetworkRule>(), networkPolicy.egress)
+
+        sandboxesAdapter.createSandbox(
+            spec = SandboxImageSpec.builder().image("ubuntu:latest").build(),
+            entrypoint = listOf("bash"),
+            env = emptyMap(),
+            metadata = emptyMap(),
+            timeout = Duration.ofSeconds(600),
+            resource = emptyMap(),
+            platform = null,
+            networkPolicy = networkPolicy,
+            extensions = emptyMap(),
+            volumes = null,
+            secureAccess = false,
+            credentialProxy = null,
+        )
+
+        val request = mockWebServer.takeRequest()
+        val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        val gotNetworkPolicy = payload["networkPolicy"]!!.jsonObject
+        assertEquals("allow", gotNetworkPolicy["defaultAction"]!!.jsonPrimitive.content)
+
+        val gotEgress = gotNetworkPolicy["egress"]!!
+        assertTrue(
+            gotEgress !is JsonNull,
+            "egress must not serialize to null: the server declares it a plain list and rejects null with 422",
+        )
+        assertEquals(0, gotEgress.jsonArray.size)
     }
 
     @Test
@@ -187,6 +273,7 @@ class SandboxesAdapterTest {
                 extensions = emptyMap(),
                 volumes = null,
                 secureAccess = false,
+                credentialProxy = null,
             )
 
         val request = mockWebServer.takeRequest()
@@ -227,6 +314,7 @@ class SandboxesAdapterTest {
                 volumes = null,
                 secureAccess = false,
                 snapshotId = null,
+                credentialProxy = null,
             )
 
         assertEquals("manual-sbx", result.id)
@@ -262,6 +350,7 @@ class SandboxesAdapterTest {
             volumes = null,
             secureAccess = false,
             snapshotId = "snap-123",
+            credentialProxy = null,
         )
 
         val request = mockWebServer.takeRequest()
@@ -301,6 +390,7 @@ class SandboxesAdapterTest {
             volumes = null,
             secureAccess = false,
             snapshotId = "snap-123",
+            credentialProxy = null,
         )
 
         val request = mockWebServer.takeRequest()
@@ -343,6 +433,86 @@ class SandboxesAdapterTest {
         assertEquals("/v1/sandboxes/$sandboxId/snapshots", request.path)
         val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
         assertEquals("baseline", payload["name"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `createSnapshot should send the requested rootfsOnly mode and map it back`() {
+        val sandboxId = "sandbox-123"
+        val responseBody =
+            """
+            {
+                "id": "snap-123",
+                "sandboxId": "$sandboxId",
+                "name": "workspace-state",
+                "mode": "rootfsOnly",
+                "status": {
+                    "state": "Ready",
+                    "reason": "snapshot_ready",
+                    "message": null,
+                    "lastTransitionAt": "2023-01-01T10:00:00Z"
+                },
+                "createdAt": "2023-01-01T10:00:00Z"
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(201))
+
+        val result = sandboxesAdapter.createSnapshot(sandboxId, "workspace-state", SnapshotMode.ROOTFS_ONLY)
+
+        assertEquals(SnapshotMode.ROOTFS_ONLY, result.mode)
+
+        val request = mockWebServer.takeRequest()
+        val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals("workspace-state", payload["name"]!!.jsonPrimitive.content)
+        assertEquals("rootfsOnly", payload["mode"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `createSnapshot should keep an unset mode off the generated default and read legacy responses as full`() {
+        val sandboxId = "sandbox-123"
+        // The response body predates the mode field: it must read back as full.
+        val responseBody =
+            """
+            {
+                "id": "snap-123",
+                "sandboxId": "$sandboxId",
+                "name": "baseline",
+                "status": {
+                    "state": "Ready",
+                    "reason": "snapshot_ready",
+                    "message": null,
+                    "lastTransitionAt": "2023-01-01T10:00:00Z"
+                },
+                "createdAt": "2023-01-01T10:00:00Z"
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(201))
+
+        val result = sandboxesAdapter.createSnapshot(sandboxId, "baseline")
+
+        assertEquals(SnapshotMode.FULL, result.mode)
+
+        val request = mockWebServer.takeRequest()
+        val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals("baseline", payload["name"]!!.jsonPrimitive.content)
+        // The generated serializer (encodeDefaults = true, explicitNulls = true)
+        // cannot omit the field entirely, so an unset mode serializes as an
+        // explicit null. Every server tolerates that: Optional[Literal] on the
+        // current server, pydantic's default extra=ignore on servers predating
+        // the field. What must never reach the wire is the generated `full`
+        // default, which would mislabel servers that forbid unknown fields.
+        val mode = payload["mode"]
+        assertTrue(
+            mode is JsonNull,
+            "unset mode must serialize as an explicit null, got: $payload",
+        )
+    }
+
+    @Test
+    fun `createSnapshot should reject an unknown mode before any request is sent`() {
+        assertThrows(InvalidArgumentException::class.java) {
+            sandboxesAdapter.createSnapshot("sandbox-123", "baseline", "diskOnly")
+        }
+        assertEquals(0, mockWebServer.requestCount)
     }
 
     @Test
@@ -408,6 +578,7 @@ class SandboxesAdapterTest {
         val filter =
             SnapshotFilter.builder()
                 .sandboxId("sandbox-123")
+                .name("toolchain:kotlin@rev-1")
                 .states("ready", "pending")
                 .page(1)
                 .pageSize(20)
@@ -423,6 +594,7 @@ class SandboxesAdapterTest {
         val url = request.requestUrl
         assertNotNull(url)
         assertEquals("sandbox-123", url!!.queryParameter("sandboxId"))
+        assertEquals("toolchain:kotlin@rev-1", url.queryParameter("name"))
         assertEquals(listOf("ready", "pending"), url.queryParameterValues("state"))
         assertEquals("1", url.queryParameter("page"))
         assertEquals("20", url.queryParameter("pageSize"))
@@ -509,6 +681,7 @@ class SandboxesAdapterTest {
             volumes = volumes,
             secureAccess = false,
             snapshotId = null,
+            credentialProxy = null,
         )
 
         val request = mockWebServer.takeRequest()
@@ -543,7 +716,15 @@ class SandboxesAdapterTest {
                 "image": {
                     "uri": "ubuntu:latest"
                 },
-                "metadata": {}
+                "allocation": {
+                    "mode": "pool",
+                    "poolRef": "default/python",
+                    "state": "allocated"
+                },
+                "metadata": {},
+                "extensions": {
+                    "opensandbox.extensions.custom-label": "中文数据"
+                }
             }
             """.trimIndent()
 
@@ -554,6 +735,10 @@ class SandboxesAdapterTest {
         assertEquals(sandboxId, result.id)
         assertEquals(SandboxState.RUNNING, result.status.state)
         assertEquals("ubuntu:latest", result.image!!.image)
+        assertEquals("pool", result.allocation!!.mode)
+        assertEquals("default/python", result.allocation!!.poolRef)
+        assertEquals("allocated", result.allocation!!.state)
+        assertEquals("中文数据", result.extensions!!["opensandbox.extensions.custom-label"])
 
         val request = mockWebServer.takeRequest()
         assertEquals("/v1/sandboxes/$sandboxId", request.path)
@@ -588,6 +773,7 @@ class SandboxesAdapterTest {
 
         assertEquals(sandboxId, result.id)
         assertEquals(null, result.expiresAt)
+        assertEquals(null, result.allocation)
     }
 
     @Test
@@ -631,12 +817,24 @@ class SandboxesAdapterTest {
         val responseBody =
             """
             {
-                "items": [],
+                "items": [
+                    {
+                        "id": "pooled-sandbox",
+                        "status": { "state": "Running" },
+                        "entrypoint": ["/bin/bash"],
+                        "createdAt": "2023-01-01T10:00:00Z",
+                        "allocation": {
+                            "mode": "pool",
+                            "poolRef": "default/python",
+                            "state": "allocated"
+                        }
+                    }
+                ],
                 "pagination": {
                     "page": 0,
                     "pageSize": 10,
-                    "totalItems": 0,
-                    "totalPages": 0,
+                    "totalItems": 1,
+                    "totalPages": 1,
                     "hasNextPage": false
                 }
             }
@@ -652,7 +850,9 @@ class SandboxesAdapterTest {
                 .pageSize(20)
                 .build()
 
-        sandboxesAdapter.listSandboxes(filter)
+        val result = sandboxesAdapter.listSandboxes(filter)
+
+        assertEquals("default/python", result.sandboxInfos.single().allocation!!.poolRef)
 
         val request = mockWebServer.takeRequest()
         val url = request.requestUrl
@@ -662,5 +862,97 @@ class SandboxesAdapterTest {
         assertEquals("key=value", url.queryParameter("metadata"))
         assertEquals("1", url.queryParameter("page"))
         assertEquals("20", url.queryParameter("pageSize"))
+    }
+
+    @Test
+    fun `createSandbox forwards lifecycle idle policy on the wire`() {
+        val responseBody =
+            """
+            {
+                "id": "550e8400-e29b-41d4-a716-446655440000",
+                "status": { "state": "Running" },
+                "createdAt": "2023-01-01T10:00:00Z",
+                "entrypoint": ["bash"]
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(201))
+
+        sandboxesAdapter.createSandbox(
+            spec = SandboxImageSpec.builder().image("ubuntu:latest").build(),
+            entrypoint = listOf("bash"),
+            env = emptyMap(),
+            metadata = emptyMap(),
+            timeout = Duration.ofSeconds(600),
+            resource = mapOf("cpu" to "1"),
+            platform = null,
+            networkPolicy = null,
+            extensions = emptyMap(),
+            volumes = null,
+            secureAccess = false,
+            snapshotId = null,
+            credentialProxy = null,
+            lifecycle =
+                SandboxLifecycle.builder()
+                    .idlePolicy(
+                        IdlePolicy.builder()
+                            .idleTimeoutSeconds(300)
+                            .onIdle(OnIdleAction.PAUSE)
+                            .wakeOnAccess(true)
+                            .activeProbe(
+                                ActivityProbe.builder().port(8080).path("/active").build(),
+                            )
+                            .build(),
+                    )
+                    .build(),
+        )
+
+        val requestBody = mockWebServer.takeRequest().body.readUtf8()
+        val lifecycle = Json.parseToJsonElement(requestBody).jsonObject["lifecycle"]!!.jsonObject
+        val idlePolicy = lifecycle["idlePolicy"]!!.jsonObject
+        assertEquals(300, idlePolicy["idleTimeoutSeconds"]!!.jsonPrimitive.content.toInt())
+        assertEquals("pause", idlePolicy["onIdle"]!!.jsonPrimitive.content)
+        assertEquals("true", idlePolicy["wakeOnAccess"]!!.jsonPrimitive.content)
+        val probe = idlePolicy["activeProbe"]!!.jsonObject
+        assertEquals(8080, probe["port"]!!.jsonPrimitive.content.toInt())
+        assertEquals("/active", probe["path"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `createSandboxFromTemplate forwards the idle policy as lifecycle idlePolicy`() {
+        val responseBody =
+            """
+            {
+                "id": "550e8400-e29b-41d4-a716-446655440000",
+                "status": { "state": "Running" },
+                "createdAt": "2023-01-01T10:00:00Z",
+                "entrypoint": ["bash"]
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(201))
+
+        sandboxesAdapter.createSandboxFromTemplate(
+            templateId = "tpl_123",
+            timeout = Duration.ofSeconds(600),
+            metadata = emptyMap(),
+            networkPolicy = null,
+            extensions = emptyMap(),
+            idlePolicy =
+                IdlePolicy.builder()
+                    .idleTimeoutSeconds(300)
+                    .onIdle(OnIdleAction.PAUSE)
+                    .build(),
+        )
+
+        val request = mockWebServer.takeRequest()
+        assertEquals("/v1/sandboxes", request.path)
+        val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals("tpl_123", payload["templateId"]!!.jsonPrimitive.content)
+        assertEquals(
+            "pause",
+            payload["lifecycle"]!!
+                .jsonObject["idlePolicy"]!!
+                .jsonObject["onIdle"]!!
+                .jsonPrimitive.content,
+        )
     }
 }

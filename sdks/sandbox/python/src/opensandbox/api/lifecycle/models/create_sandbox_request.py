@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,10 +28,13 @@ if TYPE_CHECKING:
     from ..models.create_sandbox_request_env import CreateSandboxRequestEnv
     from ..models.create_sandbox_request_extensions import CreateSandboxRequestExtensions
     from ..models.create_sandbox_request_metadata import CreateSandboxRequestMetadata
+    from ..models.credential_proxy_config import CredentialProxyConfig
     from ..models.image_spec import ImageSpec
     from ..models.network_policy import NetworkPolicy
     from ..models.platform_spec import PlatformSpec
     from ..models.resource_limits import ResourceLimits
+    from ..models.resource_requests import ResourceRequests
+    from ..models.sandbox_lifecycle import SandboxLifecycle
     from ..models.volume import Volume
 
 
@@ -40,30 +43,48 @@ T = TypeVar("T", bound="CreateSandboxRequest")
 
 @_attrs_define
 class CreateSandboxRequest:
-    """Request to create a new sandbox from either a container image or a snapshot.
-    Exactly one of `image` or `snapshotId` must be provided.
+    """Request to create a new sandbox from either a container image, a snapshot,
+    or a pre-configured pool (via `extensions.poolRef`).
+
+    **Standard mode**: Exactly one of `image` or `snapshotId` must be provided,
+    and `resourceLimits` is required except for an FSB RootfsOnly snapshot restore.
 
     When `image` is provided, `entrypoint` is required. When `snapshotId` is
     provided, `entrypoint` is optional. If omitted, the server defaults the
     sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
 
+    **Pool mode**: When `extensions.poolRef` is set, the sandbox is created from
+    a pre-configured on-demand Pool. In this case `image` and `resourceLimits`
+    are optional and defined by the Pool CRD template. `entrypoint` is also
+    optional; when omitted, the server creates a per-allocation task using
+    `['tail', '-f', '/dev/null']`. The Pool must run task-executor and provide
+    bootstrap plus execd.
+    `snapshotId`, `networkPolicy`, `platform`, `volumes`, and
+    `credentialProxy.enabled` must not be provided together with `poolRef`.
+
     **Note**: API Key authentication is required via the `OPEN-SANDBOX-API-KEY` header.
 
         Attributes:
-            resource_limits (ResourceLimits): Runtime resource constraints as key-value pairs. Similar to Kubernetes
-                resource specifications,
-                allows flexible definition of resource limits. Common resource types include:
-                - `cpu`: CPU allocation in millicores (e.g., "250m" for 0.25 CPU cores)
-                - `memory`: Memory allocation in bytes or human-readable format (e.g., "512Mi", "1Gi")
-                - `gpu`: Number of GPU devices (e.g., "1")
-
-                New resource types can be added without API changes.
-                 Example: {'cpu': '500m', 'memory': '512Mi', 'gpu': '1'}.
             image (ImageSpec | Unset): Container image specification for sandbox provisioning.
 
                 Supports public registry images and private registry images with authentication.
             snapshot_id (str | Unset): Snapshot identifier to restore from.
                 Mutually exclusive with `image`.
+            template_id (str | Unset): Fsb (fast-sandbox microVM) template to create the sandbox from; on the
+                `kubernetes` runtime this routes the create to the fsb catalog.
+                Mutually exclusive with `image` and `snapshotId`; in template mode
+                the workload shape is fixed by the template's golden image, so
+                `entrypoint`, `env`, `resourceLimits`, `resourceRequests`,
+                `volumes`, `platform`, `secureAccess` and
+                lifecycle hooks are rejected (400), and `timeout` is required.
+                `credentialProxy` is accepted and ignored: the vault is not
+                carried at create time — it is configured after creation through
+                the server-routed Credential Vault API
+                (`/sandboxes/{sandboxId}/credential-vault`).
+                `lifecycle.idlePolicy` is allowed: it is control-plane state,
+                not workload shape.
+                The template must belong to the requester's tenant and be
+                `Succeeded`; anything else yields 404 (no existence leak).
             platform (PlatformSpec | Unset): Runtime platform constraint used for scheduling/provisioning.
 
                 This field is independent from `image` and expresses the expected target
@@ -82,6 +103,34 @@ class CreateSandboxRequest:
                 Omit this field or set it to null to disable automatic expiration and require explicit cleanup.
                 Note: manual cleanup support is runtime-dependent; Kubernetes providers may reject
                 omitted or null timeout when the underlying workload provider does not support non-expiring sandboxes.
+            resource_limits (ResourceLimits | Unset): Runtime resource constraints as key-value pairs. Similar to Kubernetes
+                resource specifications,
+                allows flexible definition of resource limits. Common resource types include:
+                - `cpu`: CPU allocation in millicores (e.g., "250m" for 0.25 CPU cores)
+                - `memory`: Memory allocation in bytes or human-readable format (e.g., "512Mi", "1Gi")
+                - `gpu`: Number of GPU devices (e.g., "1")
+                - `disk`: Writable-layer disk quota (e.g., "10G", "512M"); `storage` and
+                  `ephemeral-storage` are accepted as aliases. On the Docker runtime this
+                  bounds only the container's writable layer via HostConfig.StorageOpt —
+                  bind mounts, named volumes, and read-only image layers are not covered —
+                  and requires a quota-capable storage driver (for example overlay2 on XFS
+                  with pquota); the create request fails with INVALID_PARAMETER if the
+                  daemon cannot enforce it. On the Windows profile this maps to the
+                  sandbox disk size.
+
+                New resource types can be added without API changes.
+                 Example: {'cpu': '500m', 'memory': '512Mi', 'gpu': '1'}.
+            resource_requests (ResourceRequests | Unset): Resource reservations for the sandbox, as key-value pairs in
+                Kubernetes
+                resource specification syntax (same key space as `resourceLimits`):
+                - `cpu`: CPU reservation (e.g., "250m" for 0.25 CPU cores)
+                - `memory`: Memory reservation (e.g., "512Mi", "1Gi")
+
+                On Kubernetes-based runtimes these become the sandbox container's
+                `requests` — scheduling guarantees, not hard caps. This field is
+                ignored by the Docker runtime, which reads only `resourceLimits`, so
+                a `disk` reservation here does not create a writable-layer quota.
+                 Example: {'cpu': '500m', 'memory': '512Mi'}.
             env (CreateSandboxRequestEnv | Unset): Environment variables to inject into the sandbox runtime. Example:
                 {'API_KEY': 'secret-key', 'DEBUG': 'true', 'LOG_LEVEL': 'info'}.
             metadata (CreateSandboxRequestMetadata | Unset): Custom key-value metadata for management, filtering, and
@@ -89,12 +138,23 @@ class CreateSandboxRequest:
                 Use "name" key for a human-readable identifier.
                  Example: {'name': 'Data Processing Sandbox', 'project': 'data-processing', 'team': 'ml', 'environment':
                 'staging'}.
+            lifecycle (SandboxLifecycle | Unset): Extensible container for sandbox lifecycle configuration. All fields
+                are optional. Future lifecycle events are added as new optional
+                fields without changing the semantics of existing fields.
+
+                `preStart` and `periodic` are hooks executed inside the sandbox by
+                execd. `idlePolicy` (OSEP-0024) and `renewalPolicy` (OSEP-0009) are
+                control-plane policies: they tell the server how to treat the
+                sandbox's state machine and never reach the guest.
             entrypoint (list[str] | Unset): The command to execute as the sandbox's entry process.
 
                 Required when `image` is provided.
 
                 Optional when `snapshotId` is provided. If omitted for snapshot
                 restore, the server defaults to `["tail", "-f", "/dev/null"]`.
+
+                Optional when `extensions.poolRef` is provided. If omitted for Pool
+                mode, the server uses the same default in a per-allocation task.
 
                 Explicitly specifies the user's expected main process, allowing the sandbox management
                 service to reliably inject control processes before executing this command.
@@ -110,6 +170,12 @@ class CreateSandboxRequest:
             network_policy (NetworkPolicy | Unset): Egress network policy matching the sidecar `/policy` request body.
                 If `defaultAction` is omitted, the sidecar defaults to "deny"; passing an empty
                 object or null results in allow-all behavior at startup.
+            credential_proxy (CredentialProxyConfig | Unset): Credential Vault proxy startup settings. This is an explicit
+                opt-in for
+                transparent MITM support used by credential injection. Credential Vault
+                requires `dns+nft` enforcement and a network policy. A deny-default policy
+                is strongly recommended; default-allow remains temporarily supported for
+                backward compatibility and emits a security warning.
             secure_access (bool | Unset): Opts the sandbox into secured access for endpoint access.
                 This is currently supported only for Kubernetes sandboxes exposed
                 through ingress gateway mode. When enabled, the server provisions
@@ -134,34 +200,45 @@ class CreateSandboxRequest:
                 - **Pass-through**: SDKs and middleware must treat this object as opaque and pass it through transparently.
 
                 **Well-known keys**:
-                - `access.renew.extend.seconds` (optional): Decimal integer string from **300** to **86400** (5 minutes to 24
-                hours inclusive). Opts the sandbox into OSEP-0009 renew-on-access and sets per-renewal extension seconds. Omit
-                to disable. Invalid values are rejected at creation with HTTP 400 (validated on the lifecycle create endpoint
-                via `validate_extensions` in server `src/extensions/validation.py`).
+                - `access.renew.extend.seconds` (**deprecated**): Decimal integer
+                  string from **300** to **86400** (5 minutes to 24 hours
+                  inclusive). Opts the sandbox into OSEP-0009 renew-on-access and
+                  sets per-renewal extension seconds. Omit to disable. Invalid
+                  values are rejected at creation with HTTP 400 (validated on the
+                  lifecycle create endpoint via `validate_extensions` in server
+                  `src/extensions/validation.py`). Superseded by
+                  `lifecycle.renewalPolicy.extendSeconds`: prefer the structured
+                  field in new code. The extensions key remains supported
+                  throughout 1.x and is removed in 2.0; when both are set, their
+                  parsed values must match or creation fails with HTTP 400.
     """
 
-    resource_limits: ResourceLimits
     image: ImageSpec | Unset = UNSET
     snapshot_id: str | Unset = UNSET
+    template_id: str | Unset = UNSET
     platform: PlatformSpec | Unset = UNSET
     timeout: int | None | Unset = UNSET
+    resource_limits: ResourceLimits | Unset = UNSET
+    resource_requests: ResourceRequests | Unset = UNSET
     env: CreateSandboxRequestEnv | Unset = UNSET
     metadata: CreateSandboxRequestMetadata | Unset = UNSET
+    lifecycle: SandboxLifecycle | Unset = UNSET
     entrypoint: list[str] | Unset = UNSET
     network_policy: NetworkPolicy | Unset = UNSET
+    credential_proxy: CredentialProxyConfig | Unset = UNSET
     secure_access: bool | Unset = False
     volumes: list[Volume] | Unset = UNSET
     extensions: CreateSandboxRequestExtensions | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        resource_limits = self.resource_limits.to_dict()
-
         image: dict[str, Any] | Unset = UNSET
         if not isinstance(self.image, Unset):
             image = self.image.to_dict()
 
         snapshot_id = self.snapshot_id
+
+        template_id = self.template_id
 
         platform: dict[str, Any] | Unset = UNSET
         if not isinstance(self.platform, Unset):
@@ -173,6 +250,14 @@ class CreateSandboxRequest:
         else:
             timeout = self.timeout
 
+        resource_limits: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.resource_limits, Unset):
+            resource_limits = self.resource_limits.to_dict()
+
+        resource_requests: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.resource_requests, Unset):
+            resource_requests = self.resource_requests.to_dict()
+
         env: dict[str, Any] | Unset = UNSET
         if not isinstance(self.env, Unset):
             env = self.env.to_dict()
@@ -181,6 +266,10 @@ class CreateSandboxRequest:
         if not isinstance(self.metadata, Unset):
             metadata = self.metadata.to_dict()
 
+        lifecycle: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.lifecycle, Unset):
+            lifecycle = self.lifecycle.to_dict()
+
         entrypoint: list[str] | Unset = UNSET
         if not isinstance(self.entrypoint, Unset):
             entrypoint = self.entrypoint
@@ -188,6 +277,10 @@ class CreateSandboxRequest:
         network_policy: dict[str, Any] | Unset = UNSET
         if not isinstance(self.network_policy, Unset):
             network_policy = self.network_policy.to_dict()
+
+        credential_proxy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.credential_proxy, Unset):
+            credential_proxy = self.credential_proxy.to_dict()
 
         secure_access = self.secure_access
 
@@ -204,27 +297,33 @@ class CreateSandboxRequest:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "resourceLimits": resource_limits,
-            }
-        )
+        field_dict.update({})
         if image is not UNSET:
             field_dict["image"] = image
         if snapshot_id is not UNSET:
             field_dict["snapshotId"] = snapshot_id
+        if template_id is not UNSET:
+            field_dict["templateId"] = template_id
         if platform is not UNSET:
             field_dict["platform"] = platform
         if timeout is not UNSET:
             field_dict["timeout"] = timeout
+        if resource_limits is not UNSET:
+            field_dict["resourceLimits"] = resource_limits
+        if resource_requests is not UNSET:
+            field_dict["resourceRequests"] = resource_requests
         if env is not UNSET:
             field_dict["env"] = env
         if metadata is not UNSET:
             field_dict["metadata"] = metadata
+        if lifecycle is not UNSET:
+            field_dict["lifecycle"] = lifecycle
         if entrypoint is not UNSET:
             field_dict["entrypoint"] = entrypoint
         if network_policy is not UNSET:
             field_dict["networkPolicy"] = network_policy
+        if credential_proxy is not UNSET:
+            field_dict["credentialProxy"] = credential_proxy
         if secure_access is not UNSET:
             field_dict["secureAccess"] = secure_access
         if volumes is not UNSET:
@@ -239,15 +338,16 @@ class CreateSandboxRequest:
         from ..models.create_sandbox_request_env import CreateSandboxRequestEnv
         from ..models.create_sandbox_request_extensions import CreateSandboxRequestExtensions
         from ..models.create_sandbox_request_metadata import CreateSandboxRequestMetadata
+        from ..models.credential_proxy_config import CredentialProxyConfig
         from ..models.image_spec import ImageSpec
         from ..models.network_policy import NetworkPolicy
         from ..models.platform_spec import PlatformSpec
         from ..models.resource_limits import ResourceLimits
+        from ..models.resource_requests import ResourceRequests
+        from ..models.sandbox_lifecycle import SandboxLifecycle
         from ..models.volume import Volume
 
         d = dict(src_dict)
-        resource_limits = ResourceLimits.from_dict(d.pop("resourceLimits"))
-
         _image = d.pop("image", UNSET)
         image: ImageSpec | Unset
         if isinstance(_image, Unset):
@@ -256,6 +356,8 @@ class CreateSandboxRequest:
             image = ImageSpec.from_dict(_image)
 
         snapshot_id = d.pop("snapshotId", UNSET)
+
+        template_id = d.pop("templateId", UNSET)
 
         _platform = d.pop("platform", UNSET)
         platform: PlatformSpec | Unset
@@ -273,6 +375,20 @@ class CreateSandboxRequest:
 
         timeout = _parse_timeout(d.pop("timeout", UNSET))
 
+        _resource_limits = d.pop("resourceLimits", UNSET)
+        resource_limits: ResourceLimits | Unset
+        if isinstance(_resource_limits, Unset):
+            resource_limits = UNSET
+        else:
+            resource_limits = ResourceLimits.from_dict(_resource_limits)
+
+        _resource_requests = d.pop("resourceRequests", UNSET)
+        resource_requests: ResourceRequests | Unset
+        if isinstance(_resource_requests, Unset):
+            resource_requests = UNSET
+        else:
+            resource_requests = ResourceRequests.from_dict(_resource_requests)
+
         _env = d.pop("env", UNSET)
         env: CreateSandboxRequestEnv | Unset
         if isinstance(_env, Unset):
@@ -287,6 +403,13 @@ class CreateSandboxRequest:
         else:
             metadata = CreateSandboxRequestMetadata.from_dict(_metadata)
 
+        _lifecycle = d.pop("lifecycle", UNSET)
+        lifecycle: SandboxLifecycle | Unset
+        if isinstance(_lifecycle, Unset):
+            lifecycle = UNSET
+        else:
+            lifecycle = SandboxLifecycle.from_dict(_lifecycle)
+
         entrypoint = cast(list[str], d.pop("entrypoint", UNSET))
 
         _network_policy = d.pop("networkPolicy", UNSET)
@@ -295,6 +418,13 @@ class CreateSandboxRequest:
             network_policy = UNSET
         else:
             network_policy = NetworkPolicy.from_dict(_network_policy)
+
+        _credential_proxy = d.pop("credentialProxy", UNSET)
+        credential_proxy: CredentialProxyConfig | Unset
+        if isinstance(_credential_proxy, Unset):
+            credential_proxy = UNSET
+        else:
+            credential_proxy = CredentialProxyConfig.from_dict(_credential_proxy)
 
         secure_access = d.pop("secureAccess", UNSET)
 
@@ -315,15 +445,19 @@ class CreateSandboxRequest:
             extensions = CreateSandboxRequestExtensions.from_dict(_extensions)
 
         create_sandbox_request = cls(
-            resource_limits=resource_limits,
             image=image,
             snapshot_id=snapshot_id,
+            template_id=template_id,
             platform=platform,
             timeout=timeout,
+            resource_limits=resource_limits,
+            resource_requests=resource_requests,
             env=env,
             metadata=metadata,
+            lifecycle=lifecycle,
             entrypoint=entrypoint,
             network_policy=network_policy,
+            credential_proxy=credential_proxy,
             secure_access=secure_access,
             volumes=volumes,
             extensions=extensions,

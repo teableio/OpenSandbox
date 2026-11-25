@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,18 @@
 package controller
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,7 +44,6 @@ import (
 // buildPTYRouter assembles a minimal Gin router with only the /pty routes,
 // avoiding any import cycle with pkg/web.
 func buildPTYRouter() *gin.Engine {
-	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
 
@@ -69,7 +72,6 @@ func newPTYTestServer(t *testing.T) *httptest.Server {
 	return httptest.NewServer(buildPTYRouter())
 }
 
-// wsDialPTY dials a WebSocket URL; accepts an optional extra query string.
 func wsDialPTY(t *testing.T, baseURL, path, query string) *websocket.Conn {
 	t.Helper()
 	u := "ws" + strings.TrimPrefix(baseURL+path, "http")
@@ -100,7 +102,6 @@ func wsDialExpectHTTP(t *testing.T, baseURL, path, query string) int {
 	return resp.StatusCode
 }
 
-// ptyCreateSession calls POST /pty and returns the session_id.
 func ptyCreateSession(t *testing.T, srv *httptest.Server) string {
 	t.Helper()
 	resp, err := http.Post(srv.URL+"/pty", "application/json", strings.NewReader(`{}`))
@@ -143,7 +144,6 @@ func ptyReadFrame(conn *websocket.Conn, timeout time.Duration) (model.ServerFram
 	return model.ServerFrame{}, fmt.Errorf("unknown binary frame type 0x%02x", raw[0])
 }
 
-// ptyWaitFrame reads frames until one with the given type is found.
 func ptyWaitFrame(t *testing.T, conn *websocket.Conn, wantType string, timeout time.Duration) model.ServerFrame {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -160,7 +160,6 @@ func ptyWaitFrame(t *testing.T, conn *websocket.Conn, wantType string, timeout t
 	return model.ServerFrame{}
 }
 
-// ptyOutputContains reads frames until stdout/stderr/replay contains substr.
 func ptyOutputContains(t *testing.T, conn *websocket.Conn, substr string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -187,7 +186,58 @@ func ptyWriteStdin(t *testing.T, conn *websocket.Conn, text string) {
 	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, frame))
 }
 
-// --- Tests ---
+type errorPTYCreateRunner struct {
+	codeExecutionRunner
+	attemptedSessionID string
+}
+
+func (r *errorPTYCreateRunner) CreatePTYSession(id, _, _ string) (runtime.PTYSession, error) {
+	r.attemptedSessionID = id
+	return nil, errors.New("forced PTY creation failure")
+}
+
+func TestCreatePTYSessionReturnsOnlyErrorWhenCreationFails(t *testing.T) {
+	underlying := runtime.NewController("", "")
+	runner := &errorPTYCreateRunner{codeExecutionRunner: underlying}
+	previous := codeRunner
+	codeRunner = runner
+	t.Cleanup(func() { codeRunner = previous })
+
+	req := httptest.NewRequest(http.MethodPost, "/pty", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	buildPTYRouter().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.True(t, json.Valid(rec.Body.Bytes()), "response must contain exactly one JSON value: %q", rec.Body.String())
+
+	var response model.ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	require.Equal(t, model.ErrorCodeRuntimeError, response.Code)
+	require.Equal(t, "error creating pty session: forced PTY creation failure", response.Message)
+	require.NotContains(t, rec.Body.String(), "session_id")
+	require.NotEmpty(t, runner.attemptedSessionID)
+	require.Nil(t, underlying.GetPTYSession(runner.attemptedSessionID))
+}
+
+func TestCreatePTYSessionReturns201OnSuccess(t *testing.T) {
+	runner := runtime.NewController("", "")
+	previous := codeRunner
+	codeRunner = runner
+	t.Cleanup(func() { codeRunner = previous })
+
+	req := httptest.NewRequest(http.MethodPost, "/pty", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	buildPTYRouter().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.True(t, json.Valid(rec.Body.Bytes()))
+
+	var response model.CreatePTYSessionResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	require.NotEmpty(t, response.SessionID)
+	require.NotNil(t, runner.GetPTYSession(response.SessionID))
+	require.NoError(t, runner.DeletePTYSession(response.SessionID))
+}
 
 func TestPTYWS_UnknownSessionReturns404(t *testing.T) {
 	srv := newPTYTestServer(t)
@@ -198,9 +248,7 @@ func TestPTYWS_UnknownSessionReturns404(t *testing.T) {
 }
 
 func TestPTYWS_AlreadyConnectedReturns409(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found")
-	}
+	requireBash(t)
 	srv := newPTYTestServer(t)
 	defer srv.Close()
 
@@ -212,10 +260,198 @@ func TestPTYWS_AlreadyConnectedReturns409(t *testing.T) {
 	require.Equal(t, http.StatusConflict, code)
 }
 
-func TestPTYWS_ConnectedFramePTYMode(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found")
+func TestPTYWS_ViewerRequiresRunningSession(t *testing.T) {
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	code := wsDialExpectHTTP(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	require.Equal(t, http.StatusConflict, code)
+}
+
+func TestPTYWS_ConcurrentViewersReceiveReplayAndLiveOutput(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	holder := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, holder, "connected", 10*time.Second)
+	ptyWriteStdin(t, holder, "echo viewer_replay_marker\n")
+	ptyOutputContains(t, holder, "viewer_replay_marker", 8*time.Second)
+
+	viewer1 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer&since=0")
+	viewer2 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer&since=0")
+	for _, viewer := range []*websocket.Conn{viewer1, viewer2} {
+		ptyOutputContains(t, viewer, "viewer_replay_marker", 8*time.Second)
+		f := ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+		require.Equal(t, "viewer", f.Role)
 	}
+
+	// Viewers do not release or replace the exclusive read/write holder.
+	code := wsDialExpectHTTP(t, srv.URL, "/pty/"+id+"/ws", "")
+	require.Equal(t, http.StatusConflict, code)
+
+	ptyWriteStdin(t, holder, "echo viewer_live_marker\n")
+	ptyOutputContains(t, viewer1, "viewer_live_marker", 8*time.Second)
+	ptyOutputContains(t, viewer2, "viewer_live_marker", 8*time.Second)
+}
+
+func TestPTYWS_ViewerRejectsMutatingFrames(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	holder := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, holder, "connected", 10*time.Second)
+	viewer := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+
+	markerPath := "/tmp/opensandbox-viewer-read-only-" + id
+	ptyWriteStdin(t, viewer, "touch "+markerPath+"\n")
+	f := ptyWaitFrame(t, viewer, "error", 5*time.Second)
+	require.Equal(t, model.WSErrCodeReadOnly, f.Code)
+
+	require.NoError(t, viewer.WriteJSON(model.ClientFrame{
+		Type: "stdin",
+		Data: "touch " + markerPath + "\n",
+	}))
+	f = ptyWaitFrame(t, viewer, "error", 5*time.Second)
+	require.Equal(t, model.WSErrCodeReadOnly, f.Code)
+
+	require.NoError(t, viewer.WriteJSON(model.ClientFrame{Type: "signal", Signal: "SIGTERM"}))
+	f = ptyWaitFrame(t, viewer, "error", 5*time.Second)
+	require.Equal(t, model.WSErrCodeReadOnly, f.Code)
+
+	require.NoError(t, viewer.WriteJSON(model.ClientFrame{Type: "resize", Cols: 120, Rows: 40}))
+	f = ptyWaitFrame(t, viewer, "error", 5*time.Second)
+	require.Equal(t, model.WSErrCodeReadOnly, f.Code)
+
+	require.NoError(t, viewer.WriteJSON(model.ClientFrame{Type: "ping"}))
+	f = ptyWaitFrame(t, viewer, "pong", 5*time.Second)
+	require.Equal(t, "pong", f.Type)
+
+	// The blocked stdin and signal did not mutate or terminate the shell.
+	ptyWriteStdin(t, holder, "test ! -e "+markerPath+" && echo viewer_read_only_ok\n")
+	ptyOutputContains(t, holder, "viewer_read_only_ok", 8*time.Second)
+
+	// The blocked resize did not change the initial PTY size.
+	ptyWriteStdin(t, holder, "stty size\n")
+	ptyOutputContains(t, holder, "24 80", 8*time.Second)
+}
+
+func TestPTYWS_ViewerClosesAfterReadOnlyViolationLimit(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	holder := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, holder, "connected", 10*time.Second)
+	viewer := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+
+	for range ptyViewerReadOnlyViolationLimit {
+		ptyWriteStdin(t, viewer, "ignored\n")
+		f := ptyWaitFrame(t, viewer, "error", 5*time.Second)
+		require.Equal(t, model.WSErrCodeReadOnly, f.Code)
+	}
+
+	// The output pump can send replay after the final READ_ONLY error but
+	// before cancellation closes the socket. Drain it within one deadline;
+	// a timeout or malformed frame must not be mistaken for peer closure.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		frame, err := ptyReadFrame(viewer, remaining)
+		if err != nil {
+			var closeErr *websocket.CloseError
+			require.ErrorAs(t, err, &closeErr, "viewer should close after repeated read-only violations")
+			return
+		}
+		require.Equal(t, "replay", frame.Type, "unexpected frame while waiting for viewer closure")
+	}
+	t.Fatal("viewer did not close after repeated read-only violations")
+}
+
+func TestPTYWS_ViewerFlushesOutputBeforeExit(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	holder := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "pty=0")
+	ptyWaitFrame(t, holder, "connected", 10*time.Second)
+	viewer := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+
+	ptyWriteStdin(t, holder, "printf viewer_exit_marker; exit\n")
+	ptyOutputContains(t, viewer, "viewer_exit_marker", 8*time.Second)
+	f := ptyWaitFrame(t, viewer, "exit", 8*time.Second)
+	require.Equal(t, "exit", f.Type)
+}
+
+func TestPTYWS_ViewerDisconnectDoesNotAffectSessionOrOtherViewers(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	holder := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, holder, "connected", 10*time.Second)
+
+	viewer1 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	ptyWaitFrame(t, viewer1, "connected", 8*time.Second)
+	require.NoError(t, viewer1.Close())
+
+	viewer2 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	ptyWaitFrame(t, viewer2, "connected", 8*time.Second)
+	ptyWriteStdin(t, holder, "echo viewer_disconnect_ok\n")
+	ptyOutputContains(t, viewer2, "viewer_disconnect_ok", 8*time.Second)
+}
+
+func TestPTYWS_ViewerSurvivesHolderTakeover(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	holder := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, holder, "connected", 10*time.Second)
+	viewer := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+
+	successor := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "takeover=1")
+	ptyWaitFrame(t, successor, "connected", 8*time.Second)
+	ptyWriteStdin(t, successor, "echo viewer_after_takeover\n")
+	ptyOutputContains(t, viewer, "viewer_after_takeover", 8*time.Second)
+}
+
+func TestPTYWS_ViewerPipeModeReceivesCombinedOutput(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	holder := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "pty=0")
+	f := ptyWaitFrame(t, holder, "connected", 10*time.Second)
+	require.Equal(t, "pipe", f.Mode)
+
+	viewer := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "mode=viewer")
+	f = ptyWaitFrame(t, viewer, "connected", 8*time.Second)
+	require.Equal(t, "pipe", f.Mode)
+	require.Equal(t, "viewer", f.Role)
+
+	ptyWriteStdin(t, holder, "echo viewer_pipe_output\n")
+	ptyOutputContains(t, viewer, "viewer_pipe_output", 8*time.Second)
+}
+
+func TestPTYWS_ConnectedFramePTYMode(t *testing.T) {
+	requireBash(t)
 	srv := newPTYTestServer(t)
 	defer srv.Close()
 
@@ -226,12 +462,11 @@ func TestPTYWS_ConnectedFramePTYMode(t *testing.T) {
 	require.Equal(t, "connected", f.Type)
 	require.Equal(t, id, f.SessionID)
 	require.Equal(t, "pty", f.Mode)
+	require.Equal(t, "holder", f.Role)
 }
 
 func TestPTYWS_StdinForwarding(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found")
-	}
+	requireBash(t)
 	srv := newPTYTestServer(t)
 	defer srv.Close()
 
@@ -244,9 +479,7 @@ func TestPTYWS_StdinForwarding(t *testing.T) {
 }
 
 func TestPTYWS_PingPong(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found")
-	}
+	requireBash(t)
 	srv := newPTYTestServer(t)
 	defer srv.Close()
 
@@ -260,9 +493,7 @@ func TestPTYWS_PingPong(t *testing.T) {
 }
 
 func TestPTYWS_ExitFrame(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found")
-	}
+	requireBash(t)
 	srv := newPTYTestServer(t)
 	defer srv.Close()
 
@@ -278,22 +509,156 @@ func TestPTYWS_ExitFrame(t *testing.T) {
 	require.Equal(t, 0, *f.ExitCode)
 }
 
-func TestPTYWS_ReplayOnReconnect(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found")
+// exitedPipePTYSession is a running pipe-mode session whose process exit, output
+// fanout and output completion are driven by the test, so a test can reproduce
+// the runtime closing Done before the broadcasters fan out the final chunk.
+type exitedPipePTYSession struct {
+	runtime.PTYSession
+	doneCh       chan struct{}
+	outputDoneCh chan struct{}
+	stdoutR      *io.PipeReader
+	stdoutW      *io.PipeWriter
+	stderrR      *io.PipeReader
+	stderrW      *io.PipeWriter
+}
+
+func newExitedPipePTYSession() *exitedPipePTYSession {
+	s := &exitedPipePTYSession{
+		doneCh:       make(chan struct{}),
+		outputDoneCh: make(chan struct{}),
 	}
+	s.stdoutR, s.stdoutW = io.Pipe()
+	s.stderrR, s.stderrW = io.Pipe()
+	return s
+}
+
+func (s *exitedPipePTYSession) LockWS() bool                     { return true }
+func (s *exitedPipePTYSession) UnlockWS()                        {}
+func (s *exitedPipePTYSession) SetEvictHandler(func()) uint64    { return 1 }
+func (s *exitedPipePTYSession) ClearEvictHandler(uint64)         {}
+func (s *exitedPipePTYSession) IsRunning() bool                  { return true }
+func (s *exitedPipePTYSession) IsPTY() bool                      { return false }
+func (s *exitedPipePTYSession) ExitCode() int                    { return 0 }
+func (s *exitedPipePTYSession) Done() <-chan struct{}            { return s.doneCh }
+func (s *exitedPipePTYSession) OutputDone() <-chan struct{}      { return s.outputDoneCh }
+func (s *exitedPipePTYSession) WriteStdin(p []byte) (int, error) { return len(p), nil }
+func (s *exitedPipePTYSession) SendSignal(string)                {}
+
+func (s *exitedPipePTYSession) AttachOutputWithSnapshot(int64) (io.Reader, io.Reader, func(), []byte, int64) {
+	detach := func() {
+		_ = s.stdoutW.Close()
+		_ = s.stderrW.Close()
+	}
+	return s.stdoutR, s.stderrR, detach, nil, 0
+}
+
+type fakePTYSessionRunner struct {
+	codeExecutionRunner
+	session runtime.PTYSession
+}
+
+func (r *fakePTYSessionRunner) GetPTYSession(string) runtime.PTYSession { return r.session }
+
+func newFakePTYSessionServer(t *testing.T, session runtime.PTYSession) *httptest.Server {
+	t.Helper()
+	prev := codeRunner
+	codeRunner = &fakePTYSessionRunner{codeExecutionRunner: runtime.NewController("", ""), session: session}
+	t.Cleanup(func() { codeRunner = prev })
+	srv := httptest.NewServer(buildPTYRouter())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestPTYWS_HolderPipeModeFlushesOutputBeforeExit reproduces issue #2643: in pipe
+// mode Done closes as soon as the process is reaped, possibly before the final
+// stdout chunk is fanned out to the holder. The holder must still deliver that
+// chunk before the exit frame.
+func TestPTYWS_HolderPipeModeFlushesOutputBeforeExit(t *testing.T) {
+	session := newExitedPipePTYSession()
+	srv := newFakePTYSessionServer(t, session)
+
+	conn := wsDialPTY(t, srv.URL, "/pty/fake/ws", "pty=0")
+	f := ptyWaitFrame(t, conn, "connected", 5*time.Second)
+	require.Equal(t, "pipe", f.Mode)
+
+	close(session.doneCh)
+	// Give an exit watcher that does not wait for output time to send exit first.
+	time.Sleep(100 * time.Millisecond)
+	fanoutErr := make(chan error, 1)
+	go func() {
+		_, err := session.stdoutW.Write([]byte("final_chunk\n"))
+		fanoutErr <- err
+	}()
+	require.NoError(t, <-fanoutErr, "pump should consume the final chunk")
+	close(session.outputDoneCh)
+
+	f, err := ptyReadFrame(conn, 5*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "stdout", f.Type, "final stdout chunk must precede the exit frame")
+	require.Equal(t, "final_chunk\n", f.Data)
+
+	f, err = ptyReadFrame(conn, 5*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "exit", f.Type)
+	require.NotNil(t, f.ExitCode)
+	require.Equal(t, 0, *f.ExitCode)
+}
+
+// TestPTYWS_HolderExitNotBlockedByUnfinishedOutput verifies that a pipe that never
+// reaches EOF after the process exits (for example one held open by a background
+// child) delays the exit frame by at most ptyHolderOutputDrainTimeout.
+func TestPTYWS_HolderExitNotBlockedByUnfinishedOutput(t *testing.T) {
+	session := newExitedPipePTYSession()
+	srv := newFakePTYSessionServer(t, session)
+
+	conn := wsDialPTY(t, srv.URL, "/pty/fake/ws", "pty=0")
+	ptyWaitFrame(t, conn, "connected", 5*time.Second)
+
+	close(session.doneCh)
+	f := ptyWaitFrame(t, conn, "exit", ptyHolderOutputDrainTimeout+5*time.Second)
+	require.NotNil(t, f.ExitCode)
+	require.Equal(t, 0, *f.ExitCode)
+}
+
+// TestPTYWS_HolderPipeModeOutputBeforeExit checks the same ordering end to end
+// with a real pipe-mode shell that prints and exits in one command.
+func TestPTYWS_HolderPipeModeOutputBeforeExit(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	conn := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "pty=0")
+	ptyWaitFrame(t, conn, "connected", 10*time.Second)
+
+	ptyWriteStdin(t, conn, "printf holder_exit_marker; exit\n")
+	var output strings.Builder
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f, err := ptyReadFrame(conn, time.Until(deadline))
+		require.NoError(t, err, "expected exit frame")
+		if f.Type == "stdout" {
+			output.WriteString(f.Data)
+		}
+		if f.Type == "exit" {
+			break
+		}
+	}
+	require.Equal(t, "holder_exit_marker", output.String())
+}
+
+func TestPTYWS_ReplayOnReconnect(t *testing.T) {
+	requireBash(t)
 	srv := newPTYTestServer(t)
 	defer srv.Close()
 
 	id := ptyCreateSession(t, srv)
 
-	// First connection: produce output.
 	conn1 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
 	ptyWaitFrame(t, conn1, "connected", 10*time.Second)
 	ptyWriteStdin(t, conn1, "echo replay_test\n")
 	ptyOutputContains(t, conn1, "replay_test", 8*time.Second)
 
-	// Check offset via REST.
 	resp, err := http.Get(srv.URL + "/pty/" + id)
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -301,7 +666,6 @@ func TestPTYWS_ReplayOnReconnect(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&status))
 	require.True(t, status.OutputOffset > 0)
 
-	// Disconnect.
 	_ = conn1.Close()
 	time.Sleep(100 * time.Millisecond)
 
@@ -323,10 +687,273 @@ func TestPTYWS_ReplayOnReconnect(t *testing.T) {
 	require.True(t, gotReplay, "expected replay frame containing 'replay_test'")
 }
 
-func TestPTYWS_ResizeFrame(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found")
+// TestPTYWS_TakeoverEvictsHolder verifies that ?takeover=1 evicts the current
+// holder (closing its WS with WSCloseTakenOver) and that the taking-over client
+// reattaches to the SAME shell: it replays the prior scrollback and can read a
+// shell variable set by the evicted client.
+func TestPTYWS_TakeoverEvictsHolder(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+
+	conn1 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, conn1, "connected", 10*time.Second)
+	ptyWriteStdin(t, conn1, "TAKEOVER_VAR=alive\n")
+	ptyWriteStdin(t, conn1, "echo holder_marker\n")
+	ptyOutputContains(t, conn1, "holder_marker", 8*time.Second)
+
+	conn2 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "takeover=1&since=0")
+
+	var closeErr *websocket.CloseError
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, err := conn1.ReadMessage(); err != nil {
+			_ = errors.As(err, &closeErr)
+			break
+		}
 	}
+	require.NotNil(t, closeErr, "holder should be closed with a WS CloseError after takeover")
+	require.Equal(t, model.WSCloseTakenOver, closeErr.Code)
+
+	ptyOutputContains(t, conn2, "holder_marker", 8*time.Second)
+	ptyWaitFrame(t, conn2, "connected", 8*time.Second)
+
+	ptyWriteStdin(t, conn2, "echo SAMESHELL_$TAKEOVER_VAR\n")
+	ptyOutputContains(t, conn2, "SAMESHELL_alive", 8*time.Second)
+}
+
+// pipeListener hands the server one end of a net.Pipe per dial. With no socket
+// buffers in between, a server write blocks until the client reads it.
+type pipeListener struct {
+	conns     chan net.Conn
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newPipeListener() *pipeListener {
+	return &pipeListener{conns: make(chan net.Conn), done: make(chan struct{})}
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeListener) Close() error {
+	l.closeOnce.Do(func() { close(l.done) })
+	return nil
+}
+
+func (l *pipeListener) Addr() net.Addr { return &net.UnixAddr{Name: "pipe", Net: "pipe"} }
+
+func (l *pipeListener) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	client, server := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-l.done:
+	case <-ctx.Done():
+	}
+	_ = client.Close()
+	_ = server.Close()
+	return nil, net.ErrClosed
+}
+
+// TestPTYWS_TakeoverClosesBusyHolderWithCloseCode verifies that a holder whose
+// output pump is in the middle of a write still gets the WSCloseTakenOver close
+// frame, rather than a bare close (1006). The holder is connected over a pipe and
+// stops reading while it floods output, so the pump is blocked writing when the
+// takeover evicts it.
+func TestPTYWS_TakeoverClosesBusyHolderWithCloseCode(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	pl := newPipeListener()
+	pipeSrv := &http.Server{Handler: buildPTYRouter()}
+	go func() { _ = pipeSrv.Serve(pl) }()
+	defer pipeSrv.Close()
+
+	id := ptyCreateSession(t, srv)
+	// Delete the session to stop the flood: the new holder never reads its replay,
+	// so a Ctrl-C sent through it would never be handled.
+	runner := codeRunner
+	t.Cleanup(func() { _ = runner.DeletePTYSession(id) })
+
+	dialer := websocket.Dialer{NetDialContext: pl.DialContext}
+	conn1, _, err := dialer.Dial("ws://pipe/pty/"+id+"/ws", nil)
+	require.NoError(t, err)
+	defer conn1.Close()
+	ptyWaitFrame(t, conn1, "connected", 10*time.Second)
+	ptyWriteStdin(t, conn1, "yes flood_output\n")
+	time.Sleep(100 * time.Millisecond)
+
+	_ = wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "takeover=1")
+	// The server evicts the holder right after the upgrade. Read again only once
+	// that is under way, well within wsTakeoverCloseTimeout.
+	time.Sleep(50 * time.Millisecond)
+
+	var closeErr *websocket.CloseError
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, err := conn1.ReadMessage(); err != nil {
+			_ = errors.As(err, &closeErr)
+			break
+		}
+	}
+	require.NotNil(t, closeErr, "holder should be closed with a WS CloseError after takeover")
+	require.Equal(t, model.WSCloseTakenOver, closeErr.Code)
+}
+
+// TestPTYWS_TakeoverDuringInitialReplayClosesHolderWithCloseCode verifies that
+// evicting a holder while its initial replay write is blocked sends the
+// WSCloseTakenOver (4001) close frame rather than a bare close (1006).
+func TestPTYWS_TakeoverDuringInitialReplayClosesHolderWithCloseCode(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	pl := newPipeListener()
+	pipeSrv := &http.Server{Handler: buildPTYRouter()}
+	go func() { _ = pipeSrv.Serve(pl) }()
+	defer pipeSrv.Close()
+
+	id := ptyCreateSession(t, srv)
+	runner := codeRunner
+	t.Cleanup(func() { _ = runner.DeletePTYSession(id) })
+
+	// Pre-populate output in the session so connecting triggers an initial replay frame.
+	initConn := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, initConn, "connected", 10*time.Second)
+	ptyWriteStdin(t, initConn, "for i in $(seq 1 2000); do echo pre_replay_line; done\n")
+	time.Sleep(150 * time.Millisecond)
+	_ = initConn.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// Dial over pipe listener, but do NOT read messages, causing the initial replay write
+	// to block on the pipe buffer.
+	dialer := websocket.Dialer{NetDialContext: pl.DialContext}
+	conn1, _, err := dialer.Dial("ws://pipe/pty/"+id+"/ws", nil)
+	require.NoError(t, err)
+	defer conn1.Close()
+
+	// Trigger takeover while conn1 is in initial replay write.
+	time.Sleep(50 * time.Millisecond)
+	_ = wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "takeover=1")
+	time.Sleep(50 * time.Millisecond)
+
+	var closeErr *websocket.CloseError
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, err := conn1.ReadMessage(); err != nil {
+			_ = errors.As(err, &closeErr)
+			break
+		}
+	}
+	require.NotNil(t, closeErr, "holder should be closed with a WS CloseError after takeover")
+	require.Equal(t, model.WSCloseTakenOver, closeErr.Code)
+}
+
+// TestPTYWS_TakeoverOnFreeSessionConnects verifies ?takeover=1 is a no-op when the
+// session is free: it connects normally (there is no holder to evict).
+func TestPTYWS_TakeoverOnFreeSessionConnects(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	conn := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "takeover=1")
+	f := ptyWaitFrame(t, conn, "connected", 10*time.Second)
+	require.Equal(t, id, f.SessionID)
+}
+
+// TestPTYWS_TakeoverRequiresWebSocketUpgrade verifies a plain HTTP GET carrying
+// takeover=1 does NOT evict the holder: without a WS handshake it would evict and
+// then fail to upgrade, orphaning the session. It must return 409 and leave the
+// holder attached and functional.
+func TestPTYWS_TakeoverRequiresWebSocketUpgrade(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+	conn1 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, conn1, "connected", 10*time.Second)
+
+	// Plain HTTP GET (no Upgrade header) with takeover=1 → must be refused, not evict.
+	resp, err := http.Get(srv.URL + "/pty/" + id + "/ws?takeover=1")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusConflict, resp.StatusCode)
+
+	// The holder is untouched: it still drives the shell.
+	ptyWriteStdin(t, conn1, "echo still_here\n")
+	ptyOutputContains(t, conn1, "still_here", 8*time.Second)
+}
+
+// TestPTYWS_ConcurrentTakeovers hammers a session with several simultaneous
+// ?takeover=1 reconnects (each with non-empty replay). They must serialize through
+// the lock without tripping the race detector — exercising the initial replay/connected
+// writes vs. eviction and the cleanup-window paths — and the shell must survive.
+func TestPTYWS_ConcurrentTakeovers(t *testing.T) {
+	requireBash(t)
+	srv := newPTYTestServer(t)
+	defer srv.Close()
+
+	id := ptyCreateSession(t, srv)
+
+	// Holder seeds output so every takeover gets a non-empty replay frame.
+	conn0 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
+	ptyWaitFrame(t, conn0, "connected", 10*time.Second)
+	ptyWriteStdin(t, conn0, "echo seed_output\n")
+	ptyOutputContains(t, conn0, "seed_output", 8*time.Second)
+
+	const n = 6
+	var wg sync.WaitGroup
+	var connectedCount int32
+	wsURL := "ws" + strings.TrimPrefix(srv.URL+"/pty/"+id+"/ws", "http") + "?takeover=1&since=0"
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			deadline := time.Now().Add(6 * time.Second)
+			for time.Now().Before(deadline) {
+				f, err := ptyReadFrame(c, time.Until(deadline))
+				if err != nil {
+					return
+				}
+				if f.Type == "connected" {
+					atomic.AddInt32(&connectedCount, 1)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// They serialize via the lock; at least one must have attached.
+	require.GreaterOrEqual(t, atomic.LoadInt32(&connectedCount), int32(1))
+
+	// The session is still reclaimable and the shell survived the storm.
+	winner := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "takeover=1&since=0")
+	ptyWaitFrame(t, winner, "connected", 8*time.Second)
+	ptyWriteStdin(t, winner, "echo still_alive_after_storm\n")
+	ptyOutputContains(t, winner, "still_alive_after_storm", 8*time.Second)
+}
+
+func TestPTYWS_ResizeFrame(t *testing.T) {
+	requireBash(t)
 	srv := newPTYTestServer(t)
 	defer srv.Close()
 
@@ -346,9 +973,7 @@ func TestPTYWS_ResizeFrame(t *testing.T) {
 }
 
 func TestPTYWS_PipeModeConnectedFrame(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found")
-	}
+	requireBash(t)
 	srv := newPTYTestServer(t)
 	defer srv.Close()
 

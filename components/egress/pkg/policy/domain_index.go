@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ func compileDomainIndex(egress []EgressRule) *compiledDomainIndex {
 		if r.targetKind != targetDomain {
 			continue
 		}
-		pattern := strings.ToLower(strings.TrimSpace(r.Target))
+		pattern := normalizeDomainPattern(r.Target)
 		if pattern == "" {
 			continue
 		}

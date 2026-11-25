@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,15 @@ from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.k8s.provider_common import (
     _build_resource_requests_for_k8s,
     _translate_resource_limits_for_k8s,
+    _workload_platform_constraint_scope,
 )
+
+
+def _analyzer(pod_spec):
+    """Return whether pod_spec has nodeSelector / nodeName (platform constraints)."""
+    has_platform = bool(pod_spec.get("nodeSelector") or pod_spec.get("nodeName"))
+    has_non_platform = bool(pod_spec.get("affinity"))
+    return has_platform, has_non_platform
 
 
 def test_translate_resource_limits_passes_gpu_count():
@@ -50,6 +58,37 @@ def test_translate_resource_limits_no_gpu_key_unchanged():
     # Must be a new dict — callers pass it to both limits= and requests=,
     # and we don't want surprise mutation of the input.
     assert result is not inputs
+
+
+@pytest.mark.parametrize(
+    "aliases",
+    [{"disk": "10G"}, {"storage": "10G"}, {"ephemeral-storage": "10G"}],
+    ids=["disk", "storage", "ephemeral-storage"],
+)
+def test_translate_resource_limits_normalizes_disk_aliases(aliases):
+    # The portable disk-quota key must land on the canonical Kubernetes
+    # container storage resource instead of an unknown resource key the
+    # API server would reject.
+    result = _translate_resource_limits_for_k8s({**aliases, "cpu": "500m"})
+    assert result == {"cpu": "500m", "ephemeral-storage": "10G"}
+    for alias in ("disk", "storage"):
+        assert alias not in result
+
+
+def test_translate_resource_limits_disk_alias_precedence():
+    # Same precedence as the Docker runtime and the Windows profile:
+    # disk > storage > ephemeral-storage.
+    result = _translate_resource_limits_for_k8s(
+        {"disk": "10G", "storage": "20G", "ephemeral-storage": "30G"}
+    )
+    assert result == {"ephemeral-storage": "10G"}
+
+
+def test_translate_resource_limits_canonical_disk_key_wins_over_alias():
+    result = _translate_resource_limits_for_k8s(
+        {"disk": "10G", "ephemeral-storage": "30G"}
+    )
+    assert result == {"ephemeral-storage": "10G"}
 
 
 def test_translate_resource_limits_rejects_all():
@@ -99,3 +138,49 @@ def test_build_resource_requests_defaults_to_limits():
     result = _build_resource_requests_for_k8s(limits, None)
     assert result == limits
     assert result is not limits
+
+
+@pytest.mark.parametrize("workload", [
+    {"spec": {"template": None, "poolRef": "pool-runc"}},  # key exists, value None (pool mode)
+    {"spec": {"poolRef": "pool-runc"}},                    # key absent entirely
+    {"spec": None},                                         # spec itself is None
+    {},                                                     # empty workload
+    {"spec": {"template": {"spec": None}}},                # template present, inner spec is None
+])
+def test_platform_constraint_scope_no_crash_on_null_fields(workload):
+    # Regression: chained .get(key, {}) raises AttributeError when any level
+    # is explicitly None.  `or {}` must handle all these shapes safely.
+    result = _workload_platform_constraint_scope(workload, "template", _analyzer)
+    assert result == (False, False)
+
+
+def test_platform_constraint_scope_detects_node_selector():
+    workload = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "nodeSelector": {"kubernetes.io/arch": "amd64"},
+                }
+            }
+        }
+    }
+    has_platform, has_non_platform = _workload_platform_constraint_scope(
+        workload, "template", _analyzer
+    )
+    assert has_platform is True
+    assert has_non_platform is False
+
+
+def test_platform_constraint_scope_pod_template_key_alias():
+    # AgentSandbox uses "podTemplate" instead of "template"
+    workload = {
+        "spec": {
+            "podTemplate": {
+                "spec": {"nodeSelector": {"kubernetes.io/os": "linux"}}
+            }
+        }
+    }
+    has_platform, _ = _workload_platform_constraint_scope(
+        workload, "podTemplate", _analyzer
+    )
+    assert has_platform is True

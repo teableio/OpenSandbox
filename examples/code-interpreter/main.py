@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ async def main() -> None:
     api_key = os.getenv("SANDBOX_API_KEY")
     image = os.getenv(
         "SANDBOX_IMAGE",
-        "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.0.2",
+        "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.1.0",
     )
 
     config = ConnectionConfig(
@@ -38,13 +38,12 @@ async def main() -> None:
     sandbox = await Sandbox.create(
         image,
         connection_config=config,
-        entrypoint=["/opt/opensandbox/code-interpreter.sh"]
+        entrypoint=["/opt/code-interpreter/code-interpreter.sh"]
     )
 
-    async with sandbox:
+    try:
         interpreter = await CodeInterpreter.create(sandbox=sandbox)
 
-        # Python example: show runtime info and return a simple calculation.
         py_exec = await interpreter.codes.run(
             "import platform\n"
             "print('Hello from Python!')\n"
@@ -59,7 +58,6 @@ async def main() -> None:
             for res in py_exec.result:
                 print(f"[Python result] {res.text}")
 
-        # Java example: print to stdout and return the final result line.
         java_exec = await interpreter.codes.run(
             "System.out.println(\"Hello from Java!\");\n"
             "int result = 2 + 3;\n"
@@ -76,7 +74,6 @@ async def main() -> None:
         if java_exec.error:
             print(f"[Java error] {java_exec.error.name}: {java_exec.error.value}")
 
-        # Go example: print logs and demonstrate a main function structure.
         go_exec = await interpreter.codes.run(
             "package main\n"
             "import \"fmt\"\n"
@@ -93,7 +90,6 @@ async def main() -> None:
         if go_exec.error:
             print(f"[Go error] {go_exec.error.name}: {go_exec.error.value}")
 
-        # TypeScript example: use typing and sum an array.
         ts_exec = await interpreter.codes.run(
             "console.log('Hello from TypeScript!');\n"
             "const nums: number[] = [1, 2, 3];\n"
@@ -106,7 +102,8 @@ async def main() -> None:
         if ts_exec.error:
             print(f"[TypeScript error] {ts_exec.error.name}: {ts_exec.error.value}")
 
-        await sandbox.kill()
+    finally:
+        await sandbox.destroy()
 
 
 if __name__ == "__main__":

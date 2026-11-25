@@ -1,0 +1,345 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { CodeInterpreter } from "../dist/index.js";
+import { SandboxReadyTimeoutException } from "../../../sandbox/javascript/dist/index.js";
+
+function fakeSandbox(commandResult) {
+  const commands = {
+    calls: [],
+    async run(command) {
+      commands.calls.push(command);
+      if (typeof commandResult === "function") {
+        return commandResult(commands.calls.length);
+      }
+      return commandResult ?? { error: null, exitCode: 0 };
+    },
+  };
+  return {
+    sandbox: {
+      id: "sandbox-id",
+      connectionConfig: {
+        protocol: "http",
+      },
+      commands,
+      async getEndpoint(port) {
+        return { endpoint: "sandbox.internal:3456", headers: {} };
+      },
+    },
+    commands,
+  };
+}
+
+test("CodeInterpreter.create passes the strict health check once the runtime port is listening", async () => {
+  let pingAttempts = 0;
+  const codes = {
+    async ping() {
+      pingAttempts += 1;
+      return true;
+    },
+  };
+  const adapterFactory = { createCodes: () => codes };
+  const { sandbox, commands } = fakeSandbox((attempt) =>
+    attempt >= 2 ? { error: null, exitCode: 0 } : { error: { name: "CommandExecError" } },
+  );
+
+  const interpreter = await CodeInterpreter.create(sandbox, {
+    adapterFactory,
+    readyTimeoutSeconds: 5,
+    healthCheckPollingInterval: 10,
+  });
+
+  assert.equal(pingAttempts, 2);
+  assert.equal(commands.calls.length, 2);
+  assert.ok(commands.calls[0].includes("/dev/tcp/127.0.0.1/"));
+  assert.ok(commands.calls[0].includes("${JUPYTER_PORT:-44771}"));
+  assert.equal(await interpreter.isHealthy(), true);
+});
+
+test("CodeInterpreter.create falls back to a direct execd ping when codes.ping is absent", async () => {
+  const codes = {}; // custom adapter without the optional ping capability
+  const adapterFactory = { createCodes: () => codes };
+  const recorded = [];
+  const base = fakeSandbox();
+  const sandbox = {
+    ...base.sandbox,
+    connectionConfig: {
+      protocol: "http",
+      fetch: async (input) => {
+        recorded.push(input instanceof Request ? input.url : String(input));
+        return new Response("ok", { status: 200 });
+      },
+    },
+  };
+
+  const interpreter = await CodeInterpreter.create(sandbox, {
+    adapterFactory,
+    readyTimeoutSeconds: 5,
+    healthCheckPollingInterval: 10,
+  });
+
+  assert.equal(await interpreter.isHealthy(), true);
+  assert.equal(recorded.length >= 1, true);
+  assert.match(recorded[0], /\/ping$/);
+});
+
+test("the fallback execd ping sends the same data-plane headers as the codes adapter", async () => {
+  const codes = {}; // custom adapter without the optional ping capability
+  const adapterFactory = { createCodes: () => codes };
+  const seen = [];
+  const base = fakeSandbox();
+  const sandbox = {
+    ...base.sandbox,
+    connectionConfig: {
+      protocol: "http",
+      useServerProxy: true,
+      apiKey: "tenant-key",
+      headers: { "X-Custom": "from-config" },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        seen.push(request.headers);
+        return new Response("ok", { status: 200 });
+      },
+    },
+    async getEndpoint() {
+      return { endpoint: "server.internal/sandboxes/sandbox-id/proxy/44772", headers: { "X-Route": "r1" } };
+    },
+  };
+
+  await CodeInterpreter.create(sandbox, {
+    adapterFactory,
+    readyTimeoutSeconds: 5,
+    healthCheckPollingInterval: 10,
+  });
+
+  assert.ok(seen.length >= 1);
+  assert.equal(seen[0].get("X-Custom"), "from-config");
+  assert.equal(seen[0].get("X-Route"), "r1");
+  assert.equal(seen[0].get("OPEN-SANDBOX-API-KEY"), "tenant-key");
+});
+
+test("the fallback execd ping keeps the API key off direct requests", async () => {
+  const codes = {}; // custom adapter without the optional ping capability
+  const adapterFactory = { createCodes: () => codes };
+  const seen = [];
+  const base = fakeSandbox();
+  const sandbox = {
+    ...base.sandbox,
+    connectionConfig: {
+      protocol: "http",
+      useServerProxy: false,
+      apiKey: "tenant-key",
+      headers: { "X-Custom": "from-config", "OPEN-SANDBOX-API-KEY": "tenant-key" },
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        seen.push(request.headers);
+        return new Response("ok", { status: 200 });
+      },
+    },
+  };
+
+  await CodeInterpreter.create(sandbox, {
+    adapterFactory,
+    readyTimeoutSeconds: 5,
+    healthCheckPollingInterval: 10,
+  });
+
+  assert.ok(seen.length >= 1);
+  assert.equal(seen[0].get("X-Custom"), "from-config");
+  assert.equal(seen[0].get("OPEN-SANDBOX-API-KEY"), null);
+});
+
+test("CodeInterpreter.create throws when execd never answers", async () => {
+  const codes = {
+    async ping() {
+      return false;
+    },
+  };
+  const adapterFactory = { createCodes: () => codes };
+  const { sandbox, commands } = fakeSandbox();
+
+  await assert.rejects(
+    CodeInterpreter.create(sandbox, {
+      adapterFactory,
+      readyTimeoutSeconds: 0.05,
+      healthCheckPollingInterval: 10,
+    }),
+    SandboxReadyTimeoutException,
+  );
+  // The runtime-process leg must not run when the daemon ping fails.
+  assert.equal(commands.calls.length, 0);
+});
+
+test("CodeInterpreter.create times out when a probe never settles", async () => {
+  let probeSignal;
+  const codes = {
+    // Never settles and ignores its signal, like a stalled custom adapter.
+    ping(signal) {
+      probeSignal = signal;
+      return new Promise(() => {});
+    },
+  };
+  const adapterFactory = { createCodes: () => codes };
+  const { sandbox } = fakeSandbox();
+  const started = Date.now();
+  let guard;
+
+  await assert.rejects(
+    Promise.race([
+      CodeInterpreter.create(sandbox, {
+        adapterFactory,
+        readyTimeoutSeconds: 0.2,
+        healthCheckPollingInterval: 10,
+      }),
+      new Promise((_, reject) => {
+        guard = setTimeout(() => reject(new Error("create() outlived readyTimeoutSeconds")), 5000);
+      }),
+    ]),
+    SandboxReadyTimeoutException,
+  );
+  clearTimeout(guard);
+  assert.ok(Date.now() - started < 2000);
+  // The stalled probe's requests are aborted rather than left running.
+  assert.equal(probeSignal?.aborted, true);
+});
+
+test("CodeInterpreter.create stops on a caller abort while a probe never settles", async () => {
+  const codes = {
+    // Never settles and ignores its signal, like a stalled custom adapter.
+    ping() {
+      return new Promise(() => {});
+    },
+  };
+  const adapterFactory = { createCodes: () => codes };
+  const { sandbox } = fakeSandbox();
+  const controller = new AbortController();
+  const reason = new Error("caller gave up");
+  setTimeout(() => controller.abort(reason), 50);
+  let guard;
+
+  await assert.rejects(
+    Promise.race([
+      CodeInterpreter.create(sandbox, {
+        adapterFactory,
+        readyTimeoutSeconds: 30,
+        healthCheckPollingInterval: 10,
+        signal: controller.signal,
+      }),
+      new Promise((_, reject) => {
+        guard = setTimeout(() => reject(new Error("create() ignored the caller's abort")), 5000);
+      }),
+    ]),
+    (err) => err === reason,
+  );
+  clearTimeout(guard);
+});
+
+test("CodeInterpreter.create throws when the runtime port never listens", async () => {
+  const codes = {
+    async ping() {
+      return true;
+    },
+  };
+  const adapterFactory = { createCodes: () => codes };
+  const { sandbox } = fakeSandbox({ error: { name: "CommandExecError" } });
+
+  await assert.rejects(
+    CodeInterpreter.create(sandbox, {
+      adapterFactory,
+      readyTimeoutSeconds: 0.05,
+      healthCheckPollingInterval: 10,
+    }),
+    SandboxReadyTimeoutException,
+  );
+});
+
+test("CodeInterpreter.create does not treat an unconfirmed runtime check as healthy", async () => {
+  // A stream that ends without an error or completion event leaves the exit
+  // code unknown; that does not prove the runtime port is open.
+  const codes = {
+    async ping() {
+      return true;
+    },
+  };
+  const adapterFactory = { createCodes: () => codes };
+  const { sandbox } = fakeSandbox({ error: null, exitCode: undefined });
+
+  await assert.rejects(
+    CodeInterpreter.create(sandbox, {
+      adapterFactory,
+      readyTimeoutSeconds: 0.05,
+      healthCheckPollingInterval: 10,
+    }),
+    SandboxReadyTimeoutException,
+  );
+});
+
+test("CodeInterpreter.create treats ping errors as unhealthy and keeps polling", async () => {
+  let attempts = 0;
+  const codes = {
+    async ping() {
+      attempts += 1;
+      if (attempts < 2) {
+        throw new Error("connection refused");
+      }
+      return true;
+    },
+  };
+  const adapterFactory = { createCodes: () => codes };
+  const { sandbox } = fakeSandbox();
+
+  await CodeInterpreter.create(sandbox, {
+    adapterFactory,
+    readyTimeoutSeconds: 5,
+    healthCheckPollingInterval: 10,
+  });
+
+  assert.equal(attempts, 2);
+});
+
+test("CodeInterpreter.create skips the health check when skipHealthCheck is set", async () => {
+  const codes = {
+    async ping() {
+      throw new Error("ping must not be called when skipHealthCheck is set");
+    },
+  };
+  const adapterFactory = { createCodes: () => codes };
+  const { sandbox, commands } = fakeSandbox({ error: null });
+
+  const interpreter = await CodeInterpreter.create(sandbox, {
+    adapterFactory,
+    skipHealthCheck: true,
+  });
+
+  assert.equal(interpreter.id, "sandbox-id");
+  assert.equal(commands.calls.length, 0);
+});
+
+test("CodeInterpreter.isHealthy is false when execd answers ping with an empty error response", async () => {
+  // No codes.ping, so isHealthy falls back to probing execd directly.
+  const adapterFactory = { createCodes: () => ({}) };
+  const { sandbox } = fakeSandbox();
+  sandbox.connectionConfig.fetch = async () =>
+    new Response(null, { status: 503, headers: { "Content-Length": "0" } });
+
+  const interpreter = await CodeInterpreter.create(sandbox, {
+    adapterFactory,
+    skipHealthCheck: true,
+  });
+
+  assert.equal(await interpreter.isHealthy(), false);
+});

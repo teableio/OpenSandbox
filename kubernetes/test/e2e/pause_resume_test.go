@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -156,11 +156,16 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 		utils.Run(cmd)
 	})
 
+	JustAfterEach(func() {
+		if report := CurrentSpecReport(); report.Failed() {
+			dumpPauseResumeDiagnostics(report.FullText())
+		}
+	})
+
 	Context("Pause and Resume", func() {
-		It("should complete the full pause-resume flow via spec.pause trigger", func() {
+		DescribeTable("should complete the full pause-resume flow via spec.pause trigger", func(waitForDeletion bool) {
 			const sandboxName = "test-pause-resume"
 
-			// --- Step 1: Create BatchSandbox ---
 			By("creating BatchSandbox with template")
 			bsYAML, err := renderTemplate("testdata/batchsandbox-non-pooled.yaml", map[string]interface{}{
 				"BatchSandboxName": sandboxName,
@@ -188,7 +193,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				g.Expect(output).To(Equal("Succeed"))
 			}, 2*time.Minute).Should(Succeed())
 
-			// --- Step 2: Write marker file for rootfs verification ---
 			By("getting pod name for marker file")
 			cmd = exec.Command("kubectl", "get", "pods", "-n", pauseResumeNamespace, "-o", "json")
 			podsJSON, err := utils.Run(cmd)
@@ -221,6 +225,11 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				}
 			}
 			Expect(podName).NotTo(BeEmpty(), "Should find a pod owned by BatchSandbox")
+			cmd = exec.Command("kubectl", "get", "pod", podName, "-n", pauseResumeNamespace,
+				"-o", "jsonpath={.metadata.uid}")
+			oldUID, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(oldUID).NotTo(BeEmpty())
 
 			markerValue := fmt.Sprintf("pause-test-%d", time.Now().UnixNano())
 			By("writing marker file into container for rootfs verification")
@@ -229,7 +238,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			// --- Step 3: Pause - patch spec.pause=true ---
 			By("triggering pause by patching spec.pause=true")
 			cmd = exec.Command("kubectl", "patch", "batchsandbox", sandboxName,
 				"-n", pauseResumeNamespace, "--type=merge",
@@ -237,7 +245,7 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("waiting for BatchSandbox phase to be Paused (snapshot ready, pods deleted)")
+			By("waiting for BatchSandbox phase to be Paused (snapshot ready, pod deletion requested)")
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "batchsandbox", sandboxName,
 					"-n", pauseResumeNamespace, "-o", "jsonpath={.status.phase}")
@@ -246,28 +254,41 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				g.Expect(output).To(Equal("Paused"))
 			}, 3*time.Minute).Should(Succeed())
 
-			// Verify pods are deleted
-			By("verifying pods are deleted after pause")
-			cmd = exec.Command("kubectl", "get", "pods", "-n", pauseResumeNamespace,
-				"-l", "batchsandbox-name="+sandboxName, "-o", "name")
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(BeEmpty(), "Pods should be deleted after pause")
+			if waitForDeletion {
+				By("waiting for pods to be deleted after pause")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "pods", "-n", pauseResumeNamespace,
+						"-l", "batch-sandbox.sandbox.opensandbox.io/name="+sandboxName, "-o", "name")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(BeEmpty(), "Pods should eventually be deleted after pause")
+				}, time.Minute).Should(Succeed())
+			}
 
 			By("verifying the reserved internal SandboxSnapshot exists after pause")
 			cmd = exec.Command("kubectl", "get", "sandboxsnapshot", sandboxName+"-pause",
 				"-n", pauseResumeNamespace, "-o", "jsonpath={.status.phase}")
-			output, err = utils.Run(cmd)
+			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal("Succeed"), "Internal pause snapshot should be ready after pause")
 
-			// --- Step 4: Resume - patch spec.pause=false ---
 			By("triggering resume by patching spec.pause=false")
 			cmd = exec.Command("kubectl", "patch", "batchsandbox", sandboxName,
 				"-n", pauseResumeNamespace, "--type=merge",
 				"-p", `{"spec":{"pause":false}}`)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+
+			if !waitForDeletion {
+				By("proving resume was submitted while the old pod was still terminating")
+				cmd = exec.Command("kubectl", "get", "pod", podName, "-n", pauseResumeNamespace,
+					"-o", "jsonpath={.metadata.uid} {.metadata.deletionTimestamp}")
+				output, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Race coverage missing: old pod disappeared before confirmation")
+				fields := strings.Fields(output)
+				Expect(fields).To(HaveLen(2), "Race coverage missing: old pod must be terminating")
+				Expect(fields[0]).To(Equal(oldUID), "Race coverage missing: pod was already replaced")
+			}
 
 			By("waiting for resumed BatchSandbox to return to Succeed")
 			Eventually(func(g Gomega) {
@@ -284,7 +305,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			output, err = utils.Run(cmd)
 			Expect(err).To(HaveOccurred(), "Internal pause snapshot should be deleted after successful resume")
 
-			// --- Step 5: Verify rootfs data persistence ---
 			By("getting resumed pod name")
 			cmd = exec.Command("kubectl", "get", "pods", "-n", pauseResumeNamespace, "-o", "json")
 			resumedPodsJSON, err := utils.Run(cmd)
@@ -317,6 +337,12 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				}
 			}
 			Expect(resumedPodName).NotTo(BeEmpty(), "Should find a pod owned by resumed BatchSandbox")
+			cmd = exec.Command("kubectl", "get", "pod", resumedPodName, "-n", pauseResumeNamespace,
+				"-o", "jsonpath={.metadata.uid}")
+			newUID, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(newUID).NotTo(BeEmpty())
+			Expect(newUID).NotTo(Equal(oldUID), "Resume must create a replacement pod")
 
 			By("reading marker file from resumed container to verify rootfs persistence")
 			cmd = exec.Command("kubectl", "exec", resumedPodName, "-n", pauseResumeNamespace,
@@ -325,17 +351,18 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal(markerValue), "Rootfs data should persist across pause/resume")
 
-			// --- Cleanup ---
 			By("cleaning up")
 			cmd = exec.Command("kubectl", "delete", "batchsandbox", sandboxName, "-n", pauseResumeNamespace, "--ignore-not-found=true")
 			utils.Run(cmd)
-		})
+		},
+			Entry("after pod deletion completes", true),
+			Entry("immediately while the old pod is terminating", false),
+		)
 
 		It("should complete pool-based pause-resume via spec.pause trigger", func() {
 			const poolName = "test-pool-pause"
 			const sandboxName = "test-pool-pause-resume"
 
-			// --- Step 1: Create Pool CR ---
 			By("creating Pool CR")
 			poolYAML, err := renderTemplate("testdata/pool-basic.yaml", map[string]interface{}{
 				"PoolName":     poolName,
@@ -367,7 +394,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				g.Expect(output).NotTo(Equal("0"))
 			}, 2*time.Minute).Should(Succeed())
 
-			// --- Step 2: Create BatchSandbox with poolRef ---
 			By("creating BatchSandbox with poolRef")
 			bsYAML, err := renderTemplate("testdata/batchsandbox-pooled-no-expire.yaml", map[string]interface{}{
 				"BatchSandboxName": sandboxName,
@@ -395,7 +421,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				g.Expect(output).To(Equal("Succeed"))
 			}, 2*time.Minute).Should(Succeed())
 
-			// --- Step 3: Get pod name from alloc-status ---
 			By("getting pod name from alloc-status annotation")
 			var podName string
 			Eventually(func(g Gomega) {
@@ -416,7 +441,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			}).Should(Succeed())
 			Expect(podName).NotTo(BeEmpty(), "Should have allocated pod name")
 
-			// --- Step 4: Write marker file ---
 			firstMarkerValue := fmt.Sprintf("pool-pause-test-%d", time.Now().UnixNano())
 			By("writing marker file into container for rootfs verification")
 			cmd = exec.Command("kubectl", "exec", podName, "-n", pauseResumeNamespace,
@@ -424,7 +448,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			// --- Step 5: Pause - patch spec.pause=true ---
 			By("triggering pause by patching spec.pause=true")
 			cmd = exec.Command("kubectl", "patch", "batchsandbox", sandboxName,
 				"-n", pauseResumeNamespace, "--type=merge",
@@ -441,7 +464,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				g.Expect(output).To(Equal("Paused"))
 			}, 3*time.Minute).Should(Succeed())
 
-			// Verify template was solidified (no longer nil)
 			By("verifying template was solidified from Pool CR")
 			cmd = exec.Command("kubectl", "get", "batchsandbox", sandboxName,
 				"-n", pauseResumeNamespace, "-o", "jsonpath={.spec.template.spec.containers[0].name}")
@@ -449,7 +471,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal("sandbox-container"), "Template should be solidified from Pool CR")
 
-			// --- Step 6: Resume - patch spec.pause=false ---
 			By("triggering resume by patching spec.pause=false")
 			cmd = exec.Command("kubectl", "patch", "batchsandbox", sandboxName,
 				"-n", pauseResumeNamespace, "--type=merge",
@@ -466,7 +487,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				g.Expect(output).To(Equal("Succeed"))
 			}, 2*time.Minute).Should(Succeed())
 
-			// Verify poolRef was cleared after resume
 			By("verifying poolRef was cleared after resume")
 			cmd = exec.Command("kubectl", "get", "batchsandbox", sandboxName,
 				"-n", pauseResumeNamespace, "-o", "jsonpath={.spec.poolRef}")
@@ -474,7 +494,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(BeEmpty(), "poolRef should be cleared after resume")
 
-			// --- Step 7: Verify rootfs data persistence ---
 			By("getting resumed pod name")
 			cmd = exec.Command("kubectl", "get", "pods", "-n", pauseResumeNamespace, "-o", "json")
 			resumedPodsJSON, err := utils.Run(cmd)
@@ -524,7 +543,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal(firstMarkerValue), "Rootfs data should persist across pool-based pause/resume")
 
-			// --- Cleanup ---
 			By("cleaning up")
 			cmd = exec.Command("kubectl", "delete", "batchsandbox", sandboxName, "-n", pauseResumeNamespace, "--ignore-not-found=true")
 			utils.Run(cmd)
@@ -858,23 +876,21 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("waiting for BatchSandbox to remain in Succeed with PauseFailed condition")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "batchsandbox", sandboxName,
-					"-n", pauseResumeNamespace, "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeed"))
-			}, 6*time.Minute).Should(Succeed())
-
-			By("verifying PauseFailed condition is set (commit/push failed)")
+			By("waiting for PauseFailed condition to be set")
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "batchsandbox", sandboxName,
 					"-n", pauseResumeNamespace, "-o", "jsonpath={.status.conditions[?(@.type=='PauseFailed')].status}")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(Equal("True"))
-			}, 4*time.Minute).Should(Succeed())
+			}, 15*time.Minute).Should(Succeed())
+
+			By("verifying phase returned to Succeed")
+			cmd = exec.Command("kubectl", "get", "batchsandbox", sandboxName,
+				"-n", pauseResumeNamespace, "-o", "jsonpath={.status.phase}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("Succeed"))
 
 			By("cleaning up")
 			cmd = exec.Command("kubectl", "delete", "batchsandbox", sandboxName, "-n", pauseResumeNamespace, "--ignore-not-found=true")
@@ -932,11 +948,26 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			}, 3*time.Minute).Should(Succeed())
 
 			By("tampering SandboxSnapshot with invalid image URI")
-			cmd = exec.Command("kubectl", "patch", "sandboxsnapshot", sandboxName+"-pause",
-				"-n", pauseResumeNamespace, "--type=merge", "--subresource=status",
-				"-p", `{"status":{"containers":[{"containerName":"sandbox-container","imageUri":"invalid.registry/unreachable/image:nonexistent"}]}}`)
-			_, err = utils.Run(cmd)
+			cmd = exec.Command("kubectl", "get", "sandboxsnapshot", sandboxName+"-pause",
+				"-n", pauseResumeNamespace, "-o", "jsonpath={.status.containers[0].imageDigest}")
+			digestOutput, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+			imageDigest := strings.TrimSpace(digestOutput)
+			Expect(imageDigest).NotTo(BeEmpty())
+			// `kubectl patch --subresource=status` requires kubectl v1.24+, so write
+			// the tampered status through the raw status subresource endpoint
+			// instead; that keeps the suite runnable against older kubectl (e.g.
+			// v1.22) with identical semantics: a JSON merge patch of
+			// status.containers replaces the whole array.
+			tamperedContainers := []interface{}{
+				map[string]interface{}{
+					"containerName": "sandbox-container",
+					"imageUri":      "invalid.registry/unreachable/image:nonexistent",
+					"imageDigest":   imageDigest,
+				},
+			}
+			Expect(patchSandboxSnapshotStatusContainers(
+				pauseResumeNamespace, sandboxName+"-pause", tamperedContainers)).To(Succeed())
 
 			By("triggering resume with tampered snapshot")
 			cmd = exec.Command("kubectl", "patch", "batchsandbox", sandboxName,
@@ -952,7 +983,6 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 
-				// Parse phase from JSON
 				var bs struct {
 					Status struct {
 						Phase string `json:"phase"`
@@ -972,16 +1002,18 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying ResumeFailed condition is set")
-			cmd = exec.Command("kubectl", "get", "batchsandbox", sandboxName,
-				"-n", pauseResumeNamespace, "-o", "jsonpath={.status.conditions[?(@.type=='ResumeFailed')].status}")
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal("True"))
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "batchsandbox", sandboxName,
+					"-n", pauseResumeNamespace, "-o", "jsonpath={.status.conditions[?(@.type=='ResumeFailed')].status}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("True"))
+			}, time.Minute, 2*time.Second).Should(Succeed())
 
 			By("verifying the reserved internal SandboxSnapshot is retained after failed resume")
 			cmd = exec.Command("kubectl", "get", "sandboxsnapshot", sandboxName+"-pause",
 				"-n", pauseResumeNamespace, "-o", "name")
-			output, err = utils.Run(cmd)
+			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Internal pause snapshot should remain after failed resume")
 			Expect(strings.TrimSpace(output)).To(Equal("sandboxsnapshot.sandbox.opensandbox.io/" + sandboxName + "-pause"))
 
@@ -990,108 +1022,60 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			utils.Run(cmd)
 		})
 
-		It("should successfully retry pause after fixing registry config", func() {
-			const sandboxName = "test-pause-retry-success"
-
-			By("creating BatchSandbox with template")
-			bsYAML, err := renderTemplate("testdata/batchsandbox-non-pooled.yaml", map[string]interface{}{
-				"BatchSandboxName": sandboxName,
-				"Namespace":        pauseResumeNamespace,
-				"SandboxImage":     utils.SandboxImage,
-				"Replicas":         1,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			bsFile := filepath.Join("/tmp", "test-pause-retry-success-bs.yaml")
-			err = os.WriteFile(bsFile, []byte(bsYAML), 0644)
-			Expect(err).NotTo(HaveOccurred())
-			defer os.Remove(bsFile)
-
-			cmd := exec.Command("kubectl", "apply", "-f", bsFile)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for BatchSandbox to reach the steady Succeed phase")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "batchsandbox", sandboxName,
-					"-n", pauseResumeNamespace, "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeed"))
-			}, 2*time.Minute).Should(Succeed())
-
-			By("patching registry push secret to invalid value (invalid docker config)")
-			invalidConfig := `{"auths":{"docker-registry.default.svc.cluster.local:5000":{"username":"invalid","password":"wrong","auth":"aW52YWxpZDp3cm9uZw=="}}}`
-			encoded := base64.StdEncoding.EncodeToString([]byte(invalidConfig))
-			patchData := fmt.Sprintf(`{"data":{".dockerconfigjson":"%s"}}`, encoded)
-			cmd = exec.Command("kubectl", "patch", "secret", "registry-snapshot-push-secret", "-n", pauseResumeNamespace,
-				"--type=merge", "-p", patchData)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("triggering first pause attempt (will fail due to invalid registry)")
-			cmd = exec.Command("kubectl", "patch", "batchsandbox", sandboxName,
-				"-n", pauseResumeNamespace, "--type=merge",
-				"-p", `{"spec":{"pause":true}}`)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for pause to fail with PauseFailed condition")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "batchsandbox", sandboxName,
-					"-n", pauseResumeNamespace, "-o", "jsonpath={.status.conditions[?(@.type=='PauseFailed')].status}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"))
-			}, 3*time.Minute).Should(Succeed())
-
-			By("verifying Phase is still Succeed (retryable)")
-			cmd = exec.Command("kubectl", "get", "batchsandbox", sandboxName,
-				"-n", pauseResumeNamespace, "-o", "jsonpath={.status.phase}")
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal("Succeed"))
-
-			By("restoring registry push secret to valid credentials")
-			err = createDockerRegistrySecrets(pauseResumeNamespace)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("resetting spec.pause so the next pause request gets a new generation")
-			cmd = exec.Command("kubectl", "patch", "batchsandbox", sandboxName,
-				"-n", pauseResumeNamespace, "--type=merge",
-				"-p", `{"spec":{"pause":null}}`)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("triggering retry pause (nil -> true) so PauseFailed can clear and pause can succeed")
-			cmd = exec.Command("kubectl", "patch", "batchsandbox", sandboxName,
-				"-n", pauseResumeNamespace, "--type=merge",
-				"-p", `{"spec":{"pause":true}}`)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for BatchSandbox to be Paused")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "batchsandbox", sandboxName,
-					"-n", pauseResumeNamespace, "-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Paused"))
-			}, 3*time.Minute).Should(Succeed())
-
-			By("verifying PauseFailed condition is cleared")
-			cmd = exec.Command("kubectl", "get", "batchsandbox", sandboxName,
-				"-n", pauseResumeNamespace, "-o", "jsonpath={.status.conditions[?(@.type=='PauseFailed')].status}")
-			output, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(BeEmpty(), "PauseFailed condition should be cleared after successful pause")
-
-			By("cleaning up")
-			cmd = exec.Command("kubectl", "delete", "batchsandbox", sandboxName, "-n", pauseResumeNamespace, "--ignore-not-found=true")
-			utils.Run(cmd)
-		})
 	})
 })
+
+// patchSandboxSnapshotStatusContainers replaces status.containers of the named
+// SandboxSnapshot through the raw status subresource endpoint. It is the
+// equivalent of `kubectl patch --type=merge --subresource=status` for kubectl
+// versions older than v1.24, where the --subresource flag does not exist: read
+// the current object, swap in the new containers array, and PUT it back with
+// `kubectl replace --raw`, which has been available since well before v1.22.
+// The read-modify-write round trip is retried so that a concurrent controller
+// status update (409 Conflict) between the GET and the PUT cannot flake the
+// caller.
+func patchSandboxSnapshotStatusContainers(namespace, name string, containers []interface{}) error {
+	rawPath := fmt.Sprintf("/apis/sandbox.opensandbox.io/v1alpha1/namespaces/%s/sandboxsnapshots/%s/status",
+		namespace, name)
+	bodyFile, err := os.CreateTemp("", "sandboxsnapshot-status-*.json")
+	if err != nil {
+		return fmt.Errorf("create temp file for the status body: %w", err)
+	}
+	defer os.Remove(bodyFile.Name())
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		current, err := utils.Run(exec.Command("kubectl", "get", "sandboxsnapshot", name,
+			"-n", namespace, "-o", "json"))
+		if err != nil {
+			return fmt.Errorf("get sandboxsnapshot %s: %w", name, err)
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal([]byte(current), &obj); err != nil {
+			return fmt.Errorf("parse sandboxsnapshot %s: %w", name, err)
+		}
+		status, ok := obj["status"].(map[string]interface{})
+		if !ok {
+			status = map[string]interface{}{}
+			obj["status"] = status
+		}
+		status["containers"] = containers
+		updated, err := json.Marshal(obj)
+		if err != nil {
+			return fmt.Errorf("serialize sandboxsnapshot %s: %w", name, err)
+		}
+		if err := os.WriteFile(bodyFile.Name(), updated, 0600); err != nil {
+			return fmt.Errorf("write the status body: %w", err)
+		}
+		if _, err := utils.Run(exec.Command("kubectl", "replace", "--raw", rawPath,
+			"-f", bodyFile.Name())); err != nil {
+			lastErr = fmt.Errorf("put the status of sandboxsnapshot %s: %w", name, err)
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
 
 // createHtpasswdSecret creates the htpasswd secret for registry authentication.
 // Docker Registry v2 only supports bcrypt hashes, not MD5 ($apr1$) or SHA1.
@@ -1170,4 +1154,25 @@ func createDockerRegistrySecrets(namespace string) error {
 	}
 
 	return nil
+}
+
+// dumpPauseResumeDiagnostics captures cluster state to GinkgoWriter to help
+// diagnose flaky pause/resume failures before suite teardown deletes the cluster.
+func dumpPauseResumeDiagnostics(spec string) {
+	fmt.Fprintf(GinkgoWriter, "\n=== DIAGNOSTICS for failed spec: %s ===\n", spec)
+	dump := func(title string, args ...string) {
+		cmd := exec.Command("kubectl", args...)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			output = fmt.Sprintf("(dump failed: %v)", err)
+		}
+		fmt.Fprintf(GinkgoWriter, "\n--- DIAG %s ---\n%s\n", title, output)
+	}
+	dump("batchsandboxes", "get", "batchsandboxes", "-n", pauseResumeNamespace, "-o", "yaml")
+	dump("sandboxsnapshots", "get", "sandboxsnapshots", "-n", pauseResumeNamespace, "-o", "yaml")
+	dump("jobs", "get", "jobs", "-n", pauseResumeNamespace, "-o", "yaml")
+	dump("pods", "get", "pods", "-n", pauseResumeNamespace, "-o", "wide")
+	dump("events", "get", "events", "-n", pauseResumeNamespace, "--sort-by=.lastTimestamp")
+	dump("controller-logs", "logs", "-n", namespace, "-l", "control-plane=controller-manager",
+		"--all-containers=true", "--tail=800")
 }

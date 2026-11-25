@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,15 +62,41 @@ func waitMitmCACertPath(confDirEnv, home string) (string, error) {
 	return "", fmt.Errorf("mitmproxy CA not found after %v (tried: %v)", waitCACert, cands)
 }
 
+// PurgeStaleExportedCA must run before sidecar bootstrap can install a previous generation's CA; Fast Sandbox uses a pinned template CA instead.
+func PurgeStaleExportedCA() {
+	if !constants.IsTruthy(os.Getenv(constants.EnvMitmproxyTransparent)) {
+		return
+	}
+	purgeStaleExportedCAFrom(constants.OpenSandboxRootDir)
+}
+
+func purgeStaleExportedCAFrom(rootDir string) {
+	path := filepath.Join(rootDir, mitmCACertName)
+	err := os.Remove(path)
+	switch {
+	case err == nil:
+		log.Warnf("[mitmproxy] removed stale exported CA at %s (previous egress generation left it behind; see upstream issue #1370)", path)
+	case os.IsNotExist(err):
+	default:
+		// SyncRootCA can overwrite it, but bootstrap may read the stale copy first.
+		log.Warnf("[mitmproxy] failed to remove stale exported CA at %s: %v", path, err)
+	}
+}
+
 func SyncRootCA(confDirEnv, home string) error {
+	return exportRootCA(confDirEnv, home, constants.OpenSandboxRootDir)
+}
+
+// Sidecar-only: also install the exported CA in egress system trust for upstream validation.
+func exportRootCA(confDirEnv, home, rootDir string) error {
 	src, err := waitMitmCACertPath(confDirEnv, home)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(constants.OpenSandboxRootDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", constants.OpenSandboxRootDir, err)
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", rootDir, err)
 	}
-	dst := filepath.Join(constants.OpenSandboxRootDir, mitmCACertName)
+	dst := filepath.Join(rootDir, mitmCACertName)
 	if err := copyFile(src, dst, 0o644); err != nil {
 		return fmt.Errorf("copy mitm CA to %s: %w", dst, err)
 	}

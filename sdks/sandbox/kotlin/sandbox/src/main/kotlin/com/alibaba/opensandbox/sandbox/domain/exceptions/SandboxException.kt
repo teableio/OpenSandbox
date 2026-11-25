@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,56 +16,301 @@
 
 package com.alibaba.opensandbox.sandbox.domain.exceptions
 
+import java.time.Duration
+
 /**
  * Base exception class for all sandbox-related errors.
  *
  * Inherits from [RuntimeException] (Unchecked Exception) to avoid forcing
  * Java callers to implement verbose try-catch blocks while still allowing
  * specific error handling when needed.
+ *
+ * [isRetryable] reflects whether the SDK actually decided to retry this failure:
+ * budget exhaustion, deadline expiry, and caller cancellation all force it to
+ * `false` even for transient causes.
  */
 open class SandboxException(
     message: String? = null,
     cause: Throwable? = null,
     val error: SandboxError,
     val requestId: String? = null,
+    open val isRetryable: Boolean = false,
 ) : RuntimeException(message, cause) {
-    // Keep the old constructor signature for binary compatibility with already-compiled clients.
+    // Keep the old constructor signature for binary compatibility.
     constructor(
         message: String?,
         cause: Throwable?,
         error: SandboxError,
     ) : this(message = message, cause = cause, error = error, requestId = null)
+
+    override fun toString(): String {
+        val parts = mutableListOf(super.toString())
+        if (!error.message.isNullOrBlank()) {
+            parts += "[${error.code}] ${error.message}"
+        }
+        if (!requestId.isNullOrBlank()) {
+            parts += "request_id=$requestId"
+        }
+        return parts.joinToString(" | ")
+    }
 }
 
 /**
- * Thrown when the Sandbox API returns an error response (e.g., HTTP 4xx or 5xx) or meet unexpected error when calling api.
+ * Thrown when the Sandbox API returns an error response (e.g., HTTP 4xx or 5xx)
+ * or meets an unexpected error when calling the API.
+ *
+ * [responseBody] carries the raw response body from the server so callers can
+ * inspect payloads the SDK could not parse into a structured [SandboxError].
  */
-class SandboxApiException(
+open class SandboxApiException(
     message: String? = null,
     cause: Throwable? = null,
     val statusCode: Int? = null,
     error: SandboxError = SandboxError(SandboxError.UNEXPECTED_RESPONSE),
     requestId: String? = null,
-) : SandboxException(message, cause, error, requestId) {
-    // Keep the old constructor signature for binary compatibility with already-compiled clients.
+    val responseBody: String? = null,
+    isRetryable: Boolean = false,
+) : SandboxException(
+        message = message,
+        cause = cause,
+        error = error,
+        requestId = requestId,
+    ) {
+    @Suppress("LeakingThis")
+    override val isRetryable: Boolean = isRetryable
+
+    // Keep the old constructor signature for binary compatibility.
+    @Suppress("unused", "LongLine")
     constructor(
         message: String?,
         cause: Throwable?,
         statusCode: Int?,
         error: SandboxError,
-    ) : this(message = message, cause = cause, statusCode = statusCode, error = error, requestId = null)
+    ) : this(
+        message = message,
+        cause = cause,
+        statusCode = statusCode,
+        error = error,
+        requestId = null,
+        responseBody = null,
+        isRetryable = false,
+    )
+
+    // Keep the five-arg signature for binary compatibility.
+    @Suppress("unused", "LongLine")
+    constructor(
+        message: String?,
+        cause: Throwable?,
+        statusCode: Int?,
+        error: SandboxError,
+        requestId: String?,
+    ) : this(
+        message = message,
+        cause = cause,
+        statusCode = statusCode,
+        error = error,
+        requestId = requestId,
+        responseBody = null,
+        isRetryable = false,
+    )
 }
+
+/**
+ * Thrown when the API returns HTTP 429 (Too Many Requests).
+ *
+ * [retryAfter] carries the server-supplied `Retry-After` header value as a
+ * [Duration] when present, so fast-fail callers can still act on it.
+ */
+class SandboxRateLimitException
+    @JvmOverloads
+    constructor(
+        message: String? = null,
+        cause: Throwable? = null,
+        statusCode: Int? = 429,
+        error: SandboxError = SandboxError(SandboxError.RATE_LIMIT, message),
+        requestId: String? = null,
+        val retryAfter: Duration? = null,
+        responseBody: String? = null,
+        isRetryable: Boolean = false,
+    ) : SandboxApiException(
+            message = message,
+            cause = cause,
+            statusCode = statusCode,
+            error = error,
+            requestId = requestId,
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
+
+/**
+ * Thrown when the OSEP-0024 wake retry budget is exhausted.
+ *
+ * The gateway answered `503` with the `OpenSandbox-Wake: expired` marker on
+ * every attempt: the sandbox restore did not finish within the wake retry
+ * policy's budget. The request was never forwarded, so retrying later is
+ * safe — the server-side resume continues in the background regardless.
+ *
+ * [attempts] carries the number of marked wake-timeout responses received;
+ * [waited] carries the total wall-clock time spent across waits, retries, and
+ * request time.
+ */
+class SandboxWakeTimeoutException
+    @JvmOverloads
+    constructor(
+        message: String? = null,
+        cause: Throwable? = null,
+        val attempts: Int = 0,
+        val waited: Duration = Duration.ZERO,
+        error: SandboxError = SandboxError(SandboxError.WAKE_TIMEOUT, message),
+        requestId: String? = null,
+        responseBody: String? = null,
+    ) : SandboxApiException(
+            message = message,
+            cause = cause,
+            statusCode = 503,
+            error = error,
+            requestId = requestId,
+            responseBody = responseBody,
+            isRetryable = false,
+        )
+
+/**
+ * Thrown when the control plane reports that the target sandbox instance does not exist.
+ *
+ * Recognizes the bare `SANDBOX_NOT_FOUND` code as well as runtime-backend-prefixed variants
+ * (e.g. `DOCKER::SANDBOX_NOT_FOUND`, `KUBERNETES::SANDBOX_NOT_FOUND`). Detection is intentionally
+ * restricted to these explicit server error codes rather than a bare HTTP 404: a 404 whose body
+ * cannot be parsed into such a code stays a plain [SandboxApiException] with
+ * [SandboxError.UNEXPECTED_RESPONSE], because it may indicate an endpoint/routing/configuration
+ * regression that must remain loud. See [Throwable.isSandboxNotFound].
+ *
+ * Note that [Throwable.isSandboxNotFound] matches the [error] code, so a manually constructed
+ * instance carrying a different [SandboxError.code] does not satisfy the predicate even when
+ * `statusCode` is 404.
+ */
+class SandboxNotFoundException
+    @JvmOverloads
+    constructor(
+        message: String? = null,
+        cause: Throwable? = null,
+        statusCode: Int? = 404,
+        error: SandboxError = SandboxError(SandboxError.SANDBOX_NOT_FOUND, message),
+        requestId: String? = null,
+        responseBody: String? = null,
+        isRetryable: Boolean = false,
+    ) : SandboxApiException(
+            message = message,
+            cause = cause,
+            statusCode = statusCode,
+            error = error,
+            requestId = requestId,
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
+
+/**
+ * Thrown when a data-plane operation is rejected because the sandbox workspace is over its
+ * storage capacity (server responds with HTTP 507).
+ *
+ * Structured `code` values parsed from the response body are preserved on [error]; the
+ * [SandboxError.STORAGE_CAPACITY_EXCEEDED] constant is only used when the body carries no code.
+ */
+class SandboxCapacityExceededException
+    @JvmOverloads
+    constructor(
+        message: String? = null,
+        cause: Throwable? = null,
+        statusCode: Int? = 507,
+        error: SandboxError = SandboxError(SandboxError.STORAGE_CAPACITY_EXCEEDED, message),
+        requestId: String? = null,
+        responseBody: String? = null,
+        isRetryable: Boolean = false,
+    ) : SandboxApiException(
+            message = message,
+            cause = cause,
+            statusCode = statusCode,
+            error = error,
+            requestId = requestId,
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
+
+/**
+ * Thrown when the server proxy cannot connect to the selected sandbox backend for a proxied
+ * route (server responds with HTTP 502 and the [SandboxError.BACKEND_CONNECTION_FAILED] code).
+ *
+ * The code asserts only "the proxy could not reach *this* sandbox's backend", which data-plane
+ * health probes use to decide between replacing a broken instance and backing off during
+ * shared-infrastructure incidents. A 502 whose body carries no such code stays a plain
+ * [SandboxApiException] with [SandboxError.UNEXPECTED_RESPONSE] so proxy-wide failures are not
+ * silently downgraded and remain loud.
+ */
+class SandboxBackendUnreachableException
+    @JvmOverloads
+    constructor(
+        message: String? = null,
+        cause: Throwable? = null,
+        statusCode: Int? = 502,
+        error: SandboxError = SandboxError(SandboxError.BACKEND_CONNECTION_FAILED, message),
+        requestId: String? = null,
+        responseBody: String? = null,
+        isRetryable: Boolean = false,
+    ) : SandboxApiException(
+            message = message,
+            cause = cause,
+            statusCode = statusCode,
+            error = error,
+            requestId = requestId,
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
 
 /**
  * Thrown when an unexpected internal error occurs within the SDK
  */
-class SandboxInternalException(
+open class SandboxInternalException(
     message: String? = null,
     cause: Throwable? = null,
 ) : SandboxException(
         message = message,
         cause = cause,
         error = SandboxError(SandboxError.INTERNAL_UNKNOWN_ERROR),
+    ) {
+    @Suppress("LeakingThis")
+    open override val isRetryable: Boolean = false
+}
+
+/**
+ * Thrown when a per-attempt timeout or overall retry deadline fires.
+ *
+ * Distinct from [SandboxReadyTimeoutException], which is the health-poll timeout
+ * during sandbox startup.
+ */
+class SandboxTimeoutException(
+    message: String? = null,
+    cause: Throwable? = null,
+    isRetryable: Boolean = false,
+) : SandboxException(
+        message = message,
+        cause = cause,
+        error = SandboxError(SandboxError.TIMEOUT, message),
+        requestId = null,
+        isRetryable = isRetryable,
+    )
+
+/**
+ * Transport-layer failure: DNS, TCP connect, TLS, or connection reset.
+ */
+class SandboxConnectionException(
+    message: String? = null,
+    cause: Throwable? = null,
+    isRetryable: Boolean = false,
+) : SandboxException(
+        message = message,
+        cause = cause,
+        error = SandboxError(SandboxError.CONNECTION, message),
+        requestId = null,
+        isRetryable = isRetryable,
     )
 
 /**
@@ -90,6 +335,18 @@ class SandboxReadyTimeoutException(
         message = message,
         cause = cause,
         error = SandboxError(SandboxError.READY_TIMEOUT, message),
+    )
+
+/**
+ * Thrown when a snapshot reaches the `Failed` state while waiting for it to become ready.
+ */
+class SnapshotFailedException(
+    message: String? = null,
+    cause: Throwable? = null,
+) : SandboxException(
+        message = message,
+        cause = cause,
+        error = SandboxError(SandboxError.SNAPSHOT_FAILED, message),
     )
 
 /**
@@ -143,18 +400,6 @@ class PoolStateStoreUnavailableException(
     )
 
 /**
- * Thrown when atomic take or lock-update conflicts occur in the state store.
- */
-class PoolStateStoreContentionException(
-    message: String? = null,
-    cause: Throwable? = null,
-) : SandboxException(
-        message = message,
-        cause = cause,
-        error = SandboxError(SandboxError.POOL_STATE_STORE_CONTENTION, message),
-    )
-
-/**
  * Thrown when acquire is called while pool is not in RUNNING state.
  */
 class PoolNotRunningException(
@@ -167,6 +412,32 @@ class PoolNotRunningException(
     )
 
 /**
+ * Thrown when a pool namespace is being destroyed or has already been destroyed.
+ */
+class PoolDestroyedException(
+    message: String? = "Pool namespace is destroyed",
+    cause: Throwable? = null,
+) : SandboxException(
+        message = message,
+        cause = cause,
+        error = SandboxError(SandboxError.POOL_DESTROYED, message),
+    )
+
+/**
+ * Thrown when a pool destroy operation has started but did not complete. The pool namespace
+ * remains fenced in DESTROYING state so callers can retry destroy instead of silently resuming
+ * a partially-cleaned pool.
+ */
+class PoolDestroyIncompleteException(
+    message: String? = "Pool destroy did not complete",
+    cause: Throwable? = null,
+) : SandboxException(
+        message = message,
+        cause = cause,
+        error = SandboxError(SandboxError.POOL_DESTROY_INCOMPLETE, message),
+    )
+
+/**
  * Defines standardized common error codes and messages for the Sandbox SDK.
  */
 data class SandboxError(
@@ -175,13 +446,50 @@ data class SandboxError(
 ) {
     companion object {
         const val INTERNAL_UNKNOWN_ERROR = "INTERNAL_UNKNOWN_ERROR"
+        const val COMMAND_STREAM_INCOMPLETE = "COMMAND_STREAM_INCOMPLETE"
         const val READY_TIMEOUT = "READY_TIMEOUT"
         const val UNHEALTHY = "UNHEALTHY"
         const val INVALID_ARGUMENT = "INVALID_ARGUMENT"
         const val UNEXPECTED_RESPONSE = "UNEXPECTED_RESPONSE"
 
+        /** A per-attempt timeout or overall retry deadline fired. */
+        const val TIMEOUT = "TIMEOUT"
+
+        /** Transport-layer failure: DNS, TCP connect, TLS, or connection reset. */
+        const val CONNECTION = "CONNECTION"
+
+        /** The API returned HTTP 429 (Too Many Requests). */
+        const val RATE_LIMIT = "RATE_LIMIT"
+
+        /**
+         * The OSEP-0024 wake retry budget was exhausted: every attempt answered
+         * `503` with the `OpenSandbox-Wake: expired` marker and the sandbox
+         * restore did not finish in time. The request was never forwarded, so
+         * a later manual retry is safe.
+         */
+        const val WAKE_TIMEOUT = "WAKE_TIMEOUT"
+
+        /** A snapshot reached the `Failed` state while waiting for it to become ready. */
+        const val SNAPSHOT_FAILED = "SNAPSHOT_FAILED"
+
         /** The requested file or directory does not exist (server responds with HTTP 404). */
         const val FILE_NOT_FOUND = "FILE_NOT_FOUND"
+
+        /**
+         * The target sandbox instance does not exist on the runtime backend. Reported bare
+         * (`SANDBOX_NOT_FOUND`) or prefixed with the runtime backend (`DOCKER::SANDBOX_NOT_FOUND`,
+         * `KUBERNETES::SANDBOX_NOT_FOUND`, ...).
+         */
+        const val SANDBOX_NOT_FOUND = "SANDBOX_NOT_FOUND"
+
+        /** The sandbox workspace is over its storage capacity (server responds with HTTP 507). */
+        const val STORAGE_CAPACITY_EXCEEDED = "STORAGE_CAPACITY_EXCEEDED"
+
+        /**
+         * The server proxy could not connect to the selected sandbox backend for a proxied route
+         * (server responds with HTTP 502).
+         */
+        const val BACKEND_CONNECTION_FAILED = "BACKEND_CONNECTION_FAILED"
 
         /** Pool-specific: no idle sandbox and policy is FAIL_FAST. */
         const val POOL_EMPTY = "POOL_EMPTY"
@@ -192,10 +500,13 @@ data class SandboxError(
         /** Pool state store unavailable during operations. */
         const val POOL_STATE_STORE_UNAVAILABLE = "POOL_STATE_STORE_UNAVAILABLE"
 
-        /** Pool state store contention (atomic take or lock conflicts). */
-        const val POOL_STATE_STORE_CONTENTION = "POOL_STATE_STORE_CONTENTION"
-
         /** Pool is not in RUNNING state when acquire is requested. */
         const val POOL_NOT_RUNNING = "POOL_NOT_RUNNING"
+
+        /** Pool namespace is destroying or destroyed. */
+        const val POOL_DESTROYED = "POOL_DESTROYED"
+
+        /** Pool destroy started but did not complete. */
+        const val POOL_DESTROY_INCOMPLETE = "POOL_DESTROY_INCOMPLETE"
     }
 }

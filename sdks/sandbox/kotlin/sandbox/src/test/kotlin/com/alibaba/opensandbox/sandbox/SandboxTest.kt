@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,15 +17,19 @@
 package com.alibaba.opensandbox.sandbox
 
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
+import com.alibaba.opensandbox.sandbox.domain.exceptions.InvalidArgumentException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxReadyTimeoutException
 import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContent
+import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContext
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxMetrics
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxOrigin
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
 import com.alibaba.opensandbox.sandbox.domain.services.Commands
+import com.alibaba.opensandbox.sandbox.domain.services.CredentialVault
 import com.alibaba.opensandbox.sandbox.domain.services.Diagnostics
 import com.alibaba.opensandbox.sandbox.domain.services.Egress
 import com.alibaba.opensandbox.sandbox.domain.services.Filesystem
@@ -39,6 +43,7 @@ import io.mockk.junit5.MockKExtension
 import io.mockk.just
 import io.mockk.mockk
 import io.mockk.verify
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
@@ -70,6 +75,9 @@ class SandboxTest {
     lateinit var egressService: Egress
 
     @MockK
+    lateinit var credentialVaultService: CredentialVault
+
+    @MockK
     lateinit var diagnosticsService: Diagnostics
 
     @MockK
@@ -97,6 +105,8 @@ class SandboxTest {
                 healthService = healthService,
                 metricsService = metricsService,
                 egressService = egressService,
+                credentialVaultService = credentialVaultService,
+                isolatedService = mockk(),
                 customHealthCheck = null,
                 httpClientProvider = httpClientProvider,
                 diagnosticsService = diagnosticsService,
@@ -104,8 +114,22 @@ class SandboxTest {
     }
 
     @Test
+    fun `diagnostic context uses diagnostics service`() {
+        val id = sandboxId
+        val expected = mockk<DiagnosticContext>()
+        every { diagnosticsService.getContext(id) } returns expected
+        assertSame(expected, sandbox.getDiagnosticContext())
+        verify { diagnosticsService.getContext(id) }
+    }
+
+    @Test
     fun `files should return filesystem service`() {
         assertSame(fileSystemService, sandbox.files())
+    }
+
+    @Test
+    fun `filesWithIdentity rejects adapters without identity capability`() {
+        assertThrows(UnsupportedOperationException::class.java) { sandbox.filesWithIdentity(1, 2) }
     }
 
     @Test
@@ -116,6 +140,11 @@ class SandboxTest {
     @Test
     fun `metrics should return metrics service`() {
         assertSame(metricsService, sandbox.metrics())
+    }
+
+    @Test
+    fun `credentialVault should return credential vault service`() {
+        assertSame(credentialVaultService, sandbox.credentialVault())
     }
 
     @Test
@@ -244,19 +273,23 @@ class SandboxTest {
 
     @Test
     fun `pause should delegate to sandboxService`() {
+        every { sandboxService.invalidateEndpointCache(sandboxId) } just Runs
         every { sandboxService.pauseSandbox(sandboxId) } just Runs
 
         sandbox.pause()
 
+        verify { sandboxService.invalidateEndpointCache(sandboxId) }
         verify { sandboxService.pauseSandbox(sandboxId) }
     }
 
     @Test
     fun `kill should delegate to sandboxService`() {
+        every { sandboxService.invalidateEndpointCache(sandboxId) } just Runs
         every { sandboxService.killSandbox(sandboxId) } just Runs
 
         sandbox.kill()
 
+        verify { sandboxService.invalidateEndpointCache(sandboxId) }
         verify { sandboxService.killSandbox(sandboxId) }
     }
 
@@ -295,6 +328,43 @@ class SandboxTest {
     }
 
     @Test
+    fun `checkReady should propagate wrapped interruption and restore interrupt status`() {
+        val interrupted = InterruptedException("acquire cancelled")
+        val wrapped = RuntimeException("health check interrupted", interrupted)
+        val sandboxWithInterruptingHealthCheck =
+            Sandbox(
+                id = sandboxId,
+                sandboxService = sandboxService,
+                fileSystemService = fileSystemService,
+                commandService = commandService,
+                healthService = healthService,
+                metricsService = metricsService,
+                egressService = egressService,
+                credentialVaultService = credentialVaultService,
+                isolatedService = mockk(),
+                customHealthCheck = { throw wrapped },
+                httpClientProvider = httpClientProvider,
+                diagnosticsService = diagnosticsService,
+            )
+
+        Thread.interrupted()
+        try {
+            val actual =
+                assertThrows(RuntimeException::class.java) {
+                    sandboxWithInterruptingHealthCheck.checkReady(
+                        Duration.ofSeconds(1),
+                        Duration.ofMillis(10),
+                    )
+                }
+
+            assertSame(wrapped, actual)
+            assertTrue(Thread.currentThread().isInterrupted)
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test
     fun `checkReady should throw exception when timeout`() {
         every { healthService.ping(sandboxId) } returns false
 
@@ -304,7 +374,32 @@ class SandboxTest {
     }
 
     @Test
-    fun `checkReady timeout should include connection context and bridge hint`() {
+    fun `checkReady timeout should not overshoot by a polling interval`() {
+        every { healthService.ping(sandboxId) } returns false
+
+        val start = System.nanoTime()
+        assertThrows(SandboxReadyTimeoutException::class.java) {
+            sandbox.checkReady(Duration.ofMillis(20), Duration.ofSeconds(2))
+        }
+        val elapsed = Duration.ofNanos(System.nanoTime() - start)
+
+        assertTrue(elapsed < Duration.ofMillis(500), "expected timeout in ~20ms, took ${elapsed.toMillis()}ms")
+    }
+
+    @Test
+    fun `checkReady should reject non-positive polling interval before polling`() {
+        assertThrows(InvalidArgumentException::class.java) {
+            sandbox.checkReady(Duration.ofSeconds(1), Duration.ofMillis(-1))
+        }
+        assertThrows(InvalidArgumentException::class.java) {
+            sandbox.checkReady(Duration.ofSeconds(1), Duration.ZERO)
+        }
+
+        verify(exactly = 0) { healthService.ping(any()) }
+    }
+
+    @Test
+    fun `checkReady timeout should include diagnostics without network configuration hints`() {
         every { healthService.ping(sandboxId) } throws RuntimeException("connect ECONNREFUSED")
 
         val ex =
@@ -313,27 +408,63 @@ class SandboxTest {
             }
 
         assertTrue(ex.message!!.contains("Connection context: domain=localhost:8080, useServerProxy=false"))
-        assertTrue(ex.message!!.contains("useServerProxy=true"))
-        assertTrue(ex.message!!.contains("[docker].host_ip"))
+        assertFalse(ex.message!!.contains("consider enabling useServerProxy=true", ignoreCase = true))
+        assertFalse(ex.message!!.contains("Docker bridge", ignoreCase = true))
+        assertFalse(ex.message!!.contains("remote-network", ignoreCase = true))
+        assertFalse(ex.message!!.contains("[docker].host_ip"))
         assertTrue(ex.message!!.contains("Last error: connect ECONNREFUSED"))
     }
 
     @Test
-    fun `checkReady timeout should omit host_ip hint when server proxy is enabled`() {
-        val proxyEnabledConfig =
-            ConnectionConfig.builder()
-                .domain("localhost:8080")
-                .useServerProxy(true)
-                .build()
-        every { httpClientProvider.config } returns proxyEnabledConfig
-        every { healthService.ping(sandboxId) } returns false
+    fun `origin should default to unknown`() {
+        assertEquals(SandboxOrigin.UNKNOWN, sandbox.origin)
+    }
 
-        val ex =
-            assertThrows(SandboxReadyTimeoutException::class.java) {
-                sandbox.checkReady(Duration.ofMillis(100), Duration.ofMillis(10))
+    @Test
+    fun `credentialVault should return the injected service for template-backed sandboxes`() {
+        val templateSandbox =
+            Sandbox(
+                id = sandboxId,
+                sandboxService = sandboxService,
+                fileSystemService = fileSystemService,
+                commandService = commandService,
+                healthService = healthService,
+                metricsService = metricsService,
+                egressService = egressService,
+                credentialVaultService = credentialVaultService,
+                isolatedService = mockk(),
+                customHealthCheck = null,
+                httpClientProvider = httpClientProvider,
+                diagnosticsService = diagnosticsService,
+                origin = SandboxOrigin.TEMPLATE,
+            )
+
+        assertSame(credentialVaultService, templateSandbox.credentialVault())
+    }
+
+    @Test
+    fun `templateLauncher should reject a blank template id`() {
+        assertThrows(InvalidArgumentException::class.java) {
+            Sandbox.fromTemplate().templateId(" ")
+        }
+    }
+
+    @Test
+    fun `templateLauncher should require a timeout`() {
+        val exception =
+            assertThrows(InvalidArgumentException::class.java) {
+                Sandbox.fromTemplate().templateId("tpl_1").create()
             }
+        assertTrue(exception.message!!.contains("Timeout must be specified"))
+    }
 
-        assertTrue(ex.message!!.contains("useServerProxy=true"))
-        assertFalse(ex.message!!.contains("[docker].host_ip"))
+    @Test
+    fun `templateLauncher should reject a non-positive timeout`() {
+        assertThrows(InvalidArgumentException::class.java) {
+            Sandbox.fromTemplate().templateId("tpl_1").timeout(Duration.ZERO)
+        }
+        assertThrows(InvalidArgumentException::class.java) {
+            Sandbox.fromTemplate().templateId("tpl_1").timeout(Duration.ofSeconds(-1))
+        }
     }
 }

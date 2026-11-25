@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,10 +26,12 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter"
 )
 
+// kernelWaitingBackoff retries about once a second for five minutes while
+// Jupyter starts. The delay is fixed because wait.Backoff stops retrying as
+// soon as a growing delay reaches its Cap.
 var kernelWaitingBackoff = wait.Backoff{
-	Steps:    60,
-	Duration: 500 * time.Millisecond,
-	Factor:   1.5,
+	Steps:    300,
+	Duration: time.Second,
 	Jitter:   0.1,
 }
 
@@ -37,14 +39,17 @@ var kernelWaitingBackoff = wait.Backoff{
 type Controller struct {
 	baseURL                 string
 	token                   string
+	jupyterRuntimeRoot      string
+	jupyterRuntimeUID       *int
 	mu                      sync.RWMutex
 	jupyterClientMap        sync.Map // map[sessionID]*jupyterKernel
 	defaultLanguageSessions sync.Map // map[Language]string
 	commandClientMap        sync.Map // map[sessionID]*commandKernel
 	bashSessionClientMap    sync.Map // map[sessionID]*bashSession
 	ptySessionMap           sync.Map // map[sessionID]*ptySession
+	isolatedSessionMap      sync.Map // map[sessionID]*isolatedSession
 	db                      *sql.DB
-	dbOnce                  sync.Once
+	dbMu                    sync.Mutex
 }
 
 type jupyterKernel struct {
@@ -67,7 +72,6 @@ type commandKernel struct {
 	content      string
 }
 
-// NewController creates a runtime controller.
 func NewController(baseURL, token string) *Controller {
 	return &Controller{
 		baseURL: baseURL,

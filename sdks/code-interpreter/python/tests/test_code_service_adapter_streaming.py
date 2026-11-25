@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,11 +16,20 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import httpx
 import pytest
 from opensandbox.config import ConnectionConfig
-from opensandbox.exceptions import InvalidArgumentException, SandboxApiException
+from opensandbox.config.connection_sync import ConnectionConfigSync
+from opensandbox.exceptions import (
+    InvalidArgumentException,
+    SandboxApiException,
+    SandboxException,
+    SandboxRateLimitException,
+)
+from opensandbox.models.execd import ExecutionHandlers
+from opensandbox.models.execd_sync import ExecutionHandlersSync
 from opensandbox.models.sandboxes import SandboxEndpoint
 
 from code_interpreter.adapters.code_adapter import CodesAdapter
@@ -28,6 +37,96 @@ from code_interpreter.adapters.converter.code_execution_converter import (
     CodeExecutionConverter,
 )
 from code_interpreter.models.code import CodeContext, SupportedLanguage
+from code_interpreter.sync.adapters.code_adapter import CodesAdapterSync
+
+
+@pytest.fixture(
+    params=[
+        pytest.param((["Loading", "...done\n"], "Loading...done"), id="partial-line"),
+        pytest.param(([".", ".", "."], "..."), id="progress-dots"),
+        pytest.param((["first\n", "second\n"], "first\nsecond"), id="terminated-lines"),
+        pytest.param((["first\n", "\n", "last\n"], "first\n\nlast"), id="blank-line"),
+        pytest.param((["\n"], ""), id="only-blank-line"),
+        pytest.param((["first\r", "last\r"], "first\nlast"), id="carriage-returns"),
+        pytest.param((["first\r\n", "last\r\n"], "first\nlast"), id="crlf-lines"),
+        pytest.param((["first\r", "\n", "last\r", "\n"], "first\nlast"), id="split-crlf"),
+        pytest.param((["first\n", "last"], "first\nlast"), id="unterminated-final-fragment"),
+        pytest.param((["", "Loading", "", "...done\n", ""], "Loading...done"), id="empty-fragments"),
+        pytest.param(([], ""), id="no-output"),
+    ]
+)
+def stream_fragments(request: pytest.FixtureRequest) -> tuple[list[str], str]:
+    return request.param
+
+
+def _fragment_response(
+    request: httpx.Request, stream: str, fragments: list[str]
+) -> httpx.Response:
+    """Replay synthetic stream events, without requiring execd or Jupyter."""
+    assert request.url.path == "/code"
+    events = [
+        {"type": "init", "text": "exec-fragments", "timestamp": 0},
+        *[
+            {"type": stream, "text": text, "timestamp": index}
+            for index, text in enumerate(fragments, start=1)
+        ],
+        {"type": "execution_complete", "timestamp": len(fragments) + 1},
+    ]
+    return httpx.Response(
+        200,
+        headers={"Content-Type": "text/event-stream"},
+        content="".join(f"data: {json.dumps(event)}\n\n" for event in events),
+        request=request,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+async def test_run_code_preserves_stream_fragments(
+    stream: str, stream_fragments: tuple[list[str], str]
+) -> None:
+    fragments, expected = stream_fragments
+    transport = httpx.MockTransport(
+        lambda request: _fragment_response(request, stream, fragments)
+    )
+    cfg = ConnectionConfig(protocol="http", transport=transport)
+    adapter = CodesAdapter(SandboxEndpoint(endpoint="localhost:44772"), cfg)
+
+    execution = await adapter.run("print('synthetic stream')")
+
+    assert execution.id == "exec-fragments"
+    assert execution.complete is not None
+    assert [message.text for message in getattr(execution.logs, stream)] == fragments
+    if stream == "stdout":
+        assert execution.text == expected
+        assert str(execution) == expected
+    else:
+        assert execution.text == ""
+        assert str(execution) == (f"[stderr]\n{expected}" if fragments else "")
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_sync_run_code_preserves_stream_fragments(
+    stream: str, stream_fragments: tuple[list[str], str]
+) -> None:
+    fragments, expected = stream_fragments
+    transport = httpx.MockTransport(
+        lambda request: _fragment_response(request, stream, fragments)
+    )
+    cfg = ConnectionConfigSync(protocol="http", transport=transport)
+    adapter = CodesAdapterSync(SandboxEndpoint(endpoint="localhost:44772"), cfg)
+
+    execution = adapter.run("print('synthetic stream')")
+
+    assert execution.id == "exec-fragments"
+    assert execution.complete is not None
+    assert [message.text for message in getattr(execution.logs, stream)] == fragments
+    if stream == "stdout":
+        assert execution.text == expected
+        assert str(execution) == expected
+    else:
+        assert execution.text == ""
+        assert str(execution) == (f"[stderr]\n{expected}" if fragments else "")
 
 
 class _SseTransport(httpx.AsyncBaseTransport):
@@ -165,3 +264,156 @@ async def test_run_code_non_200_raises_api_exception() -> None:
     with pytest.raises(SandboxApiException) as ei:
         await adapter.run("other")
     assert ei.value.request_id == "req-code-123"
+    # The server's error body is spliced into the message so logs carry the reason.
+    assert "bad" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_run_code_non_200_keeps_structured_error_and_rate_limit() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "3"},
+            json={"code": "RATE_LIMITED", "message": "slow down"},
+            request=request,
+        )
+
+    cfg = ConnectionConfig(protocol="http", transport=httpx.MockTransport(handler))
+    adapter = CodesAdapter(SandboxEndpoint(endpoint="localhost:44772"), cfg)
+
+    with pytest.raises(SandboxRateLimitException) as ei:
+        await adapter.run("print(1)")
+    assert ei.value.error.code == "RATE_LIMITED"
+    assert ei.value.error.message == "slow down"
+    assert ei.value.retry_after == timedelta(seconds=3)
+    assert ei.value.response_body is not None
+
+
+class _HandlerAbort(RuntimeError):
+    pass
+
+
+def _stdout_stream_response(request: httpx.Request) -> httpx.Response:
+    return _fragment_response(request, "stdout", ["first\n", "second\n"])
+
+
+@pytest.mark.asyncio
+async def test_run_code_propagates_handler_exception() -> None:
+    seen: list[str] = []
+
+    async def on_stdout(message: object) -> None:
+        seen.append(message.text)  # type: ignore[attr-defined]
+        raise _HandlerAbort("stop")
+
+    cfg = ConnectionConfig(protocol="http", transport=httpx.MockTransport(_stdout_stream_response))
+    adapter = CodesAdapter(SandboxEndpoint(endpoint="localhost:44772"), cfg)
+
+    with pytest.raises(SandboxException) as exc:
+        await adapter.run("print(1)", handlers=ExecutionHandlers(on_stdout=on_stdout))
+
+    assert isinstance(exc.value.__cause__, _HandlerAbort)
+    assert seen == ["first\n"]
+
+
+def test_sync_run_code_propagates_handler_exception() -> None:
+    seen: list[str] = []
+
+    def on_stdout(message: object) -> None:
+        seen.append(message.text)  # type: ignore[attr-defined]
+        raise _HandlerAbort("stop")
+
+    cfg = ConnectionConfigSync(protocol="http", transport=httpx.MockTransport(_stdout_stream_response))
+    adapter = CodesAdapterSync(SandboxEndpoint(endpoint="localhost:44772"), cfg)
+
+    with pytest.raises(SandboxException) as exc:
+        adapter.run("print(1)", handlers=ExecutionHandlersSync(on_stdout=on_stdout))
+
+    assert isinstance(exc.value.__cause__, _HandlerAbort)
+    assert seen == ["first\n"]
+
+
+@pytest.mark.asyncio
+async def test_run_code_skips_undecodable_events() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=(
+                b'data: {"type":"init","text":"exec-1","timestamp":1}\n\n'
+                b"data: not-json\n\n"
+                b'data: {"type":"stdout","text":"ok\\n","timestamp":2}\n\n'
+                b'data: {"type":"execution_complete","timestamp":3}\n\n'
+            ),
+            request=request,
+        )
+
+    cfg = ConnectionConfig(protocol="http", transport=httpx.MockTransport(respond))
+    adapter = CodesAdapter(SandboxEndpoint(endpoint="localhost:44772"), cfg)
+
+    execution = await adapter.run("print(1)")
+
+    assert [m.text for m in execution.logs.stdout] == ["ok\n"]
+
+
+def _terminal_event_response(request: httpx.Request, terminal: dict) -> httpx.Response:
+    events = [{"type": "init", "text": "exec-exit", "timestamp": 0}, terminal]
+    return httpx.Response(
+        200,
+        headers={"Content-Type": "text/event-stream"},
+        content="".join(f"data: {json.dumps(event)}\n\n" for event in events),
+        request=request,
+    )
+
+
+_EXIT_CODE_CASES = [
+    pytest.param(
+        {"type": "execution_complete", "timestamp": 1, "execution_time": 1}, 0, id="completed"
+    ),
+    pytest.param(
+        {
+            "type": "error",
+            "timestamp": 1,
+            # execd reports a kernel error without exit_code; the code comes from evalue.
+            "error": {"ename": "SystemExit", "evalue": "3", "traceback": []},
+        },
+        3,
+        id="system-exit",
+    ),
+    pytest.param(
+        {
+            "type": "error",
+            "timestamp": 1,
+            "error": {"ename": "ZeroDivisionError", "evalue": "division by zero", "traceback": []},
+        },
+        None,
+        id="error-without-code",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("terminal", "expected"), _EXIT_CODE_CASES)
+async def test_run_code_infers_exit_code(terminal: dict, expected: int | None) -> None:
+    """Same inference as commands.run, and as the Kotlin, C# and Go code interpreters."""
+    transport = httpx.MockTransport(lambda request: _terminal_event_response(request, terminal))
+    adapter = CodesAdapter(
+        SandboxEndpoint(endpoint="localhost:44772"),
+        ConnectionConfig(protocol="http", transport=transport),
+    )
+
+    execution = await adapter.run("raise SystemExit(3)")
+
+    assert execution.exit_code == expected
+
+
+@pytest.mark.parametrize(("terminal", "expected"), _EXIT_CODE_CASES)
+def test_sync_run_code_infers_exit_code(terminal: dict, expected: int | None) -> None:
+    transport = httpx.MockTransport(lambda request: _terminal_event_response(request, terminal))
+    adapter = CodesAdapterSync(
+        SandboxEndpoint(endpoint="localhost:44772"),
+        ConnectionConfigSync(protocol="http", transport=transport),
+    )
+
+    execution = adapter.run("raise SystemExit(3)")
+
+    assert execution.exit_code == expected

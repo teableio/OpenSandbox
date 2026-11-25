@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ operations. All API access goes through this class.
 import logging
 import threading
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Callable, Any, Dict, List, Optional, Tuple
 
 from kubernetes import client, config
 from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi, NodeV1Api
@@ -32,6 +32,12 @@ from opensandbox_server.services.k8s.rate_limiter import TokenBucketRateLimiter
 
 logger = logging.getLogger(__name__)
 
+OPENSANDBOX_API_GROUP = "sandbox.opensandbox.io"
+OPENSANDBOX_API_VERSION = "v1alpha1"
+POOL_KIND = "Pool"
+POOL_PLURAL = "pools"
+POOL_AUTO_ASSIGN_REF = "*"
+
 _InformerKey = Tuple[str, str, str, str]  # (group, version, plural, namespace)
 
 
@@ -39,8 +45,8 @@ class K8sClient:
     """
     Unified Kubernetes API client.
 
-    Encapsulates all cluster resource operations (CustomObject, Secret, Pod,
-    RuntimeClass). Callers never hold raw API handles directly.
+    Encapsulates all cluster resource operations (CustomObject, Secret, PVC,
+    Pod, RuntimeClass). Callers never hold raw API handles directly.
     """
 
     def __init__(self, k8s_config: KubernetesRuntimeConfig):
@@ -69,6 +75,14 @@ class K8sClient:
                 config.load_kube_config(config_file=self.config.kubeconfig_path)
             else:
                 config.load_incluster_config()
+            if self.config.insecure_skip_tls_verify:
+                logger.warning(
+                    "kubernetes.insecure_skip_tls_verify is enabled; TLS certificate "
+                    "verification for the Kubernetes API server is disabled"
+                )
+                cfg = client.Configuration.get_default_copy()
+                cfg.verify_ssl = False
+                client.Configuration.set_default(cfg)
         except Exception as e:
             raise Exception(f"Failed to load Kubernetes configuration: {e}") from e
 
@@ -92,17 +106,19 @@ class K8sClient:
         """Return an existing informer without starting one. Used by write paths
         to invalidate cache entries; never auto-create on writes since list paths
         own the lazy-start contract."""
-        if not self.config.informer_enabled:
-            return None
         key: _InformerKey = (group, version, plural, namespace)
         with self._informers_lock:
             return self._informers.get(key)
 
-    def _get_informer(self, group: str, version: str, plural: str, namespace: str) -> Optional[WorkloadInformer]:
+    def _get_informer(
+        self,
+        group: str,
+        version: str,
+        plural: str,
+        namespace: str,
+        event_handler=None,
+    ) -> Optional[WorkloadInformer]:
         """Return the informer for this resource+namespace, starting it lazily."""
-        if not self.config.informer_enabled:
-            return None
-
         key: _InformerKey = (group, version, plural, namespace)
         with self._informers_lock:
             informer = self._informers.get(key)
@@ -118,7 +134,8 @@ class K8sClient:
                     list_fn=list_fn,
                     resync_period_seconds=self.config.informer_resync_seconds,
                     watch_timeout_seconds=self.config.informer_watch_timeout_seconds,
-                    thread_name=f"workload-informer-{plural}-{namespace}",
+                    thread_name=f"workload-informer-{plural}.{group}-{namespace}",
+                    event_handler=event_handler,
                 )
                 self._informers[key] = informer
                 try:
@@ -127,8 +144,44 @@ class K8sClient:
                     logger.warning(f"Failed to start informer for {plural}/{namespace}: {exc}")
                     self._informers.pop(key, None)
                     return None
+            elif event_handler is not None:
+                # The informer was started lazily by a handler-less read path;
+                # late watch consumers still need their events delivered.
+                informer.add_event_handler(event_handler)
         return informer
 
+    def watch_custom_objects(
+        self,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        event_handler,
+    ) -> Optional[WorkloadInformer]:
+        """Start (or reuse) a LIST/WATCH informer that feeds ``event_handler``.
+
+        The handler fires for every watch event and for every item of an
+        initial or reconnecting LIST snapshot, turning the informer into an
+        event reactor. Returns None when the informer cannot be started. The
+        watch stops with ``stop_informers``.
+        """
+        return self._get_informer(group, version, plural, namespace, event_handler)
+
+
+    def subscribe_custom_objects(
+        self,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        names: List[str],
+        callback: Callable[[str, Dict[str, Any]], None],
+    ) -> Optional[Callable[[], None]]:
+        """Reuse the shared informer to notify a waiter about named resources."""
+        informer = self._get_informer(group, version, plural, namespace)
+        if informer is None:
+            return None
+        return informer.subscribe(names, callback)
 
     def create_custom_object(
         self,
@@ -150,7 +203,7 @@ class K8sClient:
         )
         informer = self._lookup_informer(group, version, plural, namespace)
         if informer:
-            informer.update_cache(obj)
+            informer.track_write(obj)
         return obj
 
     def get_custom_object(
@@ -160,17 +213,20 @@ class K8sClient:
         namespace: str,
         plural: str,
         name: str,
+        *,
+        use_cache: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """Get a namespaced custom resource by name.
 
-        Tries the informer cache first when available and synced.
-        Returns None on 404.
+        Tries the informer cache first when available and synced, unless
+        ``use_cache`` is False. Returns None on 404.
         """
-        informer = self._get_informer(group, version, plural, namespace)
-        if informer and informer.has_synced:
-            cached = informer.get(name)
-            if cached is not None:
-                return cached
+        if use_cache:
+            informer = self._get_informer(group, version, plural, namespace)
+            if informer:
+                cached = informer.get_if_synced(name)
+                if cached is not None:
+                    return cached
 
         if self._read_limiter:
             self._read_limiter.acquire()
@@ -182,8 +238,8 @@ class K8sClient:
                 plural=plural,
                 name=name,
             )
-            if informer:
-                informer.update_cache(obj)
+            if not isinstance(obj, dict):
+                raise TypeError("Custom object GET returned a non-dict response")
             return obj
         except ApiException as e:
             if e.status == 404:
@@ -197,6 +253,7 @@ class K8sClient:
         namespace: str,
         plural: str,
         label_selector: str = "",
+        ignore_not_found: bool = True,
     ) -> List[Dict[str, Any]]:
         """List namespaced custom resources, returning the items list.
 
@@ -205,17 +262,18 @@ class K8sClient:
         a direct API call (with rate limiting) otherwise.
         """
         informer = self._get_informer(group, version, plural, namespace)
-        if informer and informer.has_synced:
+        if informer:
             terms = parse_selector(label_selector)
             if terms is not None:
-                cached = informer.list()
-                if not terms:
-                    return cached
-                return [
-                    obj
-                    for obj in cached
-                    if matches(obj.get("metadata", {}).get("labels") or {}, terms)
-                ]
+                cached = informer.list_if_synced()
+                if cached is not None:
+                    if not terms:
+                        return cached
+                    return [
+                        obj
+                        for obj in cached
+                        if matches(obj.get("metadata", {}).get("labels") or {}, terms)
+                    ]
 
         if self._read_limiter:
             self._read_limiter.acquire()
@@ -226,6 +284,48 @@ class K8sClient:
                 namespace=namespace,
                 plural=plural,
                 label_selector=label_selector,
+            )
+            return resp.get("items", [])
+        except ApiException as e:
+            if e.status == 404 and ignore_not_found:
+                return []
+            raise
+
+    def invalidate_custom_objects(
+        self, group: str, version: str, plural: str, namespace: str
+    ) -> None:
+        """Invalidate reads after a mutation performed by an external control plane."""
+        informer = self._lookup_informer(group, version, plural, namespace)
+        if informer:
+            informer.invalidate()
+
+    def stop_informers(self) -> None:
+        with self._informers_lock:
+            for informer in self._informers.values():
+                informer.stop()
+            self._informers.clear()
+
+    def list_custom_objects_all_namespaces(
+        self,
+        group: str,
+        version: str,
+        plural: str,
+        label_selector: str = "",
+    ) -> List[Dict[str, Any]]:
+        """List custom resources across all namespaces, returning the items list.
+
+        Direct API call only (cluster-scoped informers are not maintained).
+        Used as a fallback to locate a sandbox when no namespace is known.
+        """
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        try:
+            resp = self.get_custom_objects_api().list_cluster_custom_object(
+                group=group,
+                version=version,
+                plural=plural,
+                label_selector=label_selector,
+                _request_timeout=(10, 30),
             )
             return resp.get("items", [])
         except ApiException as e:
@@ -241,21 +341,23 @@ class K8sClient:
         plural: str,
         name: str,
         grace_period_seconds: int = 0,
+        propagation_policy: Optional[str] = None,
     ) -> None:
         """Delete a namespaced custom resource."""
         if self._write_limiter:
             self._write_limiter.acquire()
-        self.get_custom_objects_api().delete_namespaced_custom_object(
+        response = self.get_custom_objects_api().delete_namespaced_custom_object(
             group=group,
             version=version,
             namespace=namespace,
             plural=plural,
             name=name,
             grace_period_seconds=grace_period_seconds,
+            propagation_policy=propagation_policy,
         )
         informer = self._lookup_informer(group, version, plural, namespace)
         if informer:
-            informer.delete_from_cache(name)
+            informer.track_delete(name, response)
 
     def patch_custom_object(
         self,
@@ -279,12 +381,9 @@ class K8sClient:
         )
         informer = self._lookup_informer(group, version, plural, namespace)
         if informer:
-            informer.update_cache(obj)
+            informer.track_write(obj)
         return obj
 
-    # ------------------------------------------------------------------
-    # PersistentVolumeClaim operations
-    # ------------------------------------------------------------------
 
     def get_pvc(
         self,
@@ -317,9 +416,74 @@ class K8sClient:
             body=body,
         )
 
-    # ------------------------------------------------------------------
-    # Secret operations
-    # ------------------------------------------------------------------
+    def list_pvcs(
+        self,
+        namespace: str,
+        label_selector: str = "",
+    ) -> List[Any]:
+        """List PersistentVolumeClaims in a namespace, returning the items list."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        result = self.get_core_v1_api().list_namespaced_persistent_volume_claim(
+            namespace=namespace,
+            label_selector=label_selector,
+        )
+        return list(getattr(result, "items", []) or [])
+
+    def delete_pvc(
+        self,
+        namespace: str,
+        name: str,
+    ) -> None:
+        """Delete a PersistentVolumeClaim by name. 404 is swallowed."""
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        try:
+            self.get_core_v1_api().delete_namespaced_persistent_volume_claim(
+                name=name,
+                namespace=namespace,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return
+            raise
+
+    def patch_pvc(
+        self,
+        namespace: str,
+        name: str,
+        body: Any,
+    ) -> Any:
+        """Patch a PersistentVolumeClaim using strategic merge semantics.
+
+        The pinned kubernetes-client picks ``application/json-patch+json`` by
+        default (first entry in the generated content-type list) which would
+        reject our merge-shaped body. Its generated high-level method does not
+        accept a content-type override, so use the underlying ``ApiClient`` to
+        preserve strategic-merge semantics for list fields like
+        ``ownerReferences``.
+        """
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        api_client = self.get_core_v1_api().api_client
+        return api_client.call_api(
+            "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{name}",
+            "PATCH",
+            path_params={"namespace": namespace, "name": name},
+            query_params=[],
+            header_params={
+                "Accept": "application/json",
+                "Content-Type": "application/strategic-merge-patch+json",
+            },
+            body=body,
+            post_params=[],
+            files={},
+            response_type="V1PersistentVolumeClaim",
+            auth_settings=["BearerToken"],
+            _return_http_data_only=True,
+            collection_formats={},
+        )
+
 
     def create_secret(self, namespace: str, body: Any) -> Any:
         """Create a namespaced Secret."""
@@ -330,6 +494,31 @@ class K8sClient:
             body=body,
         )
 
+
+    def patch_pod_labels(
+        self, namespace: str, name: str, labels: Dict[str, Optional[str]]
+    ) -> Any:
+        """Merge Pod labels, preserving null deletions and unrelated labels."""
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        # Explicitly select merge patch: the generated Pod API defaults to JSON patch.
+        return self.get_core_v1_api().api_client.call_api(
+            "/api/v1/namespaces/{namespace}/pods/{name}",
+            "PATCH",
+            path_params={"namespace": namespace, "name": name},
+            query_params=[],
+            header_params={
+                "Accept": "application/json",
+                "Content-Type": "application/merge-patch+json",
+            },
+            body={"metadata": {"labels": labels}},
+            post_params=[],
+            files={},
+            response_type="V1Pod",
+            auth_settings=["BearerToken"],
+            _return_http_data_only=True,
+            collection_formats={},
+        )
 
     def list_pods(
         self,
@@ -344,6 +533,20 @@ class K8sClient:
             label_selector=label_selector,
         )
         return resp.items
+
+    def read_pod(self, namespace: str, name: str) -> Any | None:
+        """Read a Pod by name, returning None when it no longer exists."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        try:
+            return self.get_core_v1_api().read_namespaced_pod(
+                namespace=namespace,
+                name=name,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise
 
     def read_runtime_class(self, name: str) -> Any:
         """Read a RuntimeClass from the cluster."""

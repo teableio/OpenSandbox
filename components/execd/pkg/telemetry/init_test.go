@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -50,6 +50,17 @@ func TestSystemMetricsReaders(t *testing.T) {
 	tcpCount, udpCount := systemNetworkConnectionCounts()
 	assert.GreaterOrEqual(t, tcpCount, int64(0))
 	assert.GreaterOrEqual(t, udpCount, int64(0))
+	for _, usage := range systemDiskUsages() {
+		assert.NotEmpty(t, usage.Mountpoint)
+		assert.GreaterOrEqual(t, usage.UsedBytes, int64(0))
+		assert.GreaterOrEqual(t, usage.TotalBytes, int64(0))
+	}
+	if io, ok := systemDiskIO(); ok {
+		assert.GreaterOrEqual(t, io.ReadBytes, int64(0))
+		assert.GreaterOrEqual(t, io.WrittenBytes, int64(0))
+		assert.GreaterOrEqual(t, io.ReadOps, int64(0))
+		assert.GreaterOrEqual(t, io.WriteOps, int64(0))
+	}
 }
 
 func TestExecdSharedAttrs(t *testing.T) {
@@ -66,6 +77,6 @@ func TestExecdSharedAttrs(t *testing.T) {
 	})
 	t.Cleanup(func() { execdSharedAttrs = orig })
 
-	attrs := execdSharedAttrs()
+	attrs := sharedAttrs()
 	assert.Len(t, attrs, 3)
 }

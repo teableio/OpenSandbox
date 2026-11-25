@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,34 +20,29 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/alibaba/opensandbox/execd/pkg/flag"
-	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/execd/pkg/runtime"
-	"github.com/alibaba/opensandbox/execd/pkg/telemetry"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
 var codeRunner codeExecutionRunner
 
-func InitCodeRunner() {
-	codeRunner = runtime.NewController(flag.JupyterServerHost, flag.JupyterServerToken)
+func InitCodeRunner() *runtime.Controller {
+	ctrl := runtime.NewController(flag.JupyterServerHost, flag.JupyterServerToken)
+	codeRunner = ctrl
+	return ctrl
 }
 
-// CodeInterpretingController handles code execution entrypoints.
 type CodeInterpretingController struct {
 	*basicController
-
-	// chunkWriter serializes SSE event writes to prevent interleaved output.
-	chunkWriter sync.Mutex
 }
 
 type codeExecutionRunner interface {
-	CreateContext(req *runtime.CreateContextRequest) (string, error)
+	CreateContext(ctx context.Context, req *runtime.CreateContextRequest) (string, error)
 	Execute(request *runtime.ExecuteCodeRequest) error
 	GetContext(session string) (runtime.CodeContext, error)
 	GetCommandStatus(session string) (*runtime.CommandStatus, error)
@@ -56,10 +51,11 @@ type codeExecutionRunner interface {
 	DeleteContext(session string) error
 	CreateBashSession(req *runtime.CreateContextRequest) (string, error)
 	RunInBashSession(ctx context.Context, req *runtime.ExecuteCodeRequest) error
+	ValidateBashSessionCwd(sessionID, cwd string) error
 	SeekBackgroundCommandOutput(session string, cursor int64) ([]byte, int64, error)
 	DeleteBashSession(sessionID string) error
 	Interrupt(sessionID string) error
-	CreatePTYSession(id, cwd string) (runtime.PTYSession, error)
+	CreatePTYSession(id, cwd, command string) (runtime.PTYSession, error)
 	GetPTYSession(id string) runtime.PTYSession
 	DeletePTYSession(id string) error
 	GetPTYSessionStatus(id string) (bool, int64, error)
@@ -71,7 +67,6 @@ func NewCodeInterpretingController(ctx *gin.Context) *CodeInterpretingController
 	}
 }
 
-// CreateContext creates a new code execution context.
 func (c *CodeInterpretingController) CreateContext() {
 	var request model.CodeContextRequest
 	if err := c.bindJSON(&request); err != nil {
@@ -83,10 +78,18 @@ func (c *CodeInterpretingController) CreateContext() {
 		return
 	}
 
-	session, err := codeRunner.CreateContext(&runtime.CreateContextRequest{
+	session, err := codeRunner.CreateContext(c.ctx.Request.Context(), &runtime.CreateContextRequest{
 		Language: runtime.Language(request.Language),
 		Cwd:      request.Cwd,
 	})
+	if errors.Is(err, runtime.ErrUnsupportedLanguage) || errors.Is(err, runtime.ErrInvalidContextCwd) {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeInvalidRequest,
+			fmt.Sprintf("error creating code context. %v", err),
+		)
+		return
+	}
 	if err != nil {
 		c.RespondError(
 			http.StatusInternalServerError,
@@ -103,12 +106,10 @@ func (c *CodeInterpretingController) CreateContext() {
 	c.RespondSuccess(resp)
 }
 
-// InterruptCode interrupts the execution of running code in a session.
 func (c *CodeInterpretingController) InterruptCode() {
 	c.interrupt()
 }
 
-// RunCode executes code in a context and streams output via SSE.
 func (c *CodeInterpretingController) RunCode() {
 	var request model.RunCodeRequest
 	if err := c.bindJSON(&request); err != nil {
@@ -131,44 +132,12 @@ func (c *CodeInterpretingController) RunCode() {
 	}
 
 	ctx, cancel := context.WithCancel(c.ctx.Request.Context())
-	defer cancel()
-	execStart := time.Now()
-	var recordOnce sync.Once
-	recordExecution := func(result string) {
-		recordOnce.Do(func() {
-			telemetry.RecordExecutionDuration(
-				ctx,
-				"run_code",
-				result,
-				float64(time.Since(execStart))/float64(time.Millisecond),
-			)
-		})
-	}
+	tracker := newExecutionTracker(ctx, "run_code")
 	runCodeRequest := c.buildExecuteCodeRequest(request)
-	eventsHandler := c.setServerEventsHandler(ctx)
+	eventsHandler, stopSSE := c.setServerEventsHandler(ctx)
+	defer func() { cancel(); stopSSE() }()
 
-	// completeCh is closed when OnExecuteComplete fires, meaning the final SSE
-	// event has been written and flushed. We only wait for this callback as a
-	// safety check and then return immediately to avoid fixed tail latency.
-	completeCh := make(chan struct{})
-	var completeOnce sync.Once
-	signalComplete := func() {
-		completeOnce.Do(func() {
-			close(completeCh)
-		})
-	}
-	origComplete := eventsHandler.OnExecuteComplete
-	eventsHandler.OnExecuteComplete = func(executionTime time.Duration) {
-		origComplete(executionTime)
-		recordExecution("success")
-		signalComplete()
-	}
-	origError := eventsHandler.OnExecuteError
-	eventsHandler.OnExecuteError = func(err *execute.ErrorOutput) {
-		origError(err)
-		recordExecution("failure")
-		signalComplete()
-	}
+	tracker.wrap(&eventsHandler)
 	runCodeRequest.Hooks = eventsHandler
 
 	// SSE headers are committed lazily on the first event write
@@ -176,19 +145,14 @@ func (c *CodeInterpretingController) RunCode() {
 	// still be surfaced as a structured JSON error response.
 	err = codeRunner.Execute(runCodeRequest)
 	if err != nil {
-		recordExecution("failure")
-		c.RespondError(
-			http.StatusInternalServerError,
-			model.ErrorCodeRuntimeError,
-			fmt.Sprintf("error running codes %v", err),
-		)
+		tracker.record("failure")
+		c.respondRunError(runCodeRequest.Hooks, tracker.done, fmt.Sprintf("error running codes %v", err))
 		return
 	}
 
-	waitForExecutionComplete(ctx, completeCh)
+	waitForExecutionComplete(ctx, tracker.done)
 }
 
-// GetContext returns a specific code context by id.
 func (c *CodeInterpretingController) GetContext() {
 	contextID := c.ctx.Param("contextId")
 	if contextID == "" {
@@ -220,11 +184,18 @@ func (c *CodeInterpretingController) GetContext() {
 	c.RespondSuccess(codeContext)
 }
 
-// ListContexts returns active code contexts, optionally filtered by language.
 func (c *CodeInterpretingController) ListContexts() {
 	language := c.ctx.Query("language")
 
 	contexts, err := codeRunner.ListContext(language)
+	if errors.Is(err, runtime.ErrUnsupportedLanguage) {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeInvalidRequest,
+			err.Error(),
+		)
+		return
+	}
 	if err != nil {
 		c.RespondError(
 			http.StatusInternalServerError,
@@ -237,7 +208,6 @@ func (c *CodeInterpretingController) ListContexts() {
 	c.RespondSuccess(contexts)
 }
 
-// DeleteContextsByLanguage deletes all contexts for a given language.
 func (c *CodeInterpretingController) DeleteContextsByLanguage() {
 	language := c.ctx.Query("language")
 	if language == "" {
@@ -262,7 +232,6 @@ func (c *CodeInterpretingController) DeleteContextsByLanguage() {
 	c.RespondSuccess(nil)
 }
 
-// DeleteContext deletes a specific code context by id.
 func (c *CodeInterpretingController) DeleteContext() {
 	contextID := c.ctx.Param("contextId")
 	if contextID == "" {
@@ -296,7 +265,6 @@ func (c *CodeInterpretingController) DeleteContext() {
 	c.RespondSuccess(nil)
 }
 
-// CreateSession creates a new bash session (create_session API).
 // An empty body is allowed and is treated as default options (no cwd override).
 func (c *CodeInterpretingController) CreateSession() {
 	var request model.CreateSessionRequest
@@ -324,7 +292,6 @@ func (c *CodeInterpretingController) CreateSession() {
 	c.RespondSuccess(model.CreateSessionResponse{SessionID: sessionID})
 }
 
-// RunInSession runs a command in an existing bash session and streams output via SSE (run_in_session API).
 func (c *CodeInterpretingController) RunInSession() {
 	sessionID := c.ctx.Param("sessionId")
 	if sessionID == "" {
@@ -354,6 +321,19 @@ func (c *CodeInterpretingController) RunInSession() {
 		return
 	}
 
+	// The cwd may reference EXECD_ENVS file variables or variables exported in
+	// earlier runs of this session, so it must be validated against the
+	// session's environment. Skip validation when the session is missing and
+	// let RunInBashSession surface the not-found error as before.
+	if err := codeRunner.ValidateBashSessionCwd(sessionID, request.Cwd); err != nil && !errors.Is(err, runtime.ErrContextNotFound) {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeInvalidRequest,
+			fmt.Sprintf("invalid request. %v", err),
+		)
+		return
+	}
+
 	timeout := time.Duration(request.Timeout) * time.Millisecond
 	runReq := &runtime.ExecuteCodeRequest{
 		Language: runtime.Bash,
@@ -363,43 +343,15 @@ func (c *CodeInterpretingController) RunInSession() {
 		Timeout:  timeout,
 	}
 	ctx, cancel := context.WithCancel(c.ctx.Request.Context())
-	defer cancel()
-	execStart := time.Now()
-	var recordOnce sync.Once
-	recordExecution := func(result string) {
-		recordOnce.Do(func() {
-			telemetry.RecordExecutionDuration(
-				ctx,
-				"run_in_session",
-				result,
-				float64(time.Since(execStart))/float64(time.Millisecond),
-			)
-		})
-	}
+	tracker := newExecutionTracker(ctx, "run_in_session")
 
-	// completeCh is closed when OnExecuteComplete fires, meaning the final SSE
-	// event has been written and flushed. We only wait for this callback as a
-	// safety check and then return immediately to avoid fixed tail latency.
-	completeCh := make(chan struct{})
-	var completeOnce sync.Once
-	signalComplete := func() {
-		completeOnce.Do(func() {
-			close(completeCh)
-		})
-	}
-	hooks := c.setServerEventsHandler(ctx)
-	origComplete := hooks.OnExecuteComplete
-	hooks.OnExecuteComplete = func(executionTime time.Duration) {
-		origComplete(executionTime)
-		recordExecution("success")
-		signalComplete()
-	}
-	origError := hooks.OnExecuteError
-	hooks.OnExecuteError = func(err *execute.ErrorOutput) {
-		origError(err)
-		recordExecution("failure")
-		signalComplete()
-	}
+	hooks, stopSSE := c.setServerEventsHandler(ctx)
+	// Cancel the context first (signals the ping goroutine to stop), then
+	// wait for it to fully exit before the handler returns. This prevents
+	// the ping goroutine from writing to the response after Go's net/http
+	// closes the response writer.
+	defer func() { cancel(); stopSSE() }()
+	tracker.wrap(&hooks)
 	runReq.Hooks = hooks
 
 	// SSE headers are committed lazily on the first event write
@@ -407,19 +359,14 @@ func (c *CodeInterpretingController) RunInSession() {
 	// RunInBashSession can still be surfaced as a structured JSON error.
 	err := codeRunner.RunInBashSession(ctx, runReq)
 	if err != nil {
-		recordExecution("failure")
-		c.RespondError(
-			http.StatusInternalServerError,
-			model.ErrorCodeRuntimeError,
-			fmt.Sprintf("error running in session. %v", err),
-		)
+		tracker.record("failure")
+		c.respondRunError(runReq.Hooks, tracker.done, fmt.Sprintf("error running in session. %v", err))
 		return
 	}
 
-	waitForExecutionComplete(ctx, completeCh)
+	waitForExecutionComplete(ctx, tracker.done)
 }
 
-// DeleteSession deletes a bash session (delete_session API).
 func (c *CodeInterpretingController) DeleteSession() {
 	sessionID := c.ctx.Param("sessionId")
 	if sessionID == "" {
@@ -452,7 +399,6 @@ func (c *CodeInterpretingController) DeleteSession() {
 	c.RespondSuccess(nil)
 }
 
-// buildExecuteCodeRequest converts a RunCodeRequest to runtime format.
 func (c *CodeInterpretingController) buildExecuteCodeRequest(request model.RunCodeRequest) *runtime.ExecuteCodeRequest {
 	req := &runtime.ExecuteCodeRequest{
 		Language: runtime.Language(request.Context.Language),

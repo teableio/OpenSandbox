@@ -1,11 +1,11 @@
-// Copyright 2026 Alibaba Group Holding Ltd..
-// 
+// Copyright 2026 The OpenSandbox Authors
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-// 
+//
 //     http://www.apache.org/licenses/LICENSE-2.0
-// 
+//
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -58,13 +58,36 @@ export interface paths {
          * Delete egress rules
          * @description Remove specific egress rules from the currently enforced policy by target.
          *
-         *     - Accepts a list of target strings (FQDNs or wildcard domains).
+         *     - Accepts a list of target strings (FQDNs, wildcard domains, IPs, or
+         *       CIDRs).
          *     - Matching rules are removed; targets not found in the current policy
          *       are silently ignored (idempotent).
+         *     - An explicit empty string ("") addresses port-only rules (rules with
+         *       `ports` and no `target`): listing it removes every port-only rule.
+         *       Port-only rules cannot be addressed individually by target since
+         *       they have none.
          */
         delete: {
             parameters: {
-                query?: never;
+                query?: {
+                    /**
+                     * @description When true, destinations removed by this policy change lose their
+                     *     established/related conntrack bypass on the dns+nft sidecar: matching
+                     *     keep-alive flows are dropped. Opt-in because tearing down long-lived
+                     *     connections can surprise callers that only meant to block new dials.
+                     *     The teardown rules stay installed across later policy applies until
+                     *     the destination is allowed again or the kernel's established-flow
+                     *     conntrack timeout (`nf_conntrack_tcp_timeout_established`, 5 days by
+                     *     default) has passed since the change. `POST /policy` ignores this
+                     *     parameter.
+                     *
+                     *     Unsupported configurations return `501 Not Implemented` without
+                     *     changing the policy: `dns`-only enforcement (no nftables chain), the
+                     *     experimental revision runtime, and an upstream proxy
+                     *     (`OPENSANDBOX_EGRESS_UPSTREAM_PROXY`) combined with transparent MITM.
+                     */
+                    dropEstablished?: boolean;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -75,7 +98,14 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description Rules removed successfully. */
+                /**
+                 * @description Rules removed successfully, or no matching rules were found. With
+                 *     the internal experimental revision runtime enabled, an applied
+                 *     change is confirmed by the receiver after optional policy-file
+                 *     persistence and nft application, before local policy publication
+                 *     and success. It does not wait for the default 30-second old-request
+                 *     drain or promise atomic visibility before confirmation.
+                 */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -87,6 +117,22 @@ export interface paths {
                 400: components["responses"]["BadRequest"];
                 401: components["responses"]["Unauthorized"];
                 500: components["responses"]["InternalServerError"];
+                501: components["responses"]["DropEstablishedNotImplemented"];
+                /**
+                 * @description The internal experimental revision runtime is unavailable, the
+                 *     mutation outcome could not be confirmed, or sticky recovery is
+                 *     required. This response does not prove that external effects were
+                 *     rolled back or that packets are isolated. No policy epoch is
+                 *     exposed by this API.
+                 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "text/plain": string;
+                    };
+                };
             };
         };
         options?: never;
@@ -98,11 +144,31 @@ export interface paths {
          *     This endpoint uses merge semantics:
          *     - Existing rules remain unless overridden by incoming rules.
          *     - Incoming rules are applied with higher priority than existing rules.
-         *     - If multiple incoming rules refer to the same `target`, the first one wins.
+         *     - If multiple incoming rules resolve to the same match scope (same
+         *       `target` and the same set of `ports`), the first one wins; rules
+         *       that differ in `target` or in `ports` coexist.
          */
         patch: {
             parameters: {
-                query?: never;
+                query?: {
+                    /**
+                     * @description When true, destinations removed by this policy change lose their
+                     *     established/related conntrack bypass on the dns+nft sidecar: matching
+                     *     keep-alive flows are dropped. Opt-in because tearing down long-lived
+                     *     connections can surprise callers that only meant to block new dials.
+                     *     The teardown rules stay installed across later policy applies until
+                     *     the destination is allowed again or the kernel's established-flow
+                     *     conntrack timeout (`nf_conntrack_tcp_timeout_established`, 5 days by
+                     *     default) has passed since the change. `POST /policy` ignores this
+                     *     parameter.
+                     *
+                     *     Unsupported configurations return `501 Not Implemented` without
+                     *     changing the policy: `dns`-only enforcement (no nftables chain), the
+                     *     experimental revision runtime, and an upstream proxy
+                     *     (`OPENSANDBOX_EGRESS_UPSTREAM_PROXY`) combined with transparent MITM.
+                     */
+                    dropEstablished?: boolean;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -113,7 +179,13 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description Patch applied successfully. */
+                /**
+                 * @description Patch applied successfully. With the internal experimental revision
+                 *     runtime enabled, success follows optional policy-file persistence,
+                 *     nft application, exact receiver confirmation and local policy
+                 *     publication. It does not wait for the default 30-second old-request
+                 *     drain or promise atomic visibility before confirmation.
+                 */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -125,8 +197,302 @@ export interface paths {
                 400: components["responses"]["BadRequest"];
                 401: components["responses"]["Unauthorized"];
                 500: components["responses"]["InternalServerError"];
+                501: components["responses"]["DropEstablishedNotImplemented"];
+                /**
+                 * @description The internal experimental revision runtime is unavailable, the
+                 *     mutation outcome could not be confirmed, or sticky recovery is
+                 *     required. This response does not prove that external effects were
+                 *     rolled back or that packets are isolated. No policy epoch is
+                 *     exposed by this API.
+                 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "text/plain": string;
+                    };
+                };
             };
         };
+        trace?: never;
+    };
+    "/credential-vault": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get sanitized Credential Vault state */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Sanitized Credential Vault state. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CredentialVaultState"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        /**
+         * Create a sandbox-local Credential Vault
+         * @description Create the initial sandbox-local Credential Vault revision and activate it
+         *     in Credential Proxy. Inline credential values are write-only and are never
+         *     returned by this API. The sidecar must run in `dns+nft` mode and requires
+         *     an egress policy. `defaultAction: deny` is strongly recommended;
+         *     default-allow remains temporarily supported with a security warning.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CredentialVaultCreateRequest"];
+                };
+            };
+            responses: {
+                /** @description Credential Vault created and acknowledged. */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CredentialVaultState"];
+                    };
+                };
+                400: components["responses"]["BadRequest"];
+                401: components["responses"]["Unauthorized"];
+                409: components["responses"]["Conflict"];
+                412: components["responses"]["PreconditionFailed"];
+            };
+        };
+        /** Delete the sandbox-local Credential Vault */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Credential Vault deleted. */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        options?: never;
+        head?: never;
+        /** Atomically mutate sandbox-local credentials and bindings */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CredentialVaultMutationRequest"];
+                };
+            };
+            responses: {
+                /** @description Mutation applied and acknowledged. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CredentialVaultState"];
+                    };
+                };
+                400: components["responses"]["BadRequest"];
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+                409: components["responses"]["Conflict"];
+                412: components["responses"]["PreconditionFailed"];
+            };
+        };
+        trace?: never;
+    };
+    "/credential-vault/credentials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List sanitized credential metadata */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Sanitized credential metadata. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CredentialListResponse"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/credential-vault/credentials/{credential_name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get sanitized metadata for one credential */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    credential_name: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Sanitized credential metadata. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CredentialMetadata"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/credential-vault/bindings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List sanitized credential binding metadata */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Sanitized binding metadata. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CredentialBindingListResponse"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/credential-vault/bindings/{binding_name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get sanitized metadata for one binding */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    binding_name: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Sanitized binding metadata. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CredentialBindingMetadata"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
 }
@@ -152,6 +518,13 @@ export interface components {
             /** @description Optional human-readable reason when the sidecar returns extra context. */
             reason?: string;
             policy?: components["schemas"]["NetworkPolicy"];
+            /**
+             * @description Present when the request set `dropEstablished=true`. Best-effort count of
+             *     TCP conntrack flows whose original destination matched destinations the
+             *     new policy no longer allows. The sidecar also installs nft drop rules
+             *     ahead of `ct state established,related accept` for those destinations.
+             */
+            droppedEstablished?: number;
         };
         /**
          * @description Egress network policy matching the sidecar `/policy` request body.
@@ -167,6 +540,7 @@ export interface components {
             /** @description List of egress rules evaluated in order. */
             egress?: components["schemas"]["NetworkRule"][];
         };
+        /** @description Egress rule. At least one of `target` or `ports` must be provided; when both are present the rule applies to `ports` on `target` only. Enforced by the server and the egress sidecar. */
         NetworkRule: {
             /**
              * @description Whether to allow or deny matching targets.
@@ -174,10 +548,202 @@ export interface components {
              */
             action: "allow" | "deny";
             /**
-             * @description FQDN or wildcard domain (e.g., "example.com", "*.example.com").
-             *     IP/CIDR not yet supported in the egress MVP.
+             * @description FQDN, wildcard domain (e.g., "example.com", "*.example.com"), IP
+             *     address, or CIDR. May be omitted when `ports` is set (see below);
+             *     otherwise required.
              */
-            target: string;
+            target?: string;
+            /**
+             * @description Restricts this rule to specific TCP destination ports.
+             *
+             *     - `target` omitted, `ports` set: the rule applies to these ports
+             *       across all IPv4/IPv6 destinations.
+             *     - `target` is an IP or CIDR, `ports` set: the rule applies to that
+             *       destination only on these ports.
+             *     - `target` is a domain: `ports` is rejected with a validation
+             *       error. Domain rules are evaluated at the DNS layer, which has no
+             *       port dimension; combining them is not supported yet.
+             *
+             *     TCP only for now; UDP port scoping is not supported.
+             *
+             *     Under `defaultAction: deny`, the DNS proxy still denies hostname
+             *     lookups for targetless allow rules (it matches domain rules
+             *     only), so this shape serves direct-IP clients; hostname access
+             *     requires explicit domain rules or stable IPs.
+             */
+            ports?: number[];
+        };
+        CredentialVaultCreateRequest: {
+            credentials: components["schemas"]["Credential"][];
+            bindings: components["schemas"]["CredentialBinding"][];
+        };
+        CredentialVaultMutationRequest: {
+            /** @description Optional optimistic concurrency guard. */
+            expectedRevision?: number;
+            credentials?: components["schemas"]["CredentialMutationSet"];
+            bindings?: components["schemas"]["CredentialBindingMutationSet"];
+        };
+        CredentialMutationSet: {
+            add?: components["schemas"]["Credential"][];
+            replace?: components["schemas"]["Credential"][];
+            delete?: string[];
+        };
+        CredentialBindingMutationSet: {
+            add?: components["schemas"]["CredentialBinding"][];
+            replace?: components["schemas"]["CredentialBinding"][];
+            delete?: string[];
+        };
+        CredentialVaultState: {
+            revision: number;
+            credentials: components["schemas"]["CredentialMetadata"][];
+            bindings: components["schemas"]["CredentialBindingMetadata"][];
+        };
+        CredentialListResponse: {
+            revision: number;
+            credentials: components["schemas"]["CredentialMetadata"][];
+        };
+        CredentialBindingListResponse: {
+            revision: number;
+            bindings: components["schemas"]["CredentialBindingMetadata"][];
+        };
+        CredentialMetadata: {
+            name: string;
+            /** @description Credential source kind (`inline` or `exchange`). */
+            sourceType: string;
+            revision: number;
+        };
+        CredentialBindingMetadata: {
+            name: string;
+            revision: number;
+            match?: components["schemas"]["CredentialMatch"];
+            auth?: components["schemas"]["CredentialAuthMetadata"];
+        };
+        Credential: {
+            name: string;
+            source: components["schemas"]["CredentialSource"];
+        };
+        /**
+         * @description Where the credential material comes from. Exactly one kind, selected
+         *     by `type`:
+         *
+         *     - `inline`: the secret value travels in this request via `value`.
+         *       Inline values are write-only and never appear in reads.
+         *     - `exchange`: no local material. Egress resolves header sets per
+         *       request from a header-resolver service addressed by `endpoint`.
+         *       Supported endpoint forms are `unix:///absolute/path` (HTTP over a
+         *       Unix domain socket) and `https://host[:port]` (TLS); anything else
+         *       is rejected with 400.
+         *
+         *     Fields of the other kind must be absent; for example `value` together
+         *     with `type: exchange` is rejected with 400.
+         */
+        CredentialSource: {
+            /** @enum {string} */
+            type: "inline" | "exchange";
+            /**
+             * @description Inline secret value. Required when `type` is `inline`; must be
+             *     absent otherwise.
+             */
+            value?: string;
+            /**
+             * @description Header-resolver endpoint. Required when `type` is `exchange`; must
+             *     be absent otherwise.
+             */
+            endpoint?: string;
+        };
+        CredentialBinding: {
+            name: string;
+            match: components["schemas"]["CredentialMatch"];
+            auth: components["schemas"]["CredentialAuth"];
+        };
+        CredentialMatch: {
+            /**
+             * @default [
+             *       "https"
+             *     ]
+             */
+            schemes: ("https" | "http")[];
+            /**
+             * @deprecated
+             * @description Deprecated. Port is derived from scheme (https→443, http→80). Values other than 80 or 443 are rejected with a validation error. Standard values (80/443) are accepted but ignored.
+             */
+            ports?: number[];
+            hosts: string[];
+            /**
+             * @default [
+             *       "GET",
+             *       "POST",
+             *       "PUT",
+             *       "PATCH",
+             *       "DELETE"
+             *     ]
+             */
+            methods: string[];
+            /**
+             * @default [
+             *       "/*"
+             *     ]
+             */
+            paths: string[];
+        };
+        /**
+         * @description How a binding injects credential material. Exactly one auth kind:
+         *
+         *     - `bearer`: `type: bearer` plus `credential`.
+         *     - `basic`: `type: basic` plus `credential`.
+         *     - `apiKey`: `type: apiKey` plus `name` and `credential`.
+         *     - `customHeaders`: `type: customHeaders` plus `headers`.
+         *     - `passthrough`: `type: passthrough`, no credential reference.
+         *     - typeless exchange: `type` omitted with only `credential` set. The
+         *       referenced credential must be exchange-sourced; egress resolves the
+         *       header set per request from the credential's endpoint.
+         *
+         *     Static kinds must reference inline-sourced credentials, and the
+         *     typeless form must reference an exchange-sourced credential and must
+         *     not set `name`, `headers`, or `substitutions`. The five static kinds
+         *     accept optional `substitutions`. Violations are rejected with 400.
+         */
+        CredentialAuth: {
+            /**
+             * @description Static auth kind. Omit entirely for the typeless exchange form.
+             * @enum {string}
+             */
+            type?: "bearer" | "basic" | "apiKey" | "customHeaders" | "passthrough";
+            /**
+             * @description Name of the sandbox-local credential whose value is injected. For
+             *     `basic` the referenced credential contains pre-encoded
+             *     base64(username:password). Required for `bearer`, `basic`,
+             *     `apiKey`, and the typeless exchange form; must be absent otherwise.
+             */
+            credential?: string;
+            /** @description Request header name. Required for `apiKey`; must be absent otherwise. */
+            name?: string;
+            /** @description Static header set. Required for `customHeaders`; must be absent otherwise. */
+            headers?: components["schemas"]["CustomHeaderEntry"][];
+            /**
+             * @description Optional placeholder replacement set. Accepted for the five static
+             *     kinds; must be absent for the typeless exchange form.
+             */
+            substitutions?: components["schemas"]["CredentialSubstitution"][];
+        };
+        CustomHeaderEntry: {
+            name: string;
+            credential: string;
+        };
+        /** @description Literal case-sensitive placeholder replacement for selected request surfaces. Replacement is opt-in and scoped per binding. */
+        CredentialSubstitution: {
+            /** @description Name of the sandbox-local credential used as the replacement value. */
+            credential: string;
+            /** @description Literal placeholder to replace. The placeholder and resolved credential value are added to the active redaction set. */
+            placeholder: string;
+            /** @description Request surfaces where the placeholder may be replaced. Query and path replacements are URL-encoded, JSON string bodies are escaped, x-www-form-urlencoded bodies are form-encoded, compressed bodies are skipped, and multipart bodies are skipped. */
+            in: ("path" | "query" | "header" | "body")[];
+        };
+        /** @description Sanitized auth shape — `type` (plus `name` for `apiKey`) for static kinds; `credential` only for the typeless exchange form. */
+        CredentialAuthMetadata: {
+            type?: string;
+            name?: string;
+            credential?: string;
         };
     };
     responses: {
@@ -192,6 +758,46 @@ export interface components {
         };
         /** @description Authentication failed for the egress sidecar. */
         Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "text/plain": string;
+            };
+        };
+        /** @description The requested Credential Vault resource was not found. */
+        NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "text/plain": string;
+            };
+        };
+        /** @description The request conflicts with the current Credential Vault revision. */
+        Conflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "text/plain": string;
+            };
+        };
+        /**
+         * @description `dropEstablished=true` was requested but this sidecar cannot honor it
+         *     (`dns`-only enforcement, the experimental revision runtime, or an
+         *     upstream proxy with transparent MITM). The policy was not changed.
+         */
+        DropEstablishedNotImplemented: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "text/plain": string;
+            };
+        };
+        /** @description Credential Proxy prerequisites are not ready. */
+        PreconditionFailed: {
             headers: {
                 [name: string]: unknown;
             };

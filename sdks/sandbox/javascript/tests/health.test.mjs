@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,4 +39,22 @@ test("HealthAdapter still maps ping API errors", async () => {
   }));
 
   await assert.rejects(() => health.ping(), SandboxApiException);
+});
+
+test("execd client error message carries unstructured plain-text body", async () => {
+  const health = new HealthAdapter(createExecdClient({
+    baseUrl: "http://execd.test",
+    async fetch() {
+      return new Response("slow down", { status: 400 });
+    },
+  }));
+
+  await assert.rejects(
+    () => health.ping(),
+    (err) => {
+      assert.ok(err instanceof SandboxApiException);
+      assert.match(err.message, /slow down/);
+      return true;
+    },
+  );
 });

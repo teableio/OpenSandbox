@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,19 +24,23 @@ import (
 
 // ExecuteResultHook groups execution callbacks.
 type ExecuteResultHook struct {
-	OnExecuteInit     func(context string)
-	OnExecuteResult   func(result map[string]any, count int)
-	OnExecuteStatus   func(status string)
-	OnExecuteStdout   func(stdout string) //nolint:predeclared
-	OnExecuteStderr   func(stderr string) //nolint:predeclared
-	OnExecuteError    func(err *execute.ErrorOutput)
-	OnExecuteComplete func(executionTime time.Duration)
+	// OnCommandAllocated runs once before every other command callback or goroutine.
+	// It binds internal correlation without emitting init or committing headers.
+	OnCommandAllocated func(commandID string)
+	OnExecuteInit      func(context string)
+	OnExecuteResult    func(result map[string]any, count int)
+	OnExecuteStatus    func(status string)
+	OnExecuteStdout    func(stdout string) //nolint:predeclared
+	OnExecuteStderr    func(stderr string) //nolint:predeclared
+	OnExecuteError     func(err *execute.ErrorOutput)
+	OnExecuteComplete  func(executionTime time.Duration)
 }
 
 // ExecuteCodeRequest represents a code execution request with context and hooks.
 type ExecuteCodeRequest struct {
 	Language Language          `json:"language"`
 	Code     string            `json:"code"`
+	Argv     []string          `json:"argv,omitempty"`
 	Context  string            `json:"context"`
 	Timeout  time.Duration     `json:"timeout"`
 	Cwd      string            `json:"cwd"`
@@ -84,19 +88,14 @@ type CodeContext struct {
 	Language Language `json:"language"`
 }
 
-// bashSessionConfig holds bash session configuration.
 type bashSessionConfig struct {
 	// StartupSource is a list of scripts sourced on startup.
-	StartupSource []string
-	// Session is the session identifier.
-	Session string
-	// StartupTimeout is the startup timeout.
+	StartupSource  []string
+	Session        string
 	StartupTimeout time.Duration
-	// Cwd is the working directory.
-	Cwd string
+	Cwd            string
 }
 
-// bashSession represents a bash session.
 type bashSession struct {
 	config  *bashSessionConfig
 	mu      sync.Mutex
@@ -104,7 +103,8 @@ type bashSession struct {
 	env     map[string]string
 	cwd     string
 
-	// currentProcessPid is the pid of the active run's process group leader (bash).
-	// Set after cmd.Start(), cleared when run() returns. Used by close() to kill the process group.
-	currentProcessPid int
+	// runPids holds the process group leader (bash) of each active run. Runs may
+	// overlap, so each run adds its pid after cmd.Start() and removes it when
+	// run() returns. close() kills every group still listed.
+	runPids map[int]struct{}
 }

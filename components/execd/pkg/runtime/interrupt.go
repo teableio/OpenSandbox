@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ func (c *Controller) Interrupt(sessionID string) error {
 	switch {
 	case c.getJupyterKernel(sessionID) != nil:
 		kernel := c.getJupyterKernel(sessionID)
-		log.Warning("Interrupting Jupyter kernel %s", kernel.kernelID)
+		log.Warn("jupyter: interrupt kernel %s", kernel.kernelID)
 		return kernel.client.InterruptKernel(kernel.kernelID)
 	case c.getCommandKernel(sessionID) != nil:
 		// Snapshot under c.mu so running/pid are observed consistently with
@@ -43,7 +43,7 @@ func (c *Controller) Interrupt(sessionID string) error {
 		if snapshot == nil || !snapshot.running || snapshot.pid <= 0 {
 			return fmt.Errorf("command session %s is not running", sessionID)
 		}
-		return c.killPid(snapshot.pid)
+		return c.killPid(sessionID, snapshot.pid)
 	case c.getBashSession(sessionID) != nil:
 		return c.closeBashSession(sessionID)
 	default:
@@ -63,18 +63,18 @@ func (c *Controller) Interrupt(sessionID string) error {
 // best-effort logging — once a kill signal has been delivered, a slow or
 // asynchronous teardown is not treated as a hard failure that would
 // surface as a 500 from Interrupt.
-func (c *Controller) killPid(pid int) error {
+func (c *Controller) killPid(commandID string, pid int) error {
 	if pid <= 0 {
 		return fmt.Errorf("invalid pid %d", pid)
 	}
-	log.Warning("Attempting to terminate process group %d", pid)
+	log.WarnWithCommandID(commandID, "interrupt: terminating process group %d", pid)
 
 	sigtermDelivered := false
 	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
-		log.Warning("SIGTERM failed for pgroup %d: %v, trying SIGKILL", pid, err)
+		log.WarnWithCommandID(commandID, "interrupt: SIGTERM process group %d: %v; escalating to SIGKILL", pid, err)
 	} else {
 		sigtermDelivered = true
 		// Probe the group for liveness. os.Process.Wait() doesn't apply
@@ -83,13 +83,13 @@ func (c *Controller) killPid(pid int) error {
 		for time.Now().Before(deadline) {
 			if err := syscall.Kill(-pid, 0); err != nil {
 				if errors.Is(err, syscall.ESRCH) {
-					log.Info("Process group %d terminated gracefully", pid)
+					log.InfoWithCommandID(commandID, "interrupt: process group %d terminated gracefully", pid)
 					return nil
 				}
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		log.Warning("Process group %d did not exit after SIGTERM, escalating to SIGKILL", pid)
+		log.WarnWithCommandID(commandID, "interrupt: process group %d did not exit after SIGTERM; escalating to SIGKILL", pid)
 	}
 
 	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
@@ -102,7 +102,7 @@ func (c *Controller) killPid(pid int) error {
 			// a group reduced to zombies — the kernel will reap them once
 			// the parent runs Wait(). Surface as a warning rather than a
 			// hard error.
-			log.Warning("SIGKILL on pgroup %d failed: %v; teardown likely already in progress", pid, err)
+			log.WarnWithCommandID(commandID, "interrupt: SIGKILL process group %d: %v; teardown likely already in progress", pid, err)
 			return nil
 		}
 		return fmt.Errorf("failed to kill process group %d: %w", pid, err)
@@ -111,12 +111,12 @@ func (c *Controller) killPid(pid int) error {
 	for range 3 {
 		if err := syscall.Kill(-pid, 0); err != nil {
 			if errors.Is(err, syscall.ESRCH) {
-				log.Info("Process group %d confirmed terminated", pid)
+				log.InfoWithCommandID(commandID, "interrupt: process group %d confirmed terminated", pid)
 				return nil
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	log.Warning("Process group %d still observable after SIGKILL; teardown may complete asynchronously", pid)
+	log.WarnWithCommandID(commandID, "interrupt: process group %d still observable after SIGKILL; teardown may complete asynchronously", pid)
 	return nil
 }

@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for K8s windows_profile module."""
+import shutil
+import subprocess
 
 import pytest
 
+from opensandbox_server.services.k8s import egress_helper
 from opensandbox_server.services.k8s.windows_profile import (
     _memory_with_qemu_overhead,
     apply_windows_profile_overrides,
@@ -24,8 +26,6 @@ from opensandbox_server.services.k8s.windows_profile import (
 
 
 class TestMemoryWithQemuOverhead:
-    """Tests for _memory_with_qemu_overhead helper."""
-
     @pytest.mark.parametrize(
         ("input_value", "expected"),
         [
@@ -73,8 +73,6 @@ class TestMemoryWithQemuOverhead:
 
 
 class TestBuildWindowsProfileEnv:
-    """Tests for build_windows_profile_env."""
-
     def test_does_not_inject_kvm_n_by_default(self):
         result = build_windows_profile_env(
             env={"VERSION": "11"},
@@ -105,8 +103,6 @@ class TestBuildWindowsProfileEnv:
 
 
 class TestApplyWindowsProfileOverrides:
-    """Tests for apply_windows_profile_overrides entrypoint and resource handling."""
-
     def _make_pod_spec(self):
         return {
             "initContainers": [
@@ -114,9 +110,9 @@ class TestApplyWindowsProfileOverrides:
                     "name": "execd-installer",
                     "image": "execd:test",
                     "command": ["/bin/sh", "-c"],
-                    "args": ["cp ./execd /opt/opensandbox/bin/execd"],
+                    "args": ["cp ./execd /opt/opensandbox/execd"],
                     "volumeMounts": [
-                        {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox/bin"}
+                        {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox"}
                     ],
                 }
             ],
@@ -124,15 +120,53 @@ class TestApplyWindowsProfileOverrides:
                 {
                     "name": "sandbox",
                     "image": "dockurr/windows:latest",
-                    "command": ["/opt/opensandbox/bin/bootstrap.sh", "tail", "-f", "/dev/null"],
-                    "env": [{"name": "EXECD", "value": "/opt/opensandbox/bin/execd"}],
+                    "command": ["/opt/opensandbox/bootstrap.sh", "tail", "-f", "/dev/null"],
+                    "env": [{"name": "EXECD", "value": "/opt/opensandbox/execd"}],
                     "volumeMounts": [
-                        {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox/bin"}
+                        {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox"}
                     ],
                 }
             ],
             "volumes": [{"name": "opensandbox-bin", "emptyDir": {}}],
         }
+
+    def test_missing_ipv6_path_still_runs_windows_install(
+        self, tmp_path, monkeypatch
+    ):
+        ipv6_disable_path = tmp_path / "missing" / "disable_ipv6"
+        monkeypatch.setattr(
+            egress_helper,
+            "_IPV6_DISABLE_PATH",
+            ipv6_disable_path.relative_to(tmp_path).as_posix(),
+        )
+        pod_spec = self._make_pod_spec()
+        apply_windows_profile_overrides(
+            pod_spec=pod_spec,
+            entrypoint=[],
+            env={},
+            resource_limits={},
+            disable_ipv6_for_egress=True,
+        )
+
+        script = pod_spec["initContainers"][0]["args"][0]
+        shell = shutil.which("sh")
+        assert shell is not None
+        command_stubs = 'cp() { printf "%s\\n" "$*" >> cp.log; }; chmod() { :; }; '
+        result = subprocess.run(
+            [shell, "-c", command_stubs + script],
+            capture_output=True,
+            check=False,
+            text=True,
+            cwd=tmp_path,
+        )
+
+        assert result.returncode == 0
+        assert (tmp_path / "cp.log").read_text().splitlines() == [
+            "./install.bat /oem/install.bat",
+            "./execd.exe /oem/execd.exe",
+        ]
+        security_context = pod_spec["initContainers"][0]["securityContext"]
+        assert security_context == {"privileged": True}
 
     def test_custom_entrypoint_sets_command(self):
         pod_spec = self._make_pod_spec()

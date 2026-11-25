@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,11 +27,15 @@ T = TypeVar("T", bound="RenameFileItem")
 
 @_attrs_define
 class RenameFileItem:
-    """File rename/move operation
+    """File rename/move operation. Both src and dest must be non-empty. On ordinary filesystem routes, including execution-
+    identity routes, paths must also remain non-empty after environment-variable and home-directory expansion; isolated-
+    session paths are literal. Missing or empty paths, or empty expansions on ordinary routes, return 400
+    INVALID_REQUEST_BODY before any rename in the batch. Other path-expansion and filesystem errors retain their
+    existing handling and can leave earlier renames applied.
 
-    Attributes:
-        src (str): Source file path Example: /workspace/old.txt.
-        dest (str): Destination file path Example: /workspace/new.txt.
+        Attributes:
+            src (str): Source file path Example: /workspace/old.txt.
+            dest (str): Destination file path Example: /workspace/new.txt.
     """
 
     src: str

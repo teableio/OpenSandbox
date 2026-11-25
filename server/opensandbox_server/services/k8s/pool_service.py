@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 """Kubernetes Pool service for pre-warmed sandbox resource pools."""
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -29,20 +30,37 @@ from opensandbox_server.api.schema import (
     UpdatePoolRequest,
 )
 from opensandbox_server.services.constants import SandboxErrorCodes
-from opensandbox_server.services.k8s.client import K8sClient
+from opensandbox_server.services.k8s.client import (
+    K8sClient,
+    OPENSANDBOX_API_GROUP,
+    OPENSANDBOX_API_VERSION,
+    POOL_KIND,
+    POOL_PLURAL,
+)
 
 logger = logging.getLogger(__name__)
 
-_GROUP = "sandbox.opensandbox.io"
-_VERSION = "v1alpha1"
-_PLURAL = "pools"
+
+def _invalid_pool_spec(e: ApiException, action: str) -> HTTPException:
+    """Map an API-server validation rejection (400/422) to a client error."""
+    message = e.reason
+    try:
+        message = json.loads(e.body).get("message") or message
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "code": SandboxErrorCodes.INVALID_PARAMETER,
+            "message": f"Failed to {action} pool: {message}",
+        },
+    )
 
 
 class PoolService:
     """Service for managing Pool CRD resources in Kubernetes."""
 
     def __init__(self, k8s_client: K8sClient, namespace: str) -> None:
-        """Initialize PoolService."""
         self._custom_api = k8s_client.get_custom_objects_api()
         self._namespace = namespace
 
@@ -53,10 +71,9 @@ class PoolService:
         template: Dict[str, Any],
         capacity_spec: PoolCapacitySpec,
     ) -> Dict[str, Any]:
-        """Build a Pool CRD manifest dict."""
         return {
-            "apiVersion": f"{_GROUP}/{_VERSION}",
-            "kind": "Pool",
+            "apiVersion": f"{OPENSANDBOX_API_GROUP}/{OPENSANDBOX_API_VERSION}",
+            "kind": POOL_KIND,
             "metadata": {
                 "name": name,
                 "namespace": namespace,
@@ -73,7 +90,6 @@ class PoolService:
         }
 
     def _pool_from_raw(self, raw: Dict[str, Any]) -> PoolResponse:
-        """Convert a raw Pool CRD dict to a PoolResponse model."""
         metadata = raw.get("metadata", {})
         spec = raw.get("spec", {})
         raw_status = raw.get("status")
@@ -113,10 +129,10 @@ class PoolService:
 
         try:
             created = self._custom_api.create_namespaced_custom_object(
-                group=_GROUP,
-                version=_VERSION,
+                group=OPENSANDBOX_API_GROUP,
+                version=OPENSANDBOX_API_VERSION,
                 namespace=self._namespace,
-                plural=_PLURAL,
+                plural=POOL_PLURAL,
                 body=manifest,
             )
             logger.info(f"Created pool: name={request.name}, namespace={self._namespace}")
@@ -131,6 +147,8 @@ class PoolService:
                         "message": f"Pool '{request.name}' already exists.",
                     },
                 ) from e
+            if e.status in (400, 422):
+                raise _invalid_pool_spec(e, "create") from e
             logger.error(f"Kubernetes API error creating pool {request.name}: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -153,10 +171,10 @@ class PoolService:
         """Retrieve a Pool by name."""
         try:
             raw = self._custom_api.get_namespaced_custom_object(
-                group=_GROUP,
-                version=_VERSION,
+                group=OPENSANDBOX_API_GROUP,
+                version=OPENSANDBOX_API_VERSION,
                 namespace=self._namespace,
-                plural=_PLURAL,
+                plural=POOL_PLURAL,
                 name=pool_name,
             )
             return self._pool_from_raw(raw)
@@ -194,10 +212,10 @@ class PoolService:
         """List all Pools in the configured namespace."""
         try:
             result = self._custom_api.list_namespaced_custom_object(
-                group=_GROUP,
-                version=_VERSION,
+                group=OPENSANDBOX_API_GROUP,
+                version=OPENSANDBOX_API_VERSION,
                 namespace=self._namespace,
-                plural=_PLURAL,
+                plural=POOL_PLURAL,
             )
             items: List[PoolResponse] = [
                 self._pool_from_raw(item) for item in result.get("items", [])
@@ -242,10 +260,10 @@ class PoolService:
 
         try:
             updated = self._custom_api.patch_namespaced_custom_object(
-                group=_GROUP,
-                version=_VERSION,
+                group=OPENSANDBOX_API_GROUP,
+                version=OPENSANDBOX_API_VERSION,
                 namespace=self._namespace,
-                plural=_PLURAL,
+                plural=POOL_PLURAL,
                 name=pool_name,
                 body=patch_body,
             )
@@ -261,6 +279,8 @@ class PoolService:
                         "message": f"Pool '{pool_name}' not found.",
                     },
                 ) from e
+            if e.status in (400, 422):
+                raise _invalid_pool_spec(e, "update") from e
             logger.error(f"Kubernetes API error updating pool {pool_name}: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -285,10 +305,10 @@ class PoolService:
         """Delete a Pool resource."""
         try:
             self._custom_api.delete_namespaced_custom_object(
-                group=_GROUP,
-                version=_VERSION,
+                group=OPENSANDBOX_API_GROUP,
+                version=OPENSANDBOX_API_VERSION,
                 namespace=self._namespace,
-                plural=_PLURAL,
+                plural=POOL_PLURAL,
                 name=pool_name,
                 grace_period_seconds=0,
             )

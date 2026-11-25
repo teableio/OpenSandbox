@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,7 +46,6 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body.encode("utf-8"))
 
     def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
-        # Only allow the configured path
         if self.path != PATH:
             self._send(404, "not found")
             return
@@ -60,7 +59,6 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             parsed = None
 
-        # Log request info for debugging
         print(f"\n[{datetime.utcnow().isoformat()}Z] Received webhook")
         print(f"Path: {self.path}")
         print(f"Headers: {dict(self.headers)}")

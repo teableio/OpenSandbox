@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +30,25 @@ _mock_docker_client.containers.list.return_value = []
 docker.from_env = lambda: _mock_docker_client  # type: ignore
 
 from opensandbox_server.main import app  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def fastpath_tls(tmp_path_factory):
+    import subprocess
+
+    directory = tmp_path_factory.mktemp("fastpath-tls")
+    ca, key = directory / "ca.pem", directory / "key.pem"
+    proc = subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(key), "-out", str(ca), "-days", "1",
+        "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1",
+    ], check=False, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"openssl CA generation failed (exit {proc.returncode}): "
+            f"{proc.stderr.decode(errors='replace').strip()}"
+        )
+    return ca, key
 
 
 @pytest.fixture(scope="session")

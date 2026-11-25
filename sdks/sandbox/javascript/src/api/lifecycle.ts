@@ -1,11 +1,11 @@
-// Copyright 2026 Alibaba Group Holding Ltd..
-// 
+// Copyright 2026 The OpenSandbox Authors
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-// 
+//
 //     http://www.apache.org/licenses/LICENSE-2.0
-// 
+//
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,6 +18,252 @@
  */
 
 export interface paths {
+    "/sandboxes/{sandboxId}/networkpolicy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read sandbox network policy
+         * @description Fsb reads the egress-held policy record — the response reflects
+         *     exactly what the egress enforces, not the create-time binding input.
+         *     Other backends proxy the sandbox-side egress service. Requires
+         *     lifecycle API authentication.
+         */
+        get: operations["getSandboxNetworkPolicy"];
+        /**
+         * Replace the complete sandbox network policy
+         * @description Replaces defaultAction and all rules, rather than merging them. Fsb
+         *     relays the replacement to the egress-held policy record through the
+         *     FastPath handler relay — the ack means the egress applied it (and, with
+         *     policy persistence, that it is durable). The create-time binding input
+         *     is the bootstrap only; runtime changes never rewrite it, and a paused
+         *     (sealed) sandbox rejects mutations until resume. Other backends proxy
+         *     the sandbox-side egress service.
+         */
+        put: operations["replaceSandboxNetworkPolicy"];
+        post?: never;
+        /**
+         * Delete sandbox network policy rules by target
+         * @description Removes egress rules whose target matches one of the provided
+         *     entries. Matching is by exact target string; unknown targets are
+         *     silently ignored (idempotent). The current defaultAction is
+         *     preserved. Other backends proxy the sandbox-side egress service.
+         */
+        delete: operations["deleteSandboxNetworkPolicyRules"];
+        options?: never;
+        head?: never;
+        /**
+         * Patch sandbox network policy rules
+         * @description Merges egress rules into the current policy using the same semantics
+         *     as the sandbox-side egress service PATCH endpoint: incoming rules
+         *     take priority over existing rules with the same target and replace
+         *     them in place; within one patch payload, the first rule for a target
+         *     wins; existing rules for other targets and the current defaultAction
+         *     are preserved. Fsb composes the merge server-side (relay GET → merge
+         *     → relay PUT carrying the read revision) — a concurrent writer wins
+         *     and the stale merge is a 409. Other backends proxy the sandbox-side
+         *     egress service.
+         */
+        patch: operations["patchSandboxNetworkPolicy"];
+        trace?: never;
+    };
+    "/sandboxes/{sandboxId}/credential-vault": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read sanitized sandbox Credential Vault state
+         * @description Returns the sanitized Credential Vault state: credential names,
+         *     source types, binding metadata and the current revision. Credential
+         *     values are never returned on any read surface. Readback after a lost
+         *     mutation ack resolves the current revision (retry anchor for 412).
+         *     Other backends proxy the sandbox-side egress service.
+         */
+        get: operations["getSandboxCredentialVault"];
+        put?: never;
+        /**
+         * Create the sandbox Credential Vault
+         * @description Creates the initial Credential Vault revision and activates it for
+         *     credential injection. Inline credential values are write-only and are
+         *     never returned by any read. Credential Vault requires a network
+         *     policy; `defaultAction: deny` is strongly recommended.
+         *
+         *     For Fsb the server relays the revision to the egress-held vault over
+         *     the FastPath handler relay; the relay response is the synchronous
+         *     egress-validated ack, so success means the sandbox has loaded the
+         *     revision (create-only: 409 when a vault already exists, atomic across
+         *     server replicas). Other backends proxy the sandbox-side egress
+         *     service with sidecar semantics.
+         */
+        post: operations["createSandboxCredentialVault"];
+        /**
+         * Delete the sandbox Credential Vault
+         * @description Removes all credentials and bindings; the network policy is kept.
+         *     Other backends proxy the sandbox-side egress service.
+         */
+        delete: operations["deleteSandboxCredentialVault"];
+        options?: never;
+        head?: never;
+        /**
+         * Atomically mutate sandbox credentials and bindings
+         * @description Applies one atomic mutation set: `delete` first, then `replace`, then
+         *     `add` (per set). Every mentioned name must resolve exactly once —
+         *     `add` requires the name to be absent; `replace` and `delete` require
+         *     it to exist. `expectedRevision`, when provided, must match the
+         *     current revision (412 otherwise).
+         *
+         *     For Fsb the merge is composed server-side (relay read → in-memory
+         *     merge → relay replace) and validated by the egress vault; a rejected
+         *     mutation never leaves a partially applied revision (last-good kept).
+         *     Other backends proxy the sandbox-side egress service. On 412, re-read
+         *     the state and retry with the fresh revision.
+         */
+        patch: operations["patchSandboxCredentialVault"];
+        trace?: never;
+    };
+    "/sandboxes/{sandboxId}/credential-vault/credentials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List sanitized credential metadata
+         * @description Returns sanitized credential metadata (names, source types,
+         *     per-record revisions); values are never returned. Other backends
+         *     proxy the sandbox-side egress service.
+         */
+        get: operations["listSandboxCredentialVaultCredentials"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sandboxes/{sandboxId}/credential-vault/credentials/{credentialName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+                /** @description Credential name */
+                credentialName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get sanitized metadata for one credential
+         * @description Returns sanitized metadata for a single credential; values are never
+         *     returned. Other backends proxy the sandbox-side egress service.
+         */
+        get: operations["getSandboxCredentialVaultCredential"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sandboxes/{sandboxId}/credential-vault/bindings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List sanitized credential binding metadata
+         * @description Returns sanitized credential binding metadata (matchers and auth
+         *     shapes without credential values). Other backends proxy the
+         *     sandbox-side egress service.
+         */
+        get: operations["listSandboxCredentialVaultBindings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sandboxes/{sandboxId}/credential-vault/bindings/{bindingName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+                /** @description Credential binding name */
+                bindingName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get sanitized metadata for one binding
+         * @description Returns sanitized metadata for a single credential binding; values
+         *     are never returned. Other backends proxy the sandbox-side egress
+         *     service.
+         */
+        get: operations["getSandboxCredentialVaultBinding"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/metrics/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Report an SDK metrics event
+         * @description Accepts best-effort telemetry from SDKs (Phase 1: sandbox creation latency).
+         *
+         *     SDKs SHOULD fire-and-forget this call after `create` + readiness complete
+         *     (or after a failed creation attempt). Failures to report MUST NOT affect
+         *     sandbox usability. The server accepts events even when OpenTelemetry
+         *     export is disabled (noop recording).
+         *
+         *     SDK language and version are taken from the HTTP `User-Agent` header
+         *     (for example `OpenSandbox-Python-SDK/0.1.14`), not from the JSON body.
+         */
+        post: operations["reportMetricsEvent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sandboxes": {
         parameters: {
             query?: never;
@@ -72,13 +318,17 @@ export interface paths {
         put?: never;
         /**
          * Create a sandbox
-         * @description Creates a new sandbox from a container image or restores one from a
-         *     persistent sandbox snapshot with optional resource limits, environment
-         *     variables, and metadata.
+         * @description Creates a new sandbox from a container image, restores one from a
+         *     persistent sandbox snapshot, or allocates one from a pre-configured
+         *     Pool, with optional resource limits, environment variables, and metadata.
          *
-         *     Exactly one startup source must be provided:
+         *     Standard mode requires exactly one startup source:
          *     - `image` to provision directly from a container image.
          *     - `snapshotId` to restore from a previously created snapshot.
+         *
+         *     Pool mode uses `extensions.poolRef` to select the pre-created Pod and
+         *     schedules a per-allocation task; `image` and `snapshotId` are not
+         *     required.
          *
          *     When `image` is provided, `entrypoint` is required. When `snapshotId` is
          *     provided, `entrypoint` is optional. If omitted, the server defaults the
@@ -103,19 +353,16 @@ export interface paths {
             };
             responses: {
                 /**
-                 * @description Sandbox created and accepted for provisioning.
+                 * @description Sandbox created and provisioned successfully.
                  *
                  *     The returned sandbox includes:
                  *     - `id`: Unique sandbox identifier
-                 *     - `status.state: "Pending"` (auto-starting provisioning or restore)
-                 *     - `status.reason` and `status.message` indicating initialization stage
+                 *     - `status.state: "Running"` (provisioning completed synchronously)
+                 *     - `status.reason` and `status.message` indicating current state
                  *     - `metadata`, `expiresAt`, `createdAt`: Core sandbox information
                  *
                  *     Note: startup source details and `updatedAt` are not included in the create response.
                  *     Use GET /sandboxes/{sandboxId} to retrieve the complete sandbox information.
-                 *
-                 *     To track provisioning progress, poll GET /sandboxes/{sandboxId}.
-                 *     The sandbox will automatically transition to `Running` state once provisioning or restore completes.
                  */
                 202: {
                     headers: {
@@ -129,7 +376,37 @@ export interface paths {
                 };
                 400: components["responses"]["BadRequest"];
                 401: components["responses"]["Unauthorized"];
+                /**
+                 * @description Namespace ResourceQuota exhausted — the sandbox was not admitted.
+                 *
+                 *     The returned `ErrorResponse.code` is `KUBERNETES::QUOTA_EXCEEDED` and
+                 *     `message` carries the Kubernetes admission rejection details.
+                 *
+                 *     This fail-fast behavior applies when the `agent-sandbox` workload
+                 *     provider is used. With the default `batchsandbox` provider, quota
+                 *     exhaustion currently waits for the sandbox creation timeout.
+                 */
+                403: {
+                    headers: {
+                        "X-Request-ID": components["headers"]["XRequestId"];
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
                 409: components["responses"]["Conflict"];
+                /** @description Pool capacity remained unavailable before the acquisition timeout */
+                429: {
+                    headers: {
+                        "X-Request-ID": components["headers"]["XRequestId"];
+                        "Retry-After": components["headers"]["RetryAfter"];
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
                 500: components["responses"]["InternalServerError"];
             };
         };
@@ -156,6 +433,8 @@ export interface paths {
                 query?: {
                     /** @description Filter snapshots by source sandbox identifier */
                     sandboxId?: string;
+                    /** @description Filter snapshots by exact snapshot name */
+                    name?: string;
                     /**
                      * @description Filter by snapshot lifecycle state. Pass multiple times for OR logic.
                      *     Example: `?state=Ready&state=Failed`
@@ -333,7 +612,13 @@ export interface paths {
         post?: never;
         /**
          * Delete a sandbox
-         * @description Delete a sandbox, terminating its execution. The sandbox will transition through Stopping state to Terminated.
+         * @description Request sandbox deletion. Runtime cleanup may continue after the response.
+         *     For Kubernetes BatchSandbox workloads, queries report Stopping during cleanup
+         *     and return 404 once the resource is removed.
+         *     A 204 response means deletion was accepted, not that the sandbox's runtime
+         *     execution has terminated: the control object can disappear (and queries
+         *     can start returning 404) while runtime cleanup is still in progress, so a
+         *     404 after deletion must not be read as confirmed termination.
          */
         delete: {
             parameters: {
@@ -347,11 +632,7 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
-                /**
-                 * @description Sandbox successfully deleted.
-                 *
-                 *     Sandbox has been scheduled for termination and will transition to Stopping state, then Terminated.
-                 */
+                /** @description Sandbox deletion accepted. Runtime cleanup may still be in progress. */
                 204: {
                     headers: {
                         "X-Request-ID": components["headers"]["XRequestId"];
@@ -406,10 +687,14 @@ export interface paths {
          *
          *     This operation does not restart or recreate the sandbox container/pod.
          *
-         *     **Concurrency:** This endpoint uses read-modify-write without optimistic
-         *     locking (no `resourceVersion` check). Concurrent PATCH requests may
-         *     interleave and silently drop updates. Use a single writer or coordinate
-         *     out-of-band when concurrent modifications to the same key are expected.
+         *     **Concurrency:** On the Docker runtime concurrent PATCH requests apply
+         *     one after another, last write wins per key. On Kubernetes a PATCH
+         *     writes back the whole label set it read, with no `resourceVersion`
+         *     check, so a concurrent PATCH may revert a value another PATCH changed
+         *     or resurrect a key it deleted. A PATCH on an fsb sandbox sends only its
+         *     own keys, fenced by the sandbox UID and generation. Use a single writer
+         *     or coordinate out-of-band when concurrent modifications to the same
+         *     key are expected.
          */
         patch: {
             parameters: {
@@ -627,7 +912,10 @@ export interface paths {
         put?: never;
         /**
          * Renew sandbox expiration
-         * @description Renew the absolute expiration time of a sandbox.
+         * @description Set the absolute expiration time of a sandbox to the supplied future timestamp.
+         *     This may shorten, preserve, or extend the current expiration.
+         *     The server configuration `server.max_sandbox_timeout_seconds` applies only
+         *     to `timeout` on creation and does not limit this operation.
          */
         post: {
             parameters: {
@@ -689,14 +977,20 @@ export interface paths {
         get: {
             parameters: {
                 query?: {
-                    /** @description Whether to return a server-proxied URL */
+                    /**
+                     * @deprecated
+                     * @description Deprecated: the server-proxied data path is in maintenance mode and only
+                     *     receives security fixes and bug fixes; data-plane traffic should be served by
+                     *     the ingress gateway. When true, returns a server-proxied URL. Cannot be
+                     *     combined with `expires`.
+                     */
                     use_server_proxy?: boolean;
                     /**
                      * @description Optional. When set, the server **issues a signed** access route (OSEP-0011). The value
                      *     is **Linux / Unix epoch seconds** — a decimal `uint64` count of **whole seconds** since
                      *     the Unix epoch (`1970-01-01 00:00:00` UTC, same as POSIX / `time(2)`), not
                      *     milliseconds. Normalized to `expires_b36` for the four-segment route token. Omit to
-                     *     get the unsigned/legacy response shape.
+                     *     get the unsigned/legacy response shape. Cannot be combined with `use_server_proxy=true`.
                      */
                     expires?: string;
                 };
@@ -719,6 +1013,7 @@ export interface paths {
                 200: {
                     headers: {
                         "X-Request-ID": components["headers"]["XRequestId"];
+                        OpenSandboxOrigin: components["headers"]["SandboxOrigin"];
                         [name: string]: unknown;
                     };
                     content: {
@@ -740,10 +1035,100 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List fsb templates
+         * @description Lists the current tenant's templates with optional metadata filtering
+         *     (AND logic) and pagination. Results never include other tenants'
+         *     templates.
+         */
+        get: operations["listTemplates"];
+        put?: never;
+        /**
+         * Create a fsb template
+         * @description Declares a golden-image build executed by fast-sandbox.
+         *     Available on Kubernetes-backed runtimes (`kubernetes` and `fsb`);
+         *     501 otherwise (e.g. the Docker runtime).
+         *
+         *     The build is asynchronous: the response carries `status.phase: Pending`;
+         *     poll `GET /templates/{templateId}` until `Succeeded` (or `Failed` with
+         *     `status.message`). Only `Succeeded` templates can back template-based
+         *     sandbox creation. Kernel, execd and guest init are server-side build
+         *     inputs supplied from the `[fsb]` configuration, not client fields.
+         *
+         *     Templates are tenant-private: every template is scoped to the
+         *     requester's fast-sandbox namespace.
+         */
+        post: operations["createTemplate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/templates/{templateId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Template identifier (`tpl_<uuid>`) */
+                templateId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a fsb template
+         * @description Returns one template with its build status. The status is lazily
+         *     synced from the fast-sandbox SandboxTemplate CRD, so the response
+         *     reflects the latest build phase.
+         */
+        get: operations["getTemplate"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a fsb template
+         * @description Deletes the catalog row and the backing SandboxTemplate CRD.
+         *     Sandboxes already created from the template are unaffected: their
+         *     Sandbox CRs hold their own artifact references.
+         */
+        delete: operations["deleteTemplate"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description SDK-reported metrics event. Phase 1 covers sandbox creation latency from
+         *     the start of create until readiness succeeds or creation fails.
+         *
+         *     SDK language and package version are identified via the request
+         *     `User-Agent` header (for example `OpenSandbox-Go-SDK/0.1.0`), not body fields.
+         */
+        MetricsEvent: {
+            /**
+             * @description Metric event type
+             * @enum {string}
+             */
+            eventType: "sandbox.create";
+            /** @description Sandbox identifier when available (may be omitted if create failed before an ID was assigned) */
+            sandboxId?: string;
+            /** @description Container image URI or snapshot startup source label */
+            image?: string;
+            /** @description Wall-clock duration in milliseconds from create start to ready or failure */
+            createDurationMs: number;
+            /** @description Whether create + readiness completed successfully */
+            success: boolean;
+        };
         ListSandboxesResponse: {
             items: components["schemas"]["Sandbox"][];
             pagination: components["schemas"]["PaginationInfo"];
@@ -775,6 +1160,10 @@ export interface components {
             metadata?: {
                 [key: string]: string;
             };
+            /** @description Opaque extension data restored from provider-specific storage */
+            extensions?: {
+                [key: string]: string;
+            };
             /**
              * @description Platform constraint echoed from request or workload template.
              *     Null when no scheduling constraint is provided.
@@ -801,6 +1190,27 @@ export interface components {
         CreateSnapshotRequest: {
             /** @description Optional human-readable snapshot name. */
             name?: string;
+            /**
+             * @description What the snapshot persists.
+             *
+             *     - `full` (default): the most complete capture the runtime
+             *       supports. On the fast-sandbox backend that includes memory and
+             *       process state, and restoring resumes the sandbox in place;
+             *       Docker and Kubernetes snapshots capture the filesystem only and
+             *       do not restore running processes.
+             *     - `rootfsOnly`: only the writable filesystem; restoring boots a
+             *       fresh sandbox from the disk. Running processes and in-memory
+             *       state are discarded, and the entrypoint re-runs on restore.
+             *       Supported only on the fast-sandbox backend, for sandboxes on
+             *       either artifact path (native S3 templates and OCI/OverlayBD
+             *       templates); Docker and Kubernetes reject the mode before any
+             *       capture starts. Capture additionally requires a node qualified
+             *       for rootfs-only snapshots — an unqualified node fails the
+             *       snapshot instead of silently producing a `full` artifact.
+             * @default full
+             * @enum {string}
+             */
+            mode: "full" | "rootfsOnly";
         };
         /** @description Persistent point-in-time capture of a sandbox. */
         Snapshot: {
@@ -810,6 +1220,15 @@ export interface components {
             sandboxId: string;
             /** @description Optional human-readable snapshot name */
             name?: string;
+            /**
+             * @description Artifact class of the snapshot: `full` is the runtime's most
+             *     complete capture (memory and process state on the fast-sandbox
+             *     backend; filesystem-only on Docker and Kubernetes),
+             *     `rootfsOnly` preserves only the writable filesystem. Snapshots
+             *     created before this field existed report `full`.
+             * @enum {string}
+             */
+            mode?: "full" | "rootfsOnly";
             /** @description Current snapshot lifecycle status and detailed state information */
             status: components["schemas"]["SnapshotStatus"];
             /**
@@ -875,6 +1294,16 @@ export interface components {
             metadata?: {
                 [key: string]: string;
             };
+            /** @description Opaque extension data restored from provider-specific storage */
+            extensions?: {
+                [key: string]: string;
+            };
+            /**
+             * @description Current runtime-confirmed pool allocation. Omitted unless an active pool
+             *     allocation is confirmed; this is not a request echo, allocation history,
+             *     readiness signal, or Kubernetes introspection result.
+             */
+            allocation?: components["schemas"]["AllocationSummary"];
             /**
              * @description The command to execute as the sandbox's entry process.
              *     Always present in responses. For image-created sandboxes, this is copied
@@ -892,6 +1321,21 @@ export interface components {
              * @description Sandbox creation timestamp
              */
             createdAt: string;
+        };
+        /** @description Public summary of a confirmed active pool allocation. */
+        AllocationSummary: {
+            /**
+             * @description Allocation mode.
+             * @enum {string}
+             */
+            mode: "pool";
+            /** @description Concrete pool reference currently allocated. */
+            poolRef: string;
+            /**
+             * @description Current confirmed allocation state.
+             * @enum {string}
+             */
+            state: "allocated";
         };
         /**
          * @description High-level lifecycle state of the sandbox.
@@ -990,6 +1434,154 @@ export interface components {
             arch: "amd64" | "arm64";
         };
         /**
+         * @description A lifecycle command executed directly as an argv array. No implicit shell
+         *     expansion is performed. Use an explicit shell command such as
+         *     `["sh", "-c", "..."]` when shell syntax is required.
+         */
+        LifecycleHook: {
+            /** @description Command and arguments to execute. */
+            command: string[];
+            /** @description Maximum execution time in seconds, up to 3 hours (10800 seconds) for `preStart`. The server defaults to 60 when omitted. */
+            timeoutSeconds?: number;
+        };
+        /** @description A named lifecycle command scheduled inside the sandbox by execd. */
+        PeriodicLifecycleHook: {
+            /** @description Name unique among periodic hooks in this sandbox. */
+            name: string;
+            /**
+             * @description Five-field cron expression or descriptor such as `@hourly` or
+             *     `@every 30s`. An `@every` interval must be a whole number of
+             *     seconds with a minimum of one second.
+             */
+            schedule: string;
+            /** @description Command and arguments to execute without implicit shell expansion. */
+            command: string[];
+            /** @description Maximum execution time in seconds, up to 300. The server defaults to 60 when omitted. */
+            timeoutSeconds?: number;
+        };
+        /**
+         * @description Extensible container for sandbox lifecycle configuration. All fields
+         *     are optional. Future lifecycle events are added as new optional
+         *     fields without changing the semantics of existing fields.
+         *
+         *     `preStart` and `periodic` are hooks executed inside the sandbox by
+         *     execd. `idlePolicy` (OSEP-0024) and `renewalPolicy` (OSEP-0009) are
+         *     control-plane policies: they tell the server how to treat the
+         *     sandbox's state machine and never reach the guest.
+         */
+        SandboxLifecycle: {
+            /**
+             * @description Runs in execd after its HTTP server is ready and before the user
+             *     entrypoint on every sandbox container start. A failed or timed-out
+             *     hook prevents the user entrypoint from starting.
+             */
+            preStart?: components["schemas"]["LifecycleHook"];
+            /**
+             * @description Scheduled hooks run by execd while the sandbox is running. Runs of
+             *     the same named hook never overlap; a scheduled run is skipped when
+             *     its previous run is still active.
+             */
+            periodic?: components["schemas"]["PeriodicLifecycleHook"][];
+            /**
+             * @description Auto-pause and wake-on-access behavior (OSEP-0024). Supported only
+             *     by the fast-sandbox backend; other backends reject the field.
+             *     Omitting `idlePolicy` preserves non-automated behavior exactly:
+             *     the sandbox is never auto-paused and never auto-woken.
+             */
+            idlePolicy?: components["schemas"]["IdlePolicy"];
+            /**
+             * @description Renew-on-access behavior (OSEP-0009): each ingress-observed or
+             *     proxied access extends the sandbox expiration. Control-plane
+             *     state and never reaches the guest. Supported by the docker and
+             *     Kubernetes (pod) backends; the fast-sandbox backend rejects the
+             *     field. Supersedes the deprecated
+             *     `extensions["access.renew.extend.seconds"]` creation key, which
+             *     remains supported throughout 1.x and is removed in 2.0.
+             */
+            renewalPolicy?: components["schemas"]["RenewalPolicy"];
+        };
+        /**
+         * @description Renew-on-access behavior declared by the sandbox (OSEP-0009). The
+         *     policy is desired control-plane state: when the ingress gateway or
+         *     the server proxy observes traffic for the sandbox, the server extends
+         *     the sandbox expiration without client involvement. The policy never
+         *     reaches the guest.
+         *
+         *     Setting the policy has no effect unless the server operator enabled
+         *     the renew-intent integration (`[renew_intent]`). A missing policy
+         *     means the sandbox never auto-renews.
+         */
+        RenewalPolicy: {
+            /**
+             * @description Extension window X in seconds for each access-driven renewal:
+             *     the expiration is moved to `max(now + X, current expiresAt)`.
+             *     Must be between 300 (5 minutes) and 86400 (24 hours) inclusive.
+             */
+            extendSeconds: number;
+        };
+        /**
+         * @description Idle behavior declared by the sandbox (OSEP-0024). The policy is
+         *     desired state: the server validates it and persists it as the
+         *     reserved `sandbox.opensandbox.io/idle-policy` Sandbox CR annotation.
+         *
+         *     With `idleTimeoutSeconds`, the sandbox is auto-paused after that many
+         *     seconds without ingress-observed activity. Without it, the policy is
+         *     wake-only: the sandbox is never auto-paused, but a (manually) paused
+         *     sandbox wakes on access. A missing, malformed, or invalid policy is
+         *     treated exactly as absent — never as an implicit opt-in.
+         *
+         *     Constraints: `idleTimeoutSeconds` must not exceed the server's
+         *     configured activity TTL (default 1800), so a present-but-stale
+         *     activity key always implies idle-by-value. Enabling deployment flags
+         *     never changes the behavior of sandboxes that do not declare a policy.
+         */
+        IdlePolicy: {
+            /**
+             * @description Idle threshold X in seconds: the sandbox is auto-paused after X
+             *     continuously idle seconds. Absent together with `onIdle` means a
+             *     wake-only policy.
+             */
+            idleTimeoutSeconds?: number;
+            /**
+             * @description Action taken at the idle threshold. Required with, and only
+             *     valid with, `idleTimeoutSeconds`. Only `pause` exists today; the
+             *     enum exists so future actions are additive.
+             * @enum {string}
+             */
+            onIdle?: "pause";
+            /**
+             * @description Whether incoming traffic may wake the sandbox from `Paused`.
+             *     Defaults to `true` when omitted.
+             *     `false` keeps today's paused behavior (permanent 503 through the
+             *     gateway) and only `POST /sandboxes/{sandboxId}/resume` restores
+             *     the sandbox.
+             */
+            wakeOnAccess?: boolean;
+            /**
+             * @description Application-declared activity probe. When the sandbox is
+             *     otherwise idle, the server issues `GET {path}` on `{port}`;
+             *     `200 {"active": true}` counts as activity and resets the idle
+             *     clock, while `{"active": false}`, any failure, or a timeout
+             *     records nothing. Relevant only with auto-pause.
+             */
+            activeProbe?: components["schemas"]["ActivityProbe"];
+        };
+        /**
+         * @description Endpoint inside the sandbox that answers `{"active": bool,
+         *     "message"?: string}` with 200 while work is in progress.
+         */
+        ActivityProbe: {
+            /** @description Sandbox port serving the probe endpoint. */
+            port: number;
+            /**
+             * @description Absolute HTTP path of the probe endpoint. Must not contain
+             *     whitespace or control characters.
+             */
+            path: string;
+            /** @description Probe request budget in seconds. The server defaults to 2 when omitted. */
+            timeoutSeconds?: number;
+        };
+        /**
          * @description JSON Merge Patch (RFC 7396) request body for updating sandbox metadata.
          *
          *     The request body is the metadata object itself:
@@ -1008,12 +1600,24 @@ export interface components {
             [key: string]: string | null;
         };
         /**
-         * @description Request to create a new sandbox from either a container image or a snapshot.
-         *     Exactly one of `image` or `snapshotId` must be provided.
+         * @description Request to create a new sandbox from either a container image, a snapshot,
+         *     or a pre-configured pool (via `extensions.poolRef`).
+         *
+         *     **Standard mode**: Exactly one of `image` or `snapshotId` must be provided,
+         *     and `resourceLimits` is required except for an FSB RootfsOnly snapshot restore.
          *
          *     When `image` is provided, `entrypoint` is required. When `snapshotId` is
          *     provided, `entrypoint` is optional. If omitted, the server defaults the
          *     sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
+         *
+         *     **Pool mode**: When `extensions.poolRef` is set, the sandbox is created from
+         *     a pre-configured on-demand Pool. In this case `image` and `resourceLimits`
+         *     are optional and defined by the Pool CRD template. `entrypoint` is also
+         *     optional; when omitted, the server creates a per-allocation task using
+         *     `['tail', '-f', '/dev/null']`. The Pool must run task-executor and provide
+         *     bootstrap plus execd.
+         *     `snapshotId`, `networkPolicy`, `platform`, `volumes`, and
+         *     `credentialProxy.enabled` must not be provided together with `poolRef`.
          *
          *     **Note**: API Key authentication is required via the `OPEN-SANDBOX-API-KEY` header.
          */
@@ -1028,6 +1632,24 @@ export interface components {
              *     Mutually exclusive with `image`.
              */
             snapshotId?: string;
+            /**
+             * @description Fsb (fast-sandbox microVM) template to create the sandbox from; on the
+             *     `kubernetes` runtime this routes the create to the fsb catalog.
+             *     Mutually exclusive with `image` and `snapshotId`; in template mode
+             *     the workload shape is fixed by the template's golden image, so
+             *     `entrypoint`, `env`, `resourceLimits`, `resourceRequests`,
+             *     `volumes`, `platform`, `secureAccess` and
+             *     lifecycle hooks are rejected (400), and `timeout` is required.
+             *     `credentialProxy` is accepted and ignored: the vault is not
+             *     carried at create time — it is configured after creation through
+             *     the server-routed Credential Vault API
+             *     (`/sandboxes/{sandboxId}/credential-vault`).
+             *     `lifecycle.idlePolicy` is allowed: it is control-plane state,
+             *     not workload shape.
+             *     The template must belong to the requester's tenant and be
+             *     `Succeeded`; anything else yields 404 (no existence leak).
+             */
+            templateId?: string;
             /**
              * @description Optional platform constraint for sandbox scheduling/runtime selection.
              *
@@ -1046,10 +1668,21 @@ export interface components {
              */
             timeout?: number | null;
             /**
-             * @description Runtime resource constraints for the sandbox instance.
+             * @description Runtime resource constraints (hard caps) for the sandbox instance.
+             *     For an FSB RootfsOnly snapshot restore, omitted CPU and memory limits inherit their recorded values. Otherwise required when `extensions.poolRef` is not set.
+             *     Optional when using pool mode (resource limits are defined by the Pool CRD template).
              *     SDK clients should provide sensible defaults (e.g., cpu: "500m", memory: "512Mi").
              */
-            resourceLimits: components["schemas"]["ResourceLimits"];
+            resourceLimits?: components["schemas"]["ResourceLimits"];
+            /**
+             * @description Resource reservations (guaranteed minimums) for the sandbox instance.
+             *     When provided, these values are used as Kubernetes resource `requests`,
+             *     enabling Burstable QoS class (where `requests < limits`).
+             *     When omitted, `resourceLimits` values are used for both limits and requests,
+             *     resulting in Guaranteed QoS class.
+             *     Only meaningful for Kubernetes-based runtimes; ignored by Docker runtime.
+             */
+            resourceRequests?: components["schemas"]["ResourceRequests"];
             /**
              * @description Environment variables to inject into the sandbox runtime.
              * @example {
@@ -1075,12 +1708,36 @@ export interface components {
                 [key: string]: string;
             };
             /**
+             * @description Optional declarative sandbox lifecycle configuration. `preStart`
+             *     and `periodic` are hooks; the server transports them to execd and
+             *     callers must not depend on the internal transport mechanism. The
+             *     configuration is not included in Sandbox responses.
+             *
+             *     Lifecycle hooks are not supported together with
+             *     `extensions.poolRef`, because Pool Pods are pre-created before
+             *     request-specific hooks are known. Runtimes that do not implement
+             *     lifecycle hook transport reject hooks. `lifecycle.idlePolicy` is
+             *     not a hook and may accompany `extensions.poolRef`; it is honored
+             *     only by the fast-sandbox backend and rejected by others.
+             *     `lifecycle.renewalPolicy` is likewise not a hook: it may
+             *     accompany `extensions.poolRef` and is honored by the docker and
+             *     Kubernetes (pod) backends, while the fast-sandbox backend rejects
+             *     it. Setting both `lifecycle.renewalPolicy` and the deprecated
+             *     `extensions["access.renew.extend.seconds"]` is accepted only when
+             *     their parsed values match; conflicting values are rejected with
+             *     HTTP 400.
+             */
+            lifecycle?: components["schemas"]["SandboxLifecycle"];
+            /**
              * @description The command to execute as the sandbox's entry process.
              *
              *     Required when `image` is provided.
              *
              *     Optional when `snapshotId` is provided. If omitted for snapshot
              *     restore, the server defaults to `["tail", "-f", "/dev/null"]`.
+             *
+             *     Optional when `extensions.poolRef` is provided. If omitted for Pool
+             *     mode, the server uses the same default in a per-allocation task.
              *
              *     Explicitly specifies the user's expected main process, allowing the sandbox management
              *     service to reliably inject control processes before executing this command.
@@ -1102,8 +1759,26 @@ export interface components {
              * @description Optional outbound network policy for the sandbox.
              *     Shape matches the sidecar `/policy` endpoint. If omitted or empty,
              *     the sidecar starts in allow-all mode until updated.
+             *     For Fsb, an omitted policy still registers an egress binding,
+             *     seeded with a no-op default-allow record (the sandbox behaves
+             *     like a policy-less one until changed): runtime changes go
+             *     through the networkpolicy endpoints (handler relay), which
+             *     require that registration.
+             *     Not supported together with `extensions.poolRef`; pooled pods are
+             *     pre-created, so the server rejects this combination instead of
+             *     silently ignoring the requested policy.
              */
             networkPolicy?: components["schemas"]["NetworkPolicy"];
+            /**
+             * @description Optional Credential Vault proxy startup settings. Set `enabled: true`
+             *     to enable transparent MITM support for credential injection. Plain
+             *     `networkPolicy` does not enable transparent MITM unless this option
+             *     is set. On fsb template-backed sandboxes the field is accepted and
+             *     ignored at create time: the shared-Fastlet egress has no per-sandbox
+             *     sidecar, and the vault is configured after creation through the
+             *     server-routed Credential Vault API.
+             */
+            credentialProxy?: components["schemas"]["CredentialProxyConfig"];
             /**
              * @description Opts the sandbox into secured access for endpoint access.
              *     This is currently supported only for Kubernetes sandboxes exposed
@@ -1132,7 +1807,17 @@ export interface components {
              *     - **Pass-through**: SDKs and middleware must treat this object as opaque and pass it through transparently.
              *
              *     **Well-known keys**:
-             *     - `access.renew.extend.seconds` (optional): Decimal integer string from **300** to **86400** (5 minutes to 24 hours inclusive). Opts the sandbox into OSEP-0009 renew-on-access and sets per-renewal extension seconds. Omit to disable. Invalid values are rejected at creation with HTTP 400 (validated on the lifecycle create endpoint via `validate_extensions` in server `src/extensions/validation.py`).
+             *     - `access.renew.extend.seconds` (**deprecated**): Decimal integer
+             *       string from **300** to **86400** (5 minutes to 24 hours
+             *       inclusive). Opts the sandbox into OSEP-0009 renew-on-access and
+             *       sets per-renewal extension seconds. Omit to disable. Invalid
+             *       values are rejected at creation with HTTP 400 (validated on the
+             *       lifecycle create endpoint via `validate_extensions` in server
+             *       `src/extensions/validation.py`). Superseded by
+             *       `lifecycle.renewalPolicy.extendSeconds`: prefer the structured
+             *       field in new code. The extensions key remains supported
+             *       throughout 1.x and is removed in 2.0; when both are set, their
+             *       parsed values must match or creation fails with HTTP 400.
              */
             extensions?: {
                 [key: string]: string;
@@ -1144,6 +1829,14 @@ export interface components {
          *     - `cpu`: CPU allocation in millicores (e.g., "250m" for 0.25 CPU cores)
          *     - `memory`: Memory allocation in bytes or human-readable format (e.g., "512Mi", "1Gi")
          *     - `gpu`: Number of GPU devices (e.g., "1")
+         *     - `disk`: Writable-layer disk quota (e.g., "10G", "512M"); `storage` and
+         *       `ephemeral-storage` are accepted as aliases. On the Docker runtime this
+         *       bounds only the container's writable layer via HostConfig.StorageOpt —
+         *       bind mounts, named volumes, and read-only image layers are not covered —
+         *       and requires a quota-capable storage driver (for example overlay2 on XFS
+         *       with pquota); the create request fails with INVALID_PARAMETER if the
+         *       daemon cannot enforce it. On the Windows profile this maps to the
+         *       sandbox disk size.
          *
          *     New resource types can be added without API changes.
          * @example {
@@ -1155,11 +1848,51 @@ export interface components {
         ResourceLimits: {
             [key: string]: string;
         };
+        /**
+         * @description Resource reservations for the sandbox, as key-value pairs in Kubernetes
+         *     resource specification syntax (same key space as `resourceLimits`):
+         *     - `cpu`: CPU reservation (e.g., "250m" for 0.25 CPU cores)
+         *     - `memory`: Memory reservation (e.g., "512Mi", "1Gi")
+         *
+         *     On Kubernetes-based runtimes these become the sandbox container's
+         *     `requests` — scheduling guarantees, not hard caps. This field is
+         *     ignored by the Docker runtime, which reads only `resourceLimits`, so
+         *     a `disk` reservation here does not create a writable-layer quota.
+         * @example {
+         *       "cpu": "500m",
+         *       "memory": "512Mi"
+         *     }
+         */
+        ResourceRequests: {
+            [key: string]: string;
+        };
+        /**
+         * @description Guest machine sizing for a Fast Sandbox template, as key-value pairs:
+         *     - `cpu`: guest vCPUs (e.g., "1")
+         *     - `memory`: guest memory (e.g., "512Mi")
+         *     - `disk`: logical size of the guest rootfs (e.g., "2Gi"); the artifact
+         *       set is stored and P2P-pulled at this size, so keep it just above the
+         *       expanded source image.
+         *
+         *     Defaults when omitted: cpu `1`, memory `512Mi`, disk `2Gi`.
+         *     Only these three keys are accepted: `storage` and `ephemeral-storage`
+         *     are sandbox writable-layer quota aliases and are not template keys —
+         *     the request fails with HTTP 400 if they are set here.
+         * @example {
+         *       "cpu": "1",
+         *       "memory": "512Mi",
+         *       "disk": "2Gi"
+         *     }
+         */
+        FsbTemplateResourceLimits: {
+            [key: string]: string;
+        };
         RenewSandboxExpirationRequest: {
             /**
              * Format: date-time
              * @description New absolute expiration time in UTC (RFC 3339 format).
-             *     Must be in the future and after the current expiresAt time.
+             *     Must be in the future. May be earlier than, equal to, or later than the current expiresAt.
+             *     The creation-time limit `server.max_sandbox_timeout_seconds` does not apply.
              *
              *     Example: "2025-11-16T14:30:45Z"
              */
@@ -1204,6 +1937,24 @@ export interface components {
             };
         };
         /**
+         * @description Policy intent for Fsb, or the sidecar policy for other backends.
+         *     Fsb does not report live enforcement state or enforcementMode.
+         */
+        PolicyStatusResponse: {
+            /** @example ok */
+            status?: string;
+            /**
+             * @description Mode derived from the returned policy.
+             * @example deny_all
+             */
+            mode?: string;
+            /** @description Optional sidecar enforcement backend; omitted for Fsb. */
+            enforcementMode?: string;
+            /** @description Optional context returned by the sidecar. */
+            reason?: string;
+            policy?: components["schemas"]["NetworkPolicy"];
+        };
+        /**
          * @description Egress network policy matching the sidecar `/policy` request body.
          *     If `defaultAction` is omitted, the sidecar defaults to "deny"; passing an empty
          *     object or null results in allow-all behavior at startup.
@@ -1217,6 +1968,25 @@ export interface components {
             /** @description List of egress rules evaluated in order. */
             egress?: components["schemas"]["NetworkRule"][];
         };
+        /**
+         * @description Credential Vault proxy startup settings. This is an explicit opt-in for
+         *     transparent MITM support used by credential injection. Credential Vault
+         *     requires `dns+nft` enforcement and a network policy. A deny-default policy
+         *     is strongly recommended; default-allow remains temporarily supported for
+         *     backward compatibility and emits a security warning.
+         */
+        CredentialProxyConfig: {
+            /**
+             * @description When true, the server starts the egress sidecar with transparent
+             *     MITM enabled and installs the runtime-managed MITM CA bundle into
+             *     the sandbox container. Requires `networkPolicy` and server
+             *     `[egress].mode = "dns+nft"`. `defaultAction: deny` is strongly
+             *     recommended; default-allow support is deprecated.
+             * @default false
+             */
+            enabled: boolean;
+        };
+        /** @description Egress rule. At least one of `target` or `ports` must be provided; when both are present the rule applies to `ports` on `target` only. Enforced by the server and the egress sidecar. */
         NetworkRule: {
             /**
              * @description Whether to allow or deny matching targets.
@@ -1224,10 +1994,221 @@ export interface components {
              */
             action: "allow" | "deny";
             /**
-             * @description FQDN or wildcard domain (e.g., "example.com", "*.example.com").
-             *     IP/CIDR not yet supported in the egress MVP.
+             * @description FQDN, wildcard domain (e.g., "example.com", "*.example.com"), IP
+             *     address, or CIDR. May be omitted when `ports` is set (see below);
+             *     otherwise required.
              */
-            target: string;
+            target?: string;
+            /**
+             * @description Restricts this rule to specific TCP destination ports.
+             *
+             *     - `target` omitted, `ports` set: the rule applies to these ports
+             *       across all IPv4/IPv6 destinations.
+             *     - `target` is an IP or CIDR, `ports` set: the rule applies to that
+             *       destination only on these ports.
+             *     - `target` is a domain: `ports` is rejected with a validation
+             *       error. Domain rules are evaluated at the DNS layer, which has no
+             *       port dimension; combining them is not supported yet.
+             *
+             *     TCP only for now; UDP port scoping is not supported.
+             *
+             *     Under `defaultAction: deny`, the DNS proxy still denies hostname
+             *     lookups for targetless allow rules (it matches domain rules
+             *     only), so this shape serves direct-IP clients; hostname access
+             *     requires explicit domain rules or stable IPs.
+             */
+            ports?: number[];
+        };
+        /**
+         * @description Initial Credential Vault revision. Inline credential values are
+         *     write-only. The vault requires a network policy; `defaultAction:
+         *     deny` is strongly recommended.
+         */
+        CredentialVaultCreateRequest: {
+            credentials: components["schemas"]["Credential"][];
+            bindings: components["schemas"]["CredentialBinding"][];
+        };
+        /**
+         * @description One atomic mutation set. Applied per set as delete → replace → add;
+         *     every mentioned name must resolve exactly once (add requires the
+         *     name to be absent, replace and delete require it to exist).
+         */
+        CredentialVaultMutationRequest: {
+            /** @description Optional optimistic concurrency guard; mismatch fails with 412. */
+            expectedRevision?: number;
+            credentials?: components["schemas"]["CredentialMutationSet"];
+            bindings?: components["schemas"]["CredentialBindingMutationSet"];
+        };
+        CredentialMutationSet: {
+            add?: components["schemas"]["Credential"][];
+            replace?: components["schemas"]["Credential"][];
+            delete?: string[];
+        };
+        CredentialBindingMutationSet: {
+            add?: components["schemas"]["CredentialBinding"][];
+            replace?: components["schemas"]["CredentialBinding"][];
+            delete?: string[];
+        };
+        /** @description Sanitized Credential Vault state — credential values never appear. */
+        CredentialVaultState: {
+            revision: number;
+            credentials: components["schemas"]["CredentialMetadata"][];
+            bindings: components["schemas"]["CredentialBindingMetadata"][];
+        };
+        CredentialListResponse: {
+            revision: number;
+            credentials: components["schemas"]["CredentialMetadata"][];
+        };
+        CredentialBindingListResponse: {
+            revision: number;
+            bindings: components["schemas"]["CredentialBindingMetadata"][];
+        };
+        CredentialMetadata: {
+            name: string;
+            /** @description Credential source kind (`inline` or `exchange`). */
+            sourceType: string;
+            /**
+             * @description Revision that last touched this record. Fsb stamps records with
+             *     the read revision (the relay surface does not carry per-record
+             *     revisions); other backends track per-record revisions.
+             */
+            revision: number;
+        };
+        CredentialBindingMetadata: {
+            name: string;
+            /** @description See CredentialMetadata.revision for the Fsb caveat. */
+            revision: number;
+            match?: components["schemas"]["CredentialMatch"];
+            auth?: components["schemas"]["CredentialAuthMetadata"];
+        };
+        /** @description Sanitized auth shape — `type` (plus `name` for `apiKey`) for static kinds; `credential` only for the typeless exchange form. */
+        CredentialAuthMetadata: {
+            type?: string;
+            name?: string;
+            credential?: string;
+        };
+        Credential: {
+            name: string;
+            source: components["schemas"]["CredentialSource"];
+        };
+        /**
+         * @description Where the credential material comes from. Exactly one kind, selected
+         *     by `type`:
+         *
+         *     - `inline`: the secret value travels in this request via `value`.
+         *       Inline values are write-only and never appear in reads.
+         *     - `exchange`: no local material. Egress resolves header sets per
+         *       request from a header-resolver service addressed by `endpoint`.
+         *       Supported endpoint forms are `unix:///absolute/path` (HTTP over a
+         *       Unix domain socket) and `https://host[:port]` (TLS); anything else
+         *       is rejected with 400.
+         *
+         *     Fields of the other kind must be absent; for example `value` together
+         *     with `type: exchange` is rejected with 400.
+         */
+        CredentialSource: {
+            /** @enum {string} */
+            type: "inline" | "exchange";
+            /**
+             * @description Inline secret value. Required when `type` is `inline`; must be
+             *     absent otherwise.
+             */
+            value?: string;
+            /**
+             * @description Header-resolver endpoint. Required when `type` is `exchange`; must
+             *     be absent otherwise.
+             */
+            endpoint?: string;
+        };
+        CredentialBinding: {
+            name: string;
+            match: components["schemas"]["CredentialMatch"];
+            auth: components["schemas"]["CredentialAuth"];
+        };
+        CredentialMatch: {
+            /**
+             * @default [
+             *       "https"
+             *     ]
+             */
+            schemes: ("https" | "http")[];
+            /**
+             * @deprecated
+             * @description Deprecated. Port is derived from scheme (https→443, http→80). Values other than 80 or 443 are rejected with a validation error. Standard values (80/443) are accepted but ignored.
+             */
+            ports?: number[];
+            hosts: string[];
+            /**
+             * @default [
+             *       "GET",
+             *       "POST",
+             *       "PUT",
+             *       "PATCH",
+             *       "DELETE"
+             *     ]
+             */
+            methods: string[];
+            /**
+             * @default [
+             *       "/*"
+             *     ]
+             */
+            paths: string[];
+        };
+        /**
+         * @description How a binding injects credential material. Exactly one auth kind:
+         *
+         *     - `bearer`: `type: bearer` plus `credential`.
+         *     - `basic`: `type: basic` plus `credential`.
+         *     - `apiKey`: `type: apiKey` plus `name` and `credential`.
+         *     - `customHeaders`: `type: customHeaders` plus `headers`.
+         *     - `passthrough`: `type: passthrough`, no credential reference.
+         *     - typeless exchange: `type` omitted with only `credential` set. The
+         *       referenced credential must be exchange-sourced; egress resolves the
+         *       header set per request from the credential's endpoint.
+         *
+         *     Static kinds must reference inline-sourced credentials, and the
+         *     typeless form must reference an exchange-sourced credential and must
+         *     not set `name`, `headers`, or `substitutions`. The five static kinds
+         *     accept optional `substitutions`. Violations are rejected with 400.
+         */
+        CredentialAuth: {
+            /**
+             * @description Static auth kind. Omit entirely for the typeless exchange form.
+             * @enum {string}
+             */
+            type?: "bearer" | "basic" | "apiKey" | "customHeaders" | "passthrough";
+            /**
+             * @description Name of the sandbox-local credential whose value is injected. For
+             *     `bearer` the value becomes the bearer token; for `basic` it
+             *     contains pre-encoded base64(username:password). Required for
+             *     `bearer`, `basic`, `apiKey`, and the typeless exchange form; must
+             *     be absent otherwise.
+             */
+            credential?: string;
+            /** @description Request header name. Required for `apiKey`; must be absent otherwise. */
+            name?: string;
+            /** @description Static header set. Required for `customHeaders`; must be absent otherwise. */
+            headers?: components["schemas"]["CustomHeaderEntry"][];
+            /**
+             * @description Optional placeholder replacement set. Accepted for the five static
+             *     kinds; must be absent for the typeless exchange form.
+             */
+            substitutions?: components["schemas"]["CredentialSubstitution"][];
+        };
+        CustomHeaderEntry: {
+            name: string;
+            /** @description Credential name whose value is injected. */
+            credential: string;
+        };
+        /** @description Literal case-sensitive placeholder replacement for selected request surfaces. Replacement is opt-in and scoped per binding. */
+        CredentialSubstitution: {
+            /** @description Name of the sandbox-local credential used as the replacement value. */
+            credential: string;
+            /** @description Literal placeholder to replace. */
+            placeholder: string;
+            /** @description Request surfaces where the placeholder may be replaced. */
+            in: ("path" | "query" | "header" | "body")[];
         };
         /**
          * @description Storage mount definition for a sandbox. Each volume entry contains:
@@ -1302,9 +2283,9 @@ export interface components {
             /**
              * @description When true, the volume is automatically removed when the sandbox
              *     is deleted. Only applies to volumes that were auto-created by the
-             *     server (Docker only). Pre-existing volumes are never removed.
-             *     Has no effect on Kubernetes PVCs, whose lifecycle is managed by
-             *     the StorageClass reclaim policy.
+             *     server on this request; pre-existing volumes are never removed.
+             *     For Kubernetes, the resulting PVC delete triggers the bound PV's
+             *     StorageClass reclaim policy (`Retain`/`Delete`).
              * @default false
              */
             deleteOnSandboxTermination: boolean;
@@ -1357,6 +2338,132 @@ export interface components {
             accessKeyId: string;
             /** @description OSS access key secret for inline credentials mode. */
             accessKeySecret: string;
+        };
+        /** @description Build-side readiness gate for a fsb template. */
+        FsbTemplateReadiness: {
+            /**
+             * @description Readiness probe checked first during the golden-image build;
+             *     e.g. `tcp://127.0.0.1:44772` or `cmd://<command>`.
+             */
+            probe?: string;
+            /** @description Fallback warmup window in seconds (default 60). */
+            warmupSeconds?: number;
+        };
+        /**
+         * @description Request to create a Fast Sandbox template: a fast-sandbox golden-image build
+         *     The server persists the build intent, projects it onto a
+         *     SandboxTemplate CRD, and reports the asynchronous build through the
+         *     template status. Kernel, execd and guest init are server-side build
+         *     inputs supplied from the `[fsb]` configuration, not client fields.
+         */
+        CreateFsbTemplateRequest: {
+            /** @description Source OCI image reference the golden image is built from. */
+            image: string;
+            /**
+             * @description Guest machine sizing: `cpu` -> guest vCPUs, `memory` -> guest memory,
+             *     `disk` -> logical size of the guest rootfs (parallel resource keys).
+             *     The artifact set is stored and P2P-pulled at the `disk` size, so keep
+             *     it just above the expanded source image. Defaults when omitted:
+             *     cpu `1`, memory `512Mi`, disk `2Gi`.
+             */
+            resourceLimits?: components["schemas"]["FsbTemplateResourceLimits"];
+            /**
+             * @description Guest business command (argv); empty defaults to
+             *     `["tail", "-f", "/dev/null"]`.
+             */
+            entrypoint?: string[];
+            /**
+             * @description Environment variables baked into the golden image (injected as
+             *     `/etc/sandbox-init.env` in the guest; literal values only). The
+             *     source image's own OCI `Config.Env` is inherited like a container
+             *     runtime would; an env with the same name here overrides the
+             *     inherited value. Names must be valid shell variable names
+             *     (`[A-Za-z_][A-Za-z0-9_]*`).
+             * @example {
+             *       "LOG_LEVEL": "info"
+             *     }
+             */
+            env?: {
+                [key: string]: string;
+            };
+            /** @description Custom key-value metadata for management, filtering, and tagging. */
+            metadata?: {
+                [key: string]: string;
+            };
+            readiness?: components["schemas"]["FsbTemplateReadiness"];
+            /**
+             * @description Publish destination: `s3://bucket/publish` for native artifacts or
+             *     `oci://registry/repository` for overlaybd artifacts. OCI targets
+             *     must not contain a tag or digest; the builder generates unique
+             *     tags per build. Registry credentials are configured on the server.
+             */
+            publish: string;
+            /**
+             * @description Storage encoding of the produced snapshot set.
+             * @default overlaybd
+             * @enum {string}
+             */
+            format: "native" | "overlaybd";
+        };
+        /** @description Status of a fsb template build. */
+        FsbTemplateStatus: {
+            /**
+             * @description Build lifecycle phase.
+             * @enum {string}
+             */
+            phase: "Pending" | "Building" | "Succeeded" | "Failed";
+            /**
+             * @description Published S3 manifest reference or immutable OCI reference
+             *     (`oci://registry/repository@sha256:...`); present when Succeeded.
+             */
+            manifestRef?: string;
+            /** @description Failure reason when phase is Failed. */
+            message?: string;
+        };
+        /**
+         * @description A fsb template: a golden image whose build is declared and executed
+         *     by fast-sandbox.
+         */
+        FsbTemplate: {
+            /** @description Server-generated template ID (`tpl_<uuid>`). */
+            templateId: string;
+            /** @description Source OCI image reference. */
+            image: string;
+            resourceLimits?: components["schemas"]["FsbTemplateResourceLimits"];
+            /** @description Guest business command (argv). */
+            entrypoint?: string[];
+            /** @description Environment variables baked into the golden image. */
+            env?: {
+                [key: string]: string;
+            };
+            /** @description Custom metadata from the creation request. */
+            metadata?: {
+                [key: string]: string;
+            };
+            readiness?: components["schemas"]["FsbTemplateReadiness"];
+            /** @description S3-compatible or repository-only OCI publish target. */
+            publish: string;
+            /**
+             * @description Snapshot storage encoding.
+             * @enum {string}
+             */
+            format: "native" | "overlaybd";
+            status: components["schemas"]["FsbTemplateStatus"];
+            /**
+             * Format: date-time
+             * @description Creation timestamp (RFC 3339 UTC).
+             */
+            createdAt: string;
+            /**
+             * Format: date-time
+             * @description Last update timestamp (RFC 3339 UTC).
+             */
+            updatedAt: string;
+        };
+        /** @description Paginated collection of fsb templates. */
+        ListFsbTemplatesResponse: {
+            items: components["schemas"]["FsbTemplate"][];
+            pagination: components["schemas"]["PaginationInfo"];
         };
     };
     responses: {
@@ -1419,6 +2526,16 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
+        /** @description The provided expectedRevision does not match the current revision */
+        PreconditionFailed: {
+            headers: {
+                "X-Request-ID": components["headers"]["XRequestId"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
         /** @description An unexpected server error occurred */
         InternalServerError: {
             headers: {
@@ -1438,6 +2555,14 @@ export interface components {
     };
     requestBodies: never;
     headers: {
+        /**
+         * @description Origin of the sandbox: `template` when the sandbox runs on a fsb
+         *     golden-image template (no sandbox-side egress sidecar; egress policy
+         *     is managed through the lifecycle control plane). The set of values
+         *     may grow over time; clients must treat a missing or unknown value as
+         *     "not template-backed" and keep using the egress sidecar.
+         */
+        SandboxOrigin: string;
         /** @description Unique request identifier for tracing */
         XRequestId: string;
         /** @description URI of the newly created or related resource */
@@ -1448,4 +2573,633 @@ export interface components {
     pathItems: never;
 }
 export type $defs = Record<string, never>;
-export type operations = Record<string, never>;
+export interface operations {
+    getSandboxNetworkPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Policy intent (Fsb) or sidecar policy (other backends). */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyStatusResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Policy state is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    replaceSandboxNetworkPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NetworkPolicy"];
+            };
+        };
+        responses: {
+            /** @description Committed policy intent; Fsb omits enforcementMode. */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyStatusResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+            /** @description FastPath or policy state is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteSandboxNetworkPolicyRules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": string[];
+            };
+        };
+        responses: {
+            /** @description Committed policy intent; Fsb omits enforcementMode. */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyStatusResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+            /** @description FastPath or policy state is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    patchSandboxNetworkPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NetworkRule"][];
+            };
+        };
+        responses: {
+            /** @description Committed policy intent; Fsb omits enforcementMode. */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyStatusResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            500: components["responses"]["InternalServerError"];
+            /** @description FastPath or policy state is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getSandboxCredentialVault: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sanitized Credential Vault state. */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CredentialVaultState"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description The vault backend is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createSandboxCredentialVault: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CredentialVaultCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Credential Vault created and acknowledged (sanitized state). */
+            201: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CredentialVaultState"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            500: components["responses"]["InternalServerError"];
+            /** @description The vault backend is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteSandboxCredentialVault: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Credential Vault deleted. */
+            204: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description The vault backend is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    patchSandboxCredentialVault: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CredentialVaultMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Mutation applied and acknowledged (sanitized state). */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CredentialVaultState"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            500: components["responses"]["InternalServerError"];
+            /** @description The vault backend is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listSandboxCredentialVaultCredentials: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sanitized credential metadata. */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CredentialListResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description The vault backend is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getSandboxCredentialVaultCredential: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+                /** @description Credential name */
+                credentialName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sanitized credential metadata. */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CredentialMetadata"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description The vault backend is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listSandboxCredentialVaultBindings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sanitized binding metadata. */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CredentialBindingListResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description The vault backend is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getSandboxCredentialVaultBinding: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+                /** @description Credential binding name */
+                bindingName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sanitized binding metadata. */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CredentialBindingMetadata"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description The vault backend is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    reportMetricsEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "eventType": "sandbox.create",
+                 *       "sandboxId": "sbx_01HZYEXAMPLE",
+                 *       "image": "python:3.12",
+                 *       "createDurationMs": 1842,
+                 *       "success": true
+                 *     }
+                 */
+                "application/json": components["schemas"]["MetricsEvent"];
+            };
+        };
+        responses: {
+            /** @description Event accepted */
+            204: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listTemplates: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Arbitrary metadata key-value pairs for filtering, keys and values
+                 *     must be url encoded. Example: `?metadata=project%3DApollo%26env%3Dprod`
+                 */
+                metadata?: string;
+                /** @description Page number for pagination */
+                page?: number;
+                /** @description Number of items per page */
+                pageSize?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Paginated collection of templates */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListFsbTemplatesResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    createTemplate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateFsbTemplateRequest"];
+            };
+        };
+        responses: {
+            /** @description Template build accepted; the phase starts at Pending */
+            201: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FsbTemplate"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
+            501: components["responses"]["InternalServerError"];
+            503: components["responses"]["InternalServerError"];
+        };
+    };
+    getTemplate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Template identifier (`tpl_<uuid>`) */
+                templateId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Template status and artifact references */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["XRequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FsbTemplate"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    deleteTemplate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Template identifier (`tpl_<uuid>`) */
+                templateId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Template deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+}

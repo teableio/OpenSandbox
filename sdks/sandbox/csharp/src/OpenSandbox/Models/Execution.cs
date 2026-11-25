@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -207,4 +207,11 @@ public class ExecutionHandlers
     /// Gets or sets the handler for execution initialization.
     /// </summary>
     public Func<ExecutionInit, Task>? OnInit { get; set; }
+
+    /// <summary>
+    /// When true, stdout/stderr messages are only delivered to handlers without
+    /// being accumulated in <see cref="ExecutionLogs"/>. Use for long-running
+    /// executions to prevent unbounded memory growth.
+    /// </summary>
+    public bool SkipAccumulation { get; set; }
 }

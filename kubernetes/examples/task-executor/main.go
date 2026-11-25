@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,7 +62,6 @@ func main() {
 		state := getTaskState(currentTask)
 		fmt.Printf("Current state: %s\n", state)
 
-		// Check if task is finished
 		if currentTask.ProcessStatus.Terminated != nil {
 			fmt.Printf("Task finished with exit code: %d\n", currentTask.ProcessStatus.Terminated.ExitCode)
 			break

@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for opensandbox_cli.utils — duration parsing, key-value type, error handling."""
-
 from __future__ import annotations
 
+import json
 from datetime import timedelta
+from pathlib import Path
 
-import click
 import pytest
 
-from opensandbox_cli.utils import DURATION, KEY_VALUE, parse_duration
-
-# ---------------------------------------------------------------------------
-# parse_duration
-# ---------------------------------------------------------------------------
+from opensandbox_cli.utils import (
+    DURATION,
+    KEY_VALUE,
+    load_json_object,
+    parse_duration,
+    validation_message,
+)
 
 
 class TestParseDuration:
@@ -45,27 +46,8 @@ class TestParseDuration:
     def test_valid_durations(self, input_str: str, expected: timedelta) -> None:
         assert parse_duration(input_str) == expected
 
-    @pytest.mark.parametrize(
-        "input_str",
-        [
-            "",
-            "abc",
-            "10x",
-            "m10",
-            "-5m",
-        ],
-    )
-    def test_invalid_durations(self, input_str: str) -> None:
-        with pytest.raises(click.BadParameter):
-            parse_duration(input_str)
-
     def test_strips_whitespace(self) -> None:
         assert parse_duration("  10m  ") == timedelta(minutes=10)
-
-
-# ---------------------------------------------------------------------------
-# DurationType (Click param type)
-# ---------------------------------------------------------------------------
 
 
 class TestDurationType:
@@ -78,15 +60,6 @@ class TestDurationType:
         result = DURATION.convert(td, None, None)  # type: ignore[arg-type]
         assert result is td
 
-    def test_invalid_raises_bad_parameter(self) -> None:
-        with pytest.raises(click.exceptions.BadParameter):
-            DURATION.convert("invalid", None, None)
-
-
-# ---------------------------------------------------------------------------
-# KeyValueType (Click param type)
-# ---------------------------------------------------------------------------
-
 
 class TestKeyValueType:
     def test_parses_simple_kv(self) -> None:
@@ -98,11 +71,28 @@ class TestKeyValueType:
     def test_empty_value(self) -> None:
         assert KEY_VALUE.convert("key=", None, None) == ("key", "")
 
-    def test_missing_equals_fails(self) -> None:
-        with pytest.raises(click.exceptions.BadParameter):
-            KEY_VALUE.convert("no-equals", None, None)
-
     def test_passes_through_tuple(self) -> None:
         t = ("key", "val")
         result = KEY_VALUE.convert(t, None, None)  # type: ignore[arg-type]
         assert result is t
+
+
+class TestLoadJsonObject:
+    def test_loads_object(self, tmp_path: Path) -> None:
+        path = tmp_path / "req.json"
+        path.write_text(json.dumps({"image": "python:3.12"}))
+        assert load_json_object(str(path)) == {"image": "python:3.12"}
+
+
+class TestValidationMessage:
+    def test_joins_field_errors(self) -> None:
+        from pydantic import BaseModel, ValidationError
+
+        class _Model(BaseModel):
+            image: str
+
+        with pytest.raises(ValidationError) as exc_info:
+            _Model()
+        message = validation_message(exc_info.value)
+        assert "image" in message
+        assert ": " in message

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,16 +21,11 @@ import (
 
 // Package values are typically overridden at build time via -ldflags.
 var (
-	// Version is the component version.
-	Version = "dirty"
-	// BuildTime is when the binary was built.
+	Version   = "dirty"
 	BuildTime = "assigned-at-build-time"
-	// GitCommit is the commit id used to build the binary.
 	GitCommit = "assigned-at-build-time"
 )
 
-// EchoVersion prints build info for the given component name (e.g. "OpenSandbox Ingress", "OpenSandbox Execd").
-// All components can use this by passing their display name.
 func EchoVersion(componentName string) {
 	fmt.Println("=====================================================")
 	fmt.Printf(" %s\n", componentName)

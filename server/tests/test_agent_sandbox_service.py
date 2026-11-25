@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,17 +32,14 @@ from opensandbox_server.services.constants import SANDBOX_SNAPSHOT_ID_LABEL, San
 
 @pytest.fixture
 def agent_sandbox_runtime_config():
-    """Provide agent-sandbox runtime configuration"""
     return KubernetesRuntimeConfig(
         kubeconfig_path="/tmp/test-kubeconfig",
         namespace="test-namespace",
-        service_account="test-sa",
         workload_provider="agent-sandbox",
     )
 
 @pytest.fixture
 def agent_sandbox_app_config(agent_sandbox_runtime_config):
-    """Provide complete app configuration (kubernetes + agent-sandbox provider)"""
     return AppConfig(
         server=ServerConfig(
             host="0.0.0.0",
@@ -63,7 +60,6 @@ def agent_sandbox_app_config(agent_sandbox_runtime_config):
 
 @pytest.fixture
 def app_config_docker():
-    """Provide Docker type app configuration"""
     return AppConfig(
         server=ServerConfig(
             host="0.0.0.0",

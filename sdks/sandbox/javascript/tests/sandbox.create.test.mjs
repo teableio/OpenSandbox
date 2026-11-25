@@ -1,3 +1,17 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -9,11 +23,11 @@ import {
   Sandbox,
 } from "../dist/index.js";
 
-function createAdapterFactory() {
+function createAdapterFactory({ includeCredentialVault = true } = {}) {
   const recordedRequests = [];
   const endpointCalls = [];
   const egressStackCalls = [];
-  const egressService = {
+  const policyOnlyEgressService = {
     async getPolicy() {
       return {
         defaultAction: "deny",
@@ -21,7 +35,35 @@ function createAdapterFactory() {
       };
     },
     async patchRules() {},
+    async deleteRules() {},
   };
+  const credentialVaultService = {
+    async create() {
+      return { revision: 1, credentials: [], bindings: [] };
+    },
+    async get() {
+      return { revision: 1, credentials: [], bindings: [] };
+    },
+    async patch() {
+      return { revision: 2, credentials: [], bindings: [] };
+    },
+    async delete() {},
+    async listCredentials() {
+      return [];
+    },
+    async getCredential(name) {
+      return { name, sourceType: "inline", revision: 1 };
+    },
+    async listBindings() {
+      return [];
+    },
+    async getBinding(name) {
+      return { name, revision: 1 };
+    },
+  };
+  const egressService = includeCredentialVault
+    ? { ...policyOnlyEgressService, ...credentialVaultService }
+    : policyOnlyEgressService;
   const sandboxes = {
     async createSandbox(req) {
       recordedRequests.push(req);
@@ -94,6 +136,47 @@ test("Sandbox.create forwards secureAccess", async () => {
 
   assert.equal(recordedRequests.length, 1);
   assert.equal(recordedRequests[0].secureAccess, true);
+});
+
+test("Sandbox.create forwards credentialProxy", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    credentialProxy: { enabled: true },
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.deepEqual(recordedRequests[0].credentialProxy, { enabled: true });
+});
+
+test("Sandbox.create forwards lifecycle hooks", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+  const lifecycle = {
+    preStart: { command: ["/opt/hooks/restore.sh"], timeoutSeconds: 120 },
+    periodic: [
+      {
+        name: "backup-home",
+        schedule: "@every 5m",
+        command: ["/opt/hooks/backup.sh"],
+      },
+    ],
+  };
+  const expectedLifecycle = structuredClone(lifecycle);
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    lifecycle,
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.deepEqual(recordedRequests[0].lifecycle, expectedLifecycle);
 });
 
 test("Sandbox.create forwards windows platform values", async () => {
@@ -224,11 +307,33 @@ test("Sandbox creates and reuses egress service during sandbox lifecycle", async
 
   await sandbox.getEgressPolicy();
   await sandbox.patchEgressRules([{ action: "allow", target: "www.github.com" }]);
+  const vaultState = await sandbox.credentialVault.get();
 
   assert.deepEqual(endpointCalls, [DEFAULT_EXECD_PORT, DEFAULT_EGRESS_PORT]);
   assert.equal(egressStackCalls.length, 1);
   assert.equal(egressStackCalls[0].egressBaseUrl, `http://127.0.0.1:${DEFAULT_EGRESS_PORT}`);
   assert.deepEqual(egressStackCalls[0].endpointHeaders, { "x-port": String(DEFAULT_EGRESS_PORT) });
+  assert.deepEqual(vaultState, { revision: 1, credentials: [], bindings: [] });
+});
+
+test("Sandbox.create accepts custom egress adapters without Credential Vault methods", async () => {
+  const { adapterFactory } = createAdapterFactory({ includeCredentialVault: false });
+
+  const sandbox = await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    skipHealthCheck: true,
+  });
+
+  assert.deepEqual(await sandbox.getEgressPolicy(), {
+    defaultAction: "deny",
+    egress: [{ action: "allow", target: "pypi.org" }],
+  });
+  await assert.rejects(
+    () => sandbox.credentialVault.get(),
+    /Credential Vault is not available/
+  );
 });
 
 test("Sandbox.create passes OSSFS volume to request", async () => {
@@ -377,4 +482,421 @@ test("Sandbox.create treats null backends as absent", async () => {
 
   assert.equal(recordedRequests.length, 1);
   assert.equal(recordedRequests[0].volumes[0].host.path, "/tmp");
+});
+
+test("Sandbox.create reports create metrics after ready", async () => {
+  const { adapterFactory } = createAdapterFactory();
+  adapterFactory.createExecdStack = () => ({
+    commands: {},
+    files: {},
+    health: {
+      async ping() {
+        return true;
+      },
+    },
+    metrics: {},
+  });
+
+  const metricsPosts = [];
+  let connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+    apiKey: "test-key",
+  });
+  connectionConfig = connectionConfig.withTransportIfMissing();
+  Object.defineProperty(connectionConfig, "fetch", {
+    configurable: true,
+    get() {
+      return async (url, init) => {
+        metricsPosts.push({ url: String(url), init });
+        return { arrayBuffer: async () => new ArrayBuffer(0) };
+      };
+    },
+  });
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig,
+    image: "python:3.12",
+    readyTimeoutSeconds: 1,
+  });
+
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(metricsPosts.length, 1);
+  assert.match(metricsPosts[0].url, /\/v1\/metrics\/events$/);
+  const body = JSON.parse(metricsPosts[0].init.body);
+  assert.equal(body.eventType, "sandbox.create");
+  assert.equal(body.success, true);
+  assert.equal(body.sandboxId, "sandbox-test-id");
+  assert.equal(body.image, "python:3.12");
+  assert.equal(body.sdkLanguage, undefined);
+  assert.equal(body.sdkVersion, undefined);
+  const headers = metricsPosts[0].init.headers || {};
+  const ua = headers["User-Agent"] || headers["user-agent"] || "";
+  assert.match(ua, /^OpenSandbox-JS-SDK\//);
+});
+
+for (const headerName of ["open-sandbox-api-key", "Open-Sandbox-Api-Key"]) {
+  test(`Sandbox.create metrics preserves explicit ${headerName}`, async (t) => {
+    const { adapterFactory } = createAdapterFactory();
+    const config = new ConnectionConfig({
+      domain: "http://127.0.0.1:8080",
+      apiKey: "fallback-key",
+      headers: { [headerName]: "explicit-key" },
+    }).withTransportIfMissing();
+    t.after(() => config.closeTransport());
+    const requests = [];
+    Object.defineProperty(config, "fetch", {
+      get: () => async (url, init) => {
+        requests.push(new Request(url, init));
+        return new Response(null);
+      },
+    });
+    const sandbox = await Sandbox.create({
+      adapterFactory,
+      connectionConfig: config,
+      image: "python:3.12",
+      skipHealthCheck: true,
+    });
+    t.after(() => sandbox.close());
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].url, /\/metrics\/events$/);
+    assert.equal(requests[0].headers.get("open-sandbox-api-key"), "explicit-key");
+  });
+}
+
+test("Sandbox.create metrics failure does not change create error", async () => {
+  const { adapterFactory } = createAdapterFactory();
+  adapterFactory.createExecdStack = () => ({
+    commands: {},
+    files: {},
+    health: {
+      async ping() {
+        throw new Error("unhealthy");
+      },
+    },
+    metrics: {},
+  });
+
+  const connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+  });
+  Object.defineProperty(connectionConfig, "fetch", {
+    configurable: true,
+    get() {
+      return async () => {
+        throw new Error("metrics down");
+      };
+    },
+  });
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig,
+      image: "python:3.12",
+      readyTimeoutSeconds: 0.2,
+      healthCheckPollingInterval: 50,
+    }),
+    /timed out|unhealthy|Sandbox/
+  );
+});
+
+test("Sandbox.create readiness timeout omits network configuration hints", async () => {
+  const { adapterFactory } = createAdapterFactory();
+  adapterFactory.createExecdStack = () => ({
+    commands: {},
+    files: {},
+    health: {
+      async ping() {
+        throw new Error("connect ECONNREFUSED");
+      },
+    },
+    metrics: {},
+  });
+
+  const connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+    useServerProxy: false,
+    disableMetrics: true,
+  });
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig,
+      image: "python:3.12",
+      readyTimeoutSeconds: 0.2,
+      healthCheckPollingInterval: 50,
+    }),
+    (err) => {
+      const message = String(err && err.message);
+      assert.match(message, /Sandbox health check timed out after/);
+      assert.match(message, /domain=http:\/\/127\.0\.0\.1:8080, useServerProxy=false/);
+      assert.match(message, /Last health check error: connect ECONNREFUSED/);
+      assert.doesNotMatch(message, /consider enabling useServerProxy=true/i);
+      assert.doesNotMatch(message, /Docker bridge|remote-network|\[docker\]\.host_ip/i);
+      return true;
+    }
+  );
+});
+
+test("Sandbox.create readiness timeout does not overshoot by a polling interval", async () => {
+  const { adapterFactory } = createAdapterFactory();
+  adapterFactory.createExecdStack = () => ({
+    commands: {},
+    files: {},
+    health: {
+      async ping() {
+        return false;
+      },
+    },
+    metrics: {},
+  });
+
+  const connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+    disableMetrics: true,
+  });
+
+  const started = Date.now();
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig,
+      image: "python:3.12",
+      readyTimeoutSeconds: 0.02,
+      healthCheckPollingInterval: 2000,
+    }),
+    /Sandbox health check timed out after 0\.02s/
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 500, `expected timeout in ~20ms, took ${elapsed}ms`);
+});
+
+test("Sandbox.create metrics synchronous throw does not change create error", async () => {
+  // Regression test: previously, payload/URL/headers construction and
+  // `connectionConfig.fetch(...)` ran outside any try/catch in the reporter.
+  // A synchronous throw from custom `fetch` (or an invalid base URL causing
+  // `new URL(...)` inside fetch to throw synchronously) would replace the
+  // original Sandbox.create failure. The reporter must swallow it.
+  const { adapterFactory } = createAdapterFactory();
+  adapterFactory.createExecdStack = () => ({
+    commands: {},
+    files: {},
+    health: {
+      async ping() {
+        throw new Error("unhealthy");
+      },
+    },
+    metrics: {},
+  });
+
+  let connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+  });
+  // Materialize the transport-carrying config the same way Sandbox.create
+  // does internally, so our fetch override actually reaches the reporter.
+  connectionConfig = connectionConfig.withTransportIfMissing();
+  Object.defineProperty(connectionConfig, "fetch", {
+    configurable: true,
+    get() {
+      // NOTE: synchronous throw, not a rejected promise.
+      return () => {
+        throw new Error("metrics fetch synchronously broken");
+      };
+    },
+  });
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig,
+      image: "python:3.12",
+      readyTimeoutSeconds: 0.2,
+      healthCheckPollingInterval: 50,
+    }),
+    // The rejection must be the create failure (unhealthy/timed out),
+    // NOT the telemetry error.
+    (err) => {
+      assert.doesNotMatch(String(err && err.message), /metrics fetch/);
+      assert.match(
+        String(err && err.message),
+        /timed out|unhealthy|Sandbox/
+      );
+      return true;
+    }
+  );
+});
+
+test("Sandbox.create forwards lifecycle.idlePolicy", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+  const idlePolicy = {
+    idleTimeoutSeconds: 300,
+    onIdle: "pause",
+    wakeOnAccess: true,
+    activeProbe: { port: 8080, path: "/active" },
+  };
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    lifecycle: { idlePolicy },
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.deepEqual(recordedRequests[0].lifecycle, { idlePolicy });
+});
+
+test("Sandbox.create forwards lifecycle.renewalPolicy", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+  const renewalPolicy = { extendSeconds: 3600 };
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    lifecycle: { renewalPolicy },
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.deepEqual(recordedRequests[0].lifecycle, { renewalPolicy });
+});
+
+test("Sandbox.create rejects an invalid renewal policy before allocating transport resources", async () => {
+  // withTransportIfMissing must never run (same guard as the idlePolicy test).
+  const guardedConfig = new ConnectionConfig({ domain: "http://127.0.0.1:8080" });
+  guardedConfig.withTransportIfMissing = () => {
+    throw new Error("transport must not be allocated for an invalid renewal policy");
+  };
+  for (const extendSeconds of [299, 86401, 3600.5, "3600"]) {
+    await assert.rejects(
+      Sandbox.create({
+        adapterFactory: {
+          createLifecycleStack() {
+            throw new Error("lifecycle stack must not be built for an invalid renewal policy");
+          },
+        },
+        connectionConfig: guardedConfig,
+        image: "python:3.12",
+        lifecycle: { renewalPolicy: { extendSeconds } },
+        skipHealthCheck: true,
+      }),
+      /extendSeconds must be an integer between 300 and 86400/
+    );
+  }
+
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+  for (const extendSeconds of [300, 86400]) {
+    await Sandbox.create({
+      adapterFactory,
+      connectionConfig: { domain: "http://127.0.0.1:8080" },
+      image: "python:3.12",
+      lifecycle: { renewalPolicy: { extendSeconds } },
+      skipHealthCheck: true,
+    });
+  }
+  assert.deepEqual(recordedRequests[0].lifecycle, { renewalPolicy: { extendSeconds: 300 } });
+  assert.deepEqual(recordedRequests[1].lifecycle, { renewalPolicy: { extendSeconds: 86400 } });
+});
+
+test("Sandbox.create rejects an invalid idle policy before allocating transport resources", async () => {
+  // Observe allocation order directly: withTransportIfMissing must never run.
+  const guardedConfig = new ConnectionConfig({ domain: "http://127.0.0.1:8080" });
+  guardedConfig.withTransportIfMissing = () => {
+    throw new Error("transport must not be allocated for an invalid idle policy");
+  };
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory: {
+        createLifecycleStack() {
+          throw new Error("lifecycle stack must not be built for an invalid idle policy");
+        },
+      },
+      connectionConfig: guardedConfig,
+      image: "python:3.12",
+      lifecycle: { idlePolicy: { idleTimeoutSeconds: 29, onIdle: "pause" } },
+      skipHealthCheck: true,
+    }),
+    /idleTimeoutSeconds must be an integer/
+  );
+
+  for (const [idlePolicy, message] of [
+    [{ idleTimeoutSeconds: 29, onIdle: "pause" }, /idleTimeoutSeconds must be an integer between 30 and 86400/],
+    [{ idleTimeoutSeconds: 86401, onIdle: "pause" }, /idleTimeoutSeconds must be an integer between 30 and 86400/],
+    [{ idleTimeoutSeconds: 300.5, onIdle: "pause" }, /idleTimeoutSeconds must be an integer between 30 and 86400/],
+    [{ idleTimeoutSeconds: 300 }, /onIdle is required when idleTimeoutSeconds is set/],
+    [{ onIdle: "pause" }, /onIdle must be omitted when idleTimeoutSeconds is omitted/],
+    [{ idleTimeoutSeconds: 300, onIdle: "terminate" }, /onIdle must be "pause"/],
+    [{ wakeOnAccess: false, activeProbe: { port: 8080, path: "/active" } }, /activeProbe requires idleTimeoutSeconds/],
+    [{ idleTimeoutSeconds: 300, onIdle: "pause", activeProbe: { port: 0, path: "/active" } }, /port must be an integer between 1 and 65535/],
+    [{ idleTimeoutSeconds: 300, onIdle: "pause", activeProbe: { port: 8080, path: "active" } }, /path must be an absolute HTTP path/],
+    [{ idleTimeoutSeconds: 300, onIdle: "pause", activeProbe: { port: 8080, path: "/a b" } }, /path must not contain whitespace/],
+    [{ idleTimeoutSeconds: 300, onIdle: "pause", activeProbe: { port: 8080, path: "/active", timeoutSeconds: 11 } }, /timeoutSeconds must be an integer between 1 and 10/],
+  ]) {
+    await assert.rejects(
+      Sandbox.create({
+        adapterFactory: {
+          createLifecycleStack() {
+            throw new Error("transport must not be allocated for an invalid idle policy");
+          },
+        },
+        connectionConfig: { domain: "http://127.0.0.1:8080" },
+        image: "python:3.12",
+        lifecycle: { idlePolicy },
+        skipHealthCheck: true,
+      }),
+      message
+    );
+  }
+});
+
+test("Sandbox.create accepts idle policy boundaries and wake-only shapes", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  const policies = [
+    // Valid timeout boundaries.
+    { idleTimeoutSeconds: 30, onIdle: "pause" },
+    { idleTimeoutSeconds: 86400, onIdle: "pause" },
+    // Wake-only shapes: never auto-paused, wakes on access.
+    {},
+    { wakeOnAccess: false },
+    // Probe boundaries.
+    {
+      idleTimeoutSeconds: 300,
+      onIdle: "pause",
+      activeProbe: { port: 1, path: "/active" },
+    },
+    {
+      idleTimeoutSeconds: 300,
+      onIdle: "pause",
+      activeProbe: { port: 65535, path: "/active", timeoutSeconds: 1 },
+    },
+    {
+      idleTimeoutSeconds: 300,
+      onIdle: "pause",
+      activeProbe: { port: 8080, path: "/active", timeoutSeconds: 10 },
+    },
+  ];
+
+  for (const idlePolicy of policies) {
+    await Sandbox.create({
+      adapterFactory,
+      connectionConfig: { domain: "http://127.0.0.1:8080" },
+      image: "python:3.12",
+      lifecycle: { idlePolicy },
+      skipHealthCheck: true,
+    });
+  }
+
+  assert.equal(recordedRequests.length, policies.length);
+  for (let i = 0; i < policies.length; i++) {
+    assert.deepEqual(
+      recordedRequests[i].lifecycle,
+      { idlePolicy: policies[i] },
+      `policy #${i} should be forwarded as-is`
+    );
+  }
 });

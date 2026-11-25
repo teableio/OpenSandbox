@@ -1,0 +1,395 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import assert from "node:assert/strict";
+import { readdir, readFile } from "node:fs/promises";
+import test from "node:test";
+
+import { EgressAdapter } from "../dist/internal.js";
+
+const credential = {
+  name: "api-token",
+  source: { value: "write-only-value" },
+};
+
+const binding = {
+  name: "api-binding",
+  match: {
+    schemes: ["https"],
+    hosts: ["api.example.com"],
+    methods: ["GET", "POST"],
+    paths: ["/v1/*"],
+  },
+  auth: {
+    type: "apiKey",
+    name: "X-API-Key",
+    credential: "api-token",
+  },
+};
+
+const sanitizedCredential = {
+  name: "api-token",
+  sourceType: "inline",
+  revision: 7,
+};
+
+const sanitizedBinding = {
+  name: "api-binding",
+  revision: 5,
+  match: {
+    schemes: ["https"],
+    hosts: ["api.example.com"],
+    methods: ["GET", "POST"],
+    paths: ["/v1/*"],
+  },
+  auth: {
+    type: "apiKey",
+    name: "X-API-Key",
+  },
+};
+
+function stateResponse() {
+  return {
+    revision: 9,
+    credentials: [
+      {
+        ...sanitizedCredential,
+        source: { type: "inline", value: "write-only-value" },
+      },
+    ],
+    bindings: [
+      {
+        ...sanitizedBinding,
+        auth: {
+          ...sanitizedBinding.auth,
+          credential: "api-token",
+          headers: [{ name: "X-Extra", credential: "api-token" }],
+        },
+      },
+    ],
+  };
+}
+
+function jsonResponse(body, init = {}) {
+  return new Response(body == null ? null : JSON.stringify(body), {
+    status: init.status ?? 200,
+    headers: {
+      "content-type": "application/json",
+      ...(init.headers ?? {}),
+    },
+  });
+}
+
+function createAdapter(stateOverride) {
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const bodyText = typeof init.body === "string" ? init.body : undefined;
+    const request = {
+      method: init.method ?? "GET",
+      url: String(input),
+      pathname: url.pathname,
+      headers: Object.fromEntries(new Headers(init.headers).entries()),
+      body: bodyText ? JSON.parse(bodyText) : undefined,
+    };
+    requests.push(request);
+
+    const state = stateOverride ?? stateResponse();
+    if (request.pathname === "/credential-vault") {
+      if (request.method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+      return jsonResponse(state);
+    }
+    if (request.pathname === "/credential-vault/credentials") {
+      return jsonResponse({
+        revision: 9,
+        credentials: [state.credentials[0]],
+      });
+    }
+    if (request.pathname === "/credential-vault/credentials/api-token%2Fprimary") {
+      return jsonResponse(state.credentials[0]);
+    }
+    if (request.pathname === "/credential-vault/bindings") {
+      return jsonResponse({
+        revision: 9,
+        bindings: state.bindings,
+      });
+    }
+    if (request.pathname === "/credential-vault/bindings/api%20binding") {
+      return jsonResponse(state.bindings[0]);
+    }
+    return jsonResponse({ code: "NOT_FOUND", message: "not found" }, { status: 404 });
+  };
+
+  const policyClient = {
+    GET() {
+      throw new Error("policy GET was not expected");
+    },
+    PATCH() {
+      throw new Error("policy PATCH was not expected");
+    },
+    DELETE() {
+      throw new Error("policy DELETE was not expected");
+    },
+  };
+
+  return {
+    adapter: new EgressAdapter(policyClient, {
+      baseUrl: "https://egress.example",
+      fetch: fetchImpl,
+      headers: {
+        "OPEN-SANDBOX-API-KEY": "sdk-key",
+        "x-endpoint-token": "route-token",
+      },
+    }),
+    requests,
+  };
+}
+
+test("EgressAdapter sends Credential Vault JSON payloads with endpoint headers", async () => {
+  const { adapter, requests } = createAdapter();
+
+  const created = await adapter.create({
+    credentials: [credential],
+    bindings: [binding],
+  });
+
+  await adapter.patch({
+    expectedRevision: 9,
+    credentials: {
+      add: [credential],
+      replace: [credential],
+      delete: ["old-token"],
+    },
+    bindings: {
+      add: [binding],
+      replace: [binding],
+      delete: ["old-binding"],
+    },
+  });
+  const current = await adapter.get();
+  const credentials = await adapter.listCredentials();
+  const oneCredential = await adapter.getCredential("api-token/primary");
+  const bindings = await adapter.listBindings();
+  const oneBinding = await adapter.getBinding("api binding");
+  await adapter.delete();
+
+  assert.deepEqual(created, {
+    revision: 9,
+    credentials: [sanitizedCredential],
+    bindings: [sanitizedBinding],
+  });
+  assert.deepEqual(current, created);
+  assert.deepEqual(credentials, [sanitizedCredential]);
+  assert.deepEqual(oneCredential, sanitizedCredential);
+  assert.deepEqual(bindings, [sanitizedBinding]);
+  assert.deepEqual(oneBinding, sanitizedBinding);
+
+  assert.deepEqual(
+    requests.map((request) => [request.method, request.pathname]),
+    [
+      ["POST", "/credential-vault"],
+      ["PATCH", "/credential-vault"],
+      ["GET", "/credential-vault"],
+      ["GET", "/credential-vault/credentials"],
+      ["GET", "/credential-vault/credentials/api-token%2Fprimary"],
+      ["GET", "/credential-vault/bindings"],
+      ["GET", "/credential-vault/bindings/api%20binding"],
+      ["DELETE", "/credential-vault"],
+    ],
+  );
+  assert.equal(requests[0].headers["open-sandbox-api-key"], "sdk-key");
+  assert.equal(requests[0].headers["x-endpoint-token"], "route-token");
+  assert.equal(requests[0].headers["content-type"], "application/json");
+  assert.equal(requests[2].headers["content-type"], undefined);
+  assert.deepEqual(requests[0].body, {
+    credentials: [credential],
+    bindings: [binding],
+  });
+  assert.deepEqual(requests[1].body, {
+    expectedRevision: 9,
+    credentials: {
+      add: [credential],
+      replace: [credential],
+      delete: ["old-token"],
+    },
+    bindings: {
+      add: [binding],
+      replace: [binding],
+      delete: ["old-binding"],
+    },
+  });
+});
+
+test("Credential Vault state omits plaintext secret fields", async () => {
+  const { adapter } = createAdapter();
+  const state = await adapter.get();
+
+  assert.equal(Object.hasOwn(state.credentials[0], "source"), false);
+  assert.equal(Object.hasOwn(state.bindings[0].auth, "credential"), false);
+  assert.equal(Object.hasOwn(state.bindings[0].auth, "headers"), false);
+
+  const dts = await readDistDeclarations();
+  const inlineCredentialSource = declarationBlock(dts, "InlineCredentialSource");
+  const exchangeCredentialSource = declarationBlock(dts, "ExchangeCredentialSource");
+  const credentialMetadata = declarationBlock(dts, "CredentialMetadata");
+  const authMetadata = declarationBlock(dts, "CredentialAuthMetadata");
+  const bindingMetadata = declarationBlock(dts, "CredentialBindingMetadata");
+
+  assert.match(inlineCredentialSource, /\btype\?: "inline"/);
+  // Cross-variant keys stay compile errors: each source variant forbids the
+  // other kind's field.
+  assert.match(inlineCredentialSource, /\bendpoint\?: never/);
+  assert.match(exchangeCredentialSource, /\bvalue\?: never/);
+  assert.doesNotMatch(credentialMetadata, /extends Record/);
+  assert.doesNotMatch(credentialMetadata, /\bsource\s*[?:]/);
+  assert.doesNotMatch(authMetadata, /extends Record/);
+  // The typeless exchange form exposes only its credential reference; the
+  // plaintext-value carriers (`headers`, and `credential` values) never ride
+  // the sanitized metadata.
+  assert.match(authMetadata, /\btype\?: string/);
+  assert.match(authMetadata, /\bcredential\?: string/);
+  assert.doesNotMatch(authMetadata, /\bheaders\s*[?:]/);
+  assert.doesNotMatch(bindingMetadata, /extends Record/);
+  assert.match(bindingMetadata, /\bauth\??: CredentialAuthMetadata/);
+  // Static-only auth fields stay compile errors on the typeless member.
+  assert.match(dts, /type\?: never;\s*\n\s*name\?: never;\s*\n\s*headers\?: never;\s*\n\s*substitutions\?: never/);
+});
+
+test("Egress declarations keep Credential Vault optional for custom adapters", async () => {
+  const dts = await readDistDeclarations();
+  const egress = declarationBlock(dts, "Egress");
+  const egressStack = declarationBlock(dts, "EgressStack");
+
+  assert.doesNotMatch(egress, /extends CredentialVault/);
+  assert.doesNotMatch(egress, /\bcreate\(/);
+  assert.match(egressStack, /\begress: Egress/);
+  assert.match(egressStack, /\bcredentialVault\??: CredentialVault/);
+});
+
+test("exchange credentials and typeless auth round-trip losslessly (OSEP-0025)", async () => {
+  const exchangeCredential = {
+    name: "spi-signer",
+    source: { type: "exchange", endpoint: "unix:///run/spi/spi.sock" },
+  };
+  const typelessBinding = {
+    name: "internal-api",
+    match: { hosts: ["*.internal.example.com"] },
+    auth: { credential: "spi-signer" },
+  };
+
+  const exchangeState = {
+    revision: 3,
+    credentials: [
+      {
+        name: "spi-signer",
+        sourceType: "exchange",
+        revision: 3,
+        // Raw relay-style source rides the wire; the sanitizer must strip it.
+        source: { type: "exchange", endpoint: "unix:///run/spi/spi.sock" },
+      },
+    ],
+    bindings: [
+      {
+        name: "internal-api",
+        revision: 3,
+        match: { hosts: ["*.internal.example.com"] },
+        // Raw auth carries extra keys; the sanitizer must keep exactly the
+        // credential reference and never produce `type: null`.
+        auth: { credential: "spi-signer", headers: [] },
+      },
+    ],
+  };
+  const { adapter, requests } = createAdapter(exchangeState);
+
+  const created = await adapter.create({
+    credentials: [exchangeCredential],
+    bindings: [typelessBinding],
+  });
+  const state = await adapter.get();
+
+  assert.deepEqual(requests[0].body, {
+    credentials: [exchangeCredential],
+    bindings: [typelessBinding],
+  });
+  assert.deepEqual(created, {
+    revision: 3,
+    credentials: [{ name: "spi-signer", sourceType: "exchange", revision: 3 }],
+    bindings: [
+      {
+        name: "internal-api",
+        revision: 3,
+        match: { hosts: ["*.internal.example.com"] },
+        auth: { credential: "spi-signer" },
+      },
+    ],
+  });
+  assert.deepEqual(state, created);
+  assert.equal(Object.hasOwn(state.credentials[0], "source"), false);
+  assert.equal(Object.hasOwn(state.bindings[0].auth, "type"), false);
+  assert.equal(JSON.stringify(state).includes("spi.sock"), false);
+});
+
+test("sanitizer recovers the legacy type:null skew shape", async () => {
+  // During rollout skew a client can still receive the pre-fix sanitized
+  // shape `{"type": null, "credential": ...}`; it must read back as the
+  // typeless form, not crash and not surface `type: null`.
+  const skewState = {
+    revision: 3,
+    credentials: [],
+    bindings: [
+      {
+        name: "internal-api",
+        revision: 3,
+        match: { hosts: ["*.internal.example.com"] },
+        auth: { type: null, credential: "spi-signer" },
+      },
+    ],
+  };
+  const { adapter } = createAdapter(skewState);
+
+  const state = await adapter.get();
+
+  assert.deepEqual(state.bindings[0].auth, { credential: "spi-signer" });
+});
+
+test("sanitizer rejects auth metadata without type or credential", async () => {
+  const brokenState = {
+    revision: 1,
+    credentials: [],
+    bindings: [{ name: "b", revision: 1, auth: {} }],
+  };
+  const { adapter } = createAdapter(brokenState);
+
+  await assert.rejects(() => adapter.get(), /auth: expected "type" or "credential"/);
+});
+
+async function readDistDeclarations() {
+  const distDir = new URL("../dist/", import.meta.url);
+  const entries = await readdir(distDir);
+  const declarations = entries.filter((entry) => entry.endsWith(".d.ts"));
+  const contents = await Promise.all(
+    declarations.map((entry) => readFile(new URL(entry, distDir), "utf8")),
+  );
+  return contents.join("\n");
+}
+
+function declarationBlock(dts, name) {
+  const start = dts.indexOf(`interface ${name}`);
+  assert.notEqual(start, -1, `missing ${name} declaration`);
+  const end = dts.indexOf("\n}", start);
+  assert.notEqual(end, -1, `missing ${name} declaration end`);
+  return dts.slice(start, end + 2);
+}

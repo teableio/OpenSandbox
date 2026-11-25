@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,11 +37,11 @@ type PluginConf struct {
 
 const DefaultProfileName = "default"
 
-func DefaultProfile() *Profile {
+func defaultProfile() *Profile {
 	return &Profile{
 		Name: DefaultProfileName,
 		Plugins: PluginsSpec{
-			Predicate: []string{"image", "resource", "nodeselector"},
+			Predicate: []string{"capacity", "image", "resource", "nodeselector"},
 			Score:     []ScoreSpec{{Name: "resbalance", Weight: 100}},
 		},
 		PluginConf: []PluginConf{

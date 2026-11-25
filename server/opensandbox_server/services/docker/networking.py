@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,21 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Network management mixin for Docker sandboxes.
-
-Provides network validation, endpoint resolution, egress sidecar lifecycle,
-and bridge IP extraction. Mixed into DockerSandboxService.
-"""
-
 from __future__ import annotations
 
 import json
 import logging
 import os
 import socket
-from typing import Any, Optional
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Dict, Optional
 
+from requests.exceptions import RequestException
 from docker.errors import DockerException, NotFound as DockerNotFound
 from fastapi import HTTPException, status
 
@@ -34,7 +31,12 @@ from opensandbox_server.api.schema import Endpoint, NetworkPolicy
 from opensandbox_server.services.constants import (
     EGRESS_MODE_ENV,
     EGRESS_RULES_ENV,
+    OTEL_EXPORTER_OTLP_ENDPOINT,
+    OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    OPENSANDBOX_EGRESS_SANDBOX_ID,
     OPENSANDBOX_EGRESS_TOKEN,
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
+    OPENSANDBOX_RUNTIME_MOUNT_PATH,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_EMBEDDING_PROXY_PORT_LABEL,
     SANDBOX_HTTP_PORT_LABEL,
@@ -48,28 +50,93 @@ from opensandbox_server.services.endpoint_auth import (
     build_egress_auth_headers,
     merge_endpoint_headers,
 )
-from opensandbox_server.services.validators import ensure_egress_configured
+from opensandbox_server.services.helpers import (
+    forward_mode_egress_env,
+    upstream_proxy_egress_env,
+)
+from opensandbox_server.services.validators import (
+    ensure_credential_proxy_configured,
+    ensure_egress_configured,
+    ensure_egress_runtime_compatible,
+)
 
 logger = logging.getLogger(__name__)
 
 
+# Docker creates ``/.dockerenv``; Podman (rootful and rootless) creates
+# ``/run/.containerenv`` instead and exports ``container=podman``. Only the
+# values container runtimes actually set count: a generic ``CONTAINER=build``
+# on a bare-metal host must not switch endpoint resolution to
+# ``[docker].host_ip``.
+_CONTAINER_MARKER_FILES = ("/.dockerenv", "/run/.containerenv")
+_CONTAINER_ENV_VARS = ("container", "CONTAINER")
+_CONTAINER_RUNTIME_VALUES = frozenset(
+    {"podman", "docker", "oci", "lxc", "lxc-libvirt", "systemd-nspawn"}
+)
+# Bind hosts that name the process's own loopback: inside a container they never reach the
+# host-mapped ports, so they must not switch ``[docker].host_ip`` off (see the resolvers below).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+
 def _running_inside_docker_container() -> bool:
-    """Return True if the current process is running inside a Docker container."""
-    return os.path.exists("/.dockerenv")
+    """Return True if the current process is running inside a container (Docker or Podman).
+
+    The answer decides whether ``[docker].host_ip`` is used to reach host-mapped
+    ports; treating a Podman-hosted server as bare metal made every egress
+    sidecar readiness probe fall back to ``127.0.0.1`` and fail.
+    """
+    if any(os.path.exists(marker) for marker in _CONTAINER_MARKER_FILES):
+        return True
+    return any(
+        os.environ.get(name, "").strip().lower() in _CONTAINER_RUNTIME_VALUES
+        for name in _CONTAINER_ENV_VARS
+    )
+
+
+def _docker_error_indicates_unsupported_ipv6_sysctls(exc: DockerException) -> bool:
+    """Return True when Docker rejects IPv6-disable sysctls for the target daemon."""
+    message = str(exc).lower()
+    return "disable_ipv6" in message and (
+        "/proc/sys/net/ipv6/" in message
+        or "no such file or directory" in message
+        or "sysctl" in message
+    )
 
 
 HOST_NETWORK_MODE = "host"
 BRIDGE_NETWORK_MODE = "bridge"
+NONE_NETWORK_MODE = "none"
+# Container-runtime network modes (as opposed to user-defined Docker networks). `pasta`
+# and `slirp4netns` are supported by some container runtimes (podman) and are the natural
+# choice where netavark/nftables is unavailable, e.g. rootless podman inside WSL2.
+PASTA_NETWORK_MODE = "pasta"
+SLIRP4NETNS_NETWORK_MODE = "slirp4netns"
+CONTAINER_RUNTIME_NETWORK_MODES = frozenset(
+    {
+        HOST_NETWORK_MODE,
+        BRIDGE_NETWORK_MODE,
+        NONE_NETWORK_MODE,
+        PASTA_NETWORK_MODE,
+        SLIRP4NETNS_NETWORK_MODE,
+    }
+)
 EGRESS_SIDECAR_LABEL = "opensandbox.io/egress-sidecar-for"
 
 
 class DockerNetworkingMixin:
     """Mixin providing network validation, endpoint resolution, and egress sidecar."""
 
+
     def _is_user_defined_network(self) -> bool:
-        """Return True when network_mode is a named user-defined network (not host/bridge/none/container:*)."""
+        """Return True when network_mode is a named user-defined network.
+
+        Anything outside the container-runtime network modes (host/bridge/none/pasta/
+        slirp4netns) and the ``container:*`` form is treated as a Docker network name and
+        must exist before the sandbox is created.
+        """
         return (
-            self.network_mode not in {HOST_NETWORK_MODE, BRIDGE_NETWORK_MODE, "none"}
+            self.network_mode not in CONTAINER_RUNTIME_NETWORK_MODES
             and not self.network_mode.startswith("container:")
         )
 
@@ -108,13 +175,30 @@ class DockerNetworkingMixin:
         if not request.network_policy:
             return
 
-        # Docker-specific validation: network_mode must be bridge
         if self.network_mode == HOST_NETWORK_MODE:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={
                     "code": SandboxErrorCodes.INVALID_PARAMETER,
                     "message": "networkPolicy is not supported when docker network_mode=host.",
+                },
+            )
+
+        # `none`, `pasta` and `slirp4netns` provide no bridge network for the egress sidecar
+        # to attach to, so network policy cannot be enforced with them.
+        if self.network_mode in {
+            NONE_NETWORK_MODE,
+            PASTA_NETWORK_MODE,
+            SLIRP4NETNS_NETWORK_MODE,
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": (
+                        f"networkPolicy is not supported when docker network_mode='{self.network_mode}'. "
+                        "Use network_mode='bridge' to enable network policy enforcement."
+                    ),
                 },
             )
 
@@ -132,8 +216,11 @@ class DockerNetworkingMixin:
                 },
             )
 
-        # Common validation: egress.image must be configured
         ensure_egress_configured(request.network_policy, self.app_config.egress)
+        ensure_credential_proxy_configured(
+            request.credential_proxy, request.network_policy, self.app_config.egress
+        )
+        ensure_egress_runtime_compatible(request.network_policy, self.app_config.secure_runtime)
 
     def _ensure_secure_access_support(self, request) -> None:
         """Validate that secure access can be honored under the current Docker runtime."""
@@ -151,16 +238,26 @@ class DockerNetworkingMixin:
             },
         )
 
-    def get_endpoint(self, sandbox_id: str, port: int, resolve_internal: bool = False,
-                     expires: Optional[int] = None) -> Endpoint:
+    def get_endpoint(
+        self,
+        sandbox_id: str,
+        port: int,
+        resolve_internal: bool = False,
+        expires: Optional[int] = None,
+        use_proxy_host: bool = False,
+    ) -> Endpoint:
         """
         Get sandbox access endpoint.
 
         Args:
-            sandbox_id: Unique sandbox identifier
-            port: Port number where the service is listening inside the sandbox
-            resolve_internal: If True, return the internal container IP (for proxy), ignoring router config.
+            resolve_internal: If True, select a server-reachable container or host-mapped endpoint.
             expires: Not supported by Docker runtime.
+            use_proxy_host: When True and resolve_internal is False, build the
+                host-mapped endpoint from the server-local proxy host
+                (``_resolve_proxy_host()``) instead of the public host. This is
+                used by the server-side proxy so that deployments that advertise
+                a public EIP (``server.eip``) still route proxied traffic to a
+                locally reachable host.
 
         Returns:
             Endpoint: Public endpoint URL
@@ -204,15 +301,32 @@ class DockerNetworkingMixin:
                     labels,
                     port,
                 )
+            # User-mode networks (`pasta`, `slirp4netns`) have no host-routable container IP at
+            # all: the Docker-compatible inspect reports an empty IPAddress and no Networks entry,
+            # and the host reaches the sandbox through the published ports. Resolve those through
+            # the host mapping as well instead of failing with NETWORK_MODE_ENDPOINT_UNAVAILABLE.
+            if self.network_mode in {PASTA_NETWORK_MODE, SLIRP4NETNS_NETWORK_MODE}:
+                return self._resolve_host_mapped_endpoint(
+                    self._resolve_proxy_host(),
+                    labels,
+                    port,
+                )
             return self._resolve_internal_endpoint(container, port)
 
-        public_host = self._resolve_public_host()
+        # The server-side proxy needs a locally reachable host: when the
+        # deployment advertises a public EIP (server.eip), _resolve_public_host()
+        # returns that EIP, which the proxy process itself may not be able to
+        # reach (no hairpin). Use the server-local proxy host for that case.
+        if use_proxy_host:
+            public_host = self._resolve_proxy_host()
+        else:
+            public_host = self._resolve_public_host()
 
         if self.network_mode == HOST_NETWORK_MODE:
             endpoint = Endpoint(endpoint=f"{public_host}:{port}")
             container = self._get_container_by_sandbox_id(sandbox_id)
             labels = container.attrs.get("Config", {}).get("Labels") or {}
-            self._attach_egress_auth_headers(endpoint, labels)
+            self._attach_egress_auth_headers(endpoint, labels, port)
             return endpoint
 
         # non-host mode (bridge / user-defined network)
@@ -225,6 +339,8 @@ class DockerNetworkingMixin:
         public_host: str,
         labels: dict[str, str],
         port: int,
+        *,
+        include_egress_auth_headers: bool = True,
     ) -> Endpoint:
         execd_host_port = self._parse_host_port_label(
             labels.get(SANDBOX_EMBEDDING_PROXY_PORT_LABEL),
@@ -245,7 +361,8 @@ class DockerNetworkingMixin:
                     },
                 )
             endpoint = Endpoint(endpoint=f"{public_host}:{http_host_port}")
-            self._attach_egress_auth_headers(endpoint, labels)
+            if include_egress_auth_headers:
+                self._attach_egress_auth_headers(endpoint, labels, port)
             return endpoint
 
         if execd_host_port is None:
@@ -258,14 +375,18 @@ class DockerNetworkingMixin:
             )
 
         endpoint = Endpoint(endpoint=f"{public_host}:{execd_host_port}/proxy/{port}")
-        self._attach_egress_auth_headers(endpoint, labels)
+        if include_egress_auth_headers:
+            self._attach_egress_auth_headers(endpoint, labels, port)
         return endpoint
 
     def _attach_egress_auth_headers(
         self,
         endpoint: Endpoint,
         labels: dict[str, str],
+        port: int,
     ) -> None:
+        if port != 18080:
+            return
         token = labels.get(SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY)
         if not token:
             return
@@ -286,11 +407,15 @@ class DockerNetworkingMixin:
             return eip_cfg
         host_cfg = (self.app_config.server.host or "").strip()
         host_key = host_cfg.lower()
-        if host_key in {"", "0.0.0.0", "::"}:
+        # Inside a container, [docker].host_ip is where host-mapped ports answer; a loopback bind
+        # (the safe default beside the sandboxes' network) is never that address, so it must not
+        # turn the setting off. An explicit non-loopback bind is left as it is.
+        if host_key in {"", "0.0.0.0", "::"} or host_key in _LOOPBACK_HOSTS:
             if _running_inside_docker_container():
                 host_ip = self._get_docker_host_ip()
                 if host_ip:
                     return host_ip
+        if host_key in {"", "0.0.0.0", "::"}:
             return self._resolve_bind_ip(socket.AF_INET)
         return host_cfg
 
@@ -302,25 +427,32 @@ class DockerNetworkingMixin:
         """
         host_cfg = (self.app_config.server.host or "").strip()
         host_key = host_cfg.lower()
-        if host_key in {"", "0.0.0.0", "::"}:
+        # Same rule as the public host: inside a container, host_ip says where the host-mapped
+        # endpoints (execd, the egress sidecar's readiness probe) answer — for a loopback bind too.
+        if host_key in {"", "0.0.0.0", "::"} or host_key in _LOOPBACK_HOSTS:
             if _running_inside_docker_container():
                 host_ip = self._get_docker_host_ip()
                 if host_ip:
                     return host_ip
+        # Outside host networking, sandbox ports are published on [docker].publish_host; when it
+        # names one address they answer only there, whatever address the server listens on.
+        publish_host = self.app_config.docker.publish_host
+        if self.network_mode != HOST_NETWORK_MODE and publish_host != "0.0.0.0":
+            return publish_host
+        if host_key in {"", "0.0.0.0", "::"}:
             return "127.0.0.1"
         return host_cfg
 
     def _resolve_internal_endpoint(self, container, port: int) -> Endpoint:
         """Return the internal endpoint used when bypassing host mapping."""
         if self.network_mode == HOST_NETWORK_MODE:
-            return Endpoint(endpoint=f"127.0.0.1:{port}")
-
-        ip_address = self._extract_bridge_ip(container)
-        return Endpoint(endpoint=f"{ip_address}:{port}")
-
-    # ---------------------------
-    # Common helpers for creation
-    # ---------------------------
+            endpoint = Endpoint(endpoint=f"127.0.0.1:{port}")
+        else:
+            ip_address = self._extract_bridge_ip(container)
+            endpoint = Endpoint(endpoint=f"{ip_address}:{port}")
+        labels = container.attrs.get("Config", {}).get("Labels") or {}
+        self._attach_egress_auth_headers(endpoint, labels, port)
+        return endpoint
 
     def _cleanup_egress_sidecar(self, sandbox_id: str) -> None:
         """
@@ -331,87 +463,166 @@ class DockerNetworkingMixin:
                 all=True, filters={"label": f"{EGRESS_SIDECAR_LABEL}={sandbox_id}"}
             )
         except DockerException as exc:
-            logger.warning("sandbox=%s | failed to list egress sidecar: %s", sandbox_id, exc)
+            logger.warning(f"sandbox={sandbox_id} | failed to list egress sidecar: {exc}")
             return
 
         for container in containers:
             try:
                 with self._docker_operation("cleanup egress sidecar", sandbox_id):
+                    try:
+                        # Bound Docker deletion independently of the image's supervisor grace.
+                        container.stop(timeout=9)
+                    except DockerNotFound:
+                        continue
+                    except (DockerException, RequestException) as exc:
+                        logger.warning(f"sandbox={sandbox_id} | sidecar stop failed; forcing removal: {exc}")
                     container.remove(force=True)
-            except DockerException as exc:
+            except DockerNotFound:
+                continue
+            except (DockerException, RequestException) as exc:
                 logger.warning(
-                    "sandbox=%s | failed to remove egress sidecar %s: %s",
-                    sandbox_id,
-                    container.id,
-                    exc,
+                    f"sandbox={sandbox_id} | failed to remove egress sidecar {container.id}: {exc}"
                 )
+
+        # The shared runtime volume can outlive a successfully removed app.
+        # Removal is best effort and still checks the server-managed label.
+        self._cleanup_managed_volumes(sandbox_id, [f"opensandbox-runtime-{sandbox_id}"])
 
     def _start_egress_sidecar(
         self,
         sandbox_id: str,
-        network_policy: NetworkPolicy,
+        network_policy: Optional[NetworkPolicy],
         egress_token: str,
         host_execd_port: int,
         host_http_port: int,
         extra_port_bindings: Optional[dict[str, tuple[str, int]]] = None,
+        egress_api_host_port: Optional[int] = None,
+        runtime_volume_name: Optional[str] = None,
+        credential_proxy_enabled: bool = False,
+        extra_env: Optional[Dict[str, Optional[str]]] = None,
     ):
         sidecar_name = f"sandbox-egress-{sandbox_id}"
         sidecar_labels = {
             EGRESS_SIDECAR_LABEL: sandbox_id,
         }
 
-        # Ensure sidecar image is available before create/start.
         egress_image = self.app_config.egress.image if self.app_config.egress else None
         if not egress_image:
             raise ValueError("egress.image must be configured when networkPolicy is provided.")
         self._ensure_image_available(egress_image, None, sandbox_id)
 
-        policy_payload = json.dumps(network_policy.model_dump(by_alias=True, exclude_none=True))
-        assert self.app_config.egress is not None  # validated by ensure_egress_configured with networkPolicy
+        assert (
+            self.app_config.egress is not None
+        )  # validated by ensure_egress_configured with networkPolicy, or by forward-mode config
         egress_mode = self.app_config.egress.mode
         sidecar_env = [
-            f"{EGRESS_RULES_ENV}={policy_payload}",
             f"{EGRESS_MODE_ENV}={egress_mode}",
             f"{OPENSANDBOX_EGRESS_TOKEN}={egress_token}",
+            f"{OPENSANDBOX_EGRESS_SANDBOX_ID}={sandbox_id}",
         ]
+        # Forward mode carries no local policy (OSEP-0030).
+        if network_policy is not None:
+            policy_payload = json.dumps(network_policy.model_dump(by_alias=True, exclude_none=True))
+            sidecar_env.insert(0, f"{EGRESS_RULES_ENV}={policy_payload}")
+        if self.app_config.egress.otlp_endpoint:
+            sidecar_env.append(
+                f"{OTEL_EXPORTER_OTLP_ENDPOINT}={self.app_config.egress.otlp_endpoint}"
+            )
+        for key, value in upstream_proxy_egress_env(
+            self.app_config.egress.upstream_proxy
+        ).items():
+            sidecar_env.append(f"{key}={value}")
+        for key, value in forward_mode_egress_env(self.app_config.egress).items():
+            sidecar_env.append(f"{key}={value}")
+        if credential_proxy_enabled:
+            sidecar_env.append(f"{OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT}=true")
 
+        if extra_env:
+            skip_keys = (
+                {OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT} if credential_proxy_enabled else set()
+            )
+            for key, value in extra_env.items():
+                if key not in skip_keys and value is not None:
+                    sidecar_env.append(f"{key}={value}")
+
+        publish_host = self.app_config.docker.publish_host
         sidecar_port_bindings: dict[str, tuple[str, int]] = {
-            "44772": ("0.0.0.0", host_execd_port),
-            "8080": ("0.0.0.0", host_http_port),
+            "44772": (publish_host, host_execd_port),
+            "8080": (publish_host, host_http_port),
         }
         if extra_port_bindings:
             sidecar_port_bindings.update(extra_port_bindings)
 
-        sidecar_host_config_kwargs: dict[str, Any] = {
+        base_sidecar_host_config_kwargs: dict[str, Any] = {
             "network_mode": BRIDGE_NETWORK_MODE,
             "cap_add": ["NET_ADMIN"],
             "port_bindings": normalize_port_bindings(sidecar_port_bindings),
         }
-        if self.app_config.egress.disable_ipv6:
-            # Optional: disable IPv6 in the shared namespace when egress.disable_ipv6 is set.
-            sidecar_host_config_kwargs["sysctls"] = {
-                "net.ipv6.conf.all.disable_ipv6": 1,
-                "net.ipv6.conf.default.disable_ipv6": 1,
-                "net.ipv6.conf.lo.disable_ipv6": 1,
-            }
+        sidecar_binds: list[str] = []
+        if runtime_volume_name:
+            sidecar_binds.append(
+                f"{runtime_volume_name}:{OPENSANDBOX_RUNTIME_MOUNT_PATH}:rw"
+            )
+        upstream_proxy = self.app_config.egress.upstream_proxy
+        if upstream_proxy is not None and upstream_proxy.ca_cert_path is not None:
+            sidecar_binds.append(
+                f"{upstream_proxy.ca_cert_path}:{EGRESS_UPSTREAM_EXTRA_CA_PATH}:ro"
+            )
+        if sidecar_binds:
+            base_sidecar_host_config_kwargs["binds"] = sidecar_binds
 
-        sidecar_host_config = self.docker_client.api.create_host_config(
-            **sidecar_host_config_kwargs
-        )
+        def build_sidecar_host_config(*, include_ipv6_sysctls: bool) -> Any:
+            sidecar_host_config_kwargs = dict(base_sidecar_host_config_kwargs)
+            if include_ipv6_sysctls:
+                # Optional: disable IPv6 in the shared namespace when egress.disable_ipv6 is set.
+                sidecar_host_config_kwargs["sysctls"] = {
+                    "net.ipv6.conf.all.disable_ipv6": 1,
+                    "net.ipv6.conf.default.disable_ipv6": 1,
+                    "net.ipv6.conf.lo.disable_ipv6": 1,
+                }
+            return self.docker_client.api.create_host_config(**sidecar_host_config_kwargs)
+
+        include_ipv6_sysctls = self.app_config.egress.disable_ipv6
+        sidecar_host_config = build_sidecar_host_config(include_ipv6_sysctls=include_ipv6_sysctls)
 
         sidecar_container = None
         sidecar_container_id: Optional[str] = None
         try:
-            with self._docker_operation("create egress sidecar", sandbox_id):
-                sidecar_resp = self.docker_client.api.create_container(
-                    image=egress_image,
-                    name=sidecar_name,
-                    host_config=sidecar_host_config,
-                    labels=sidecar_labels,
-                    environment=sidecar_env,
-                    # Expose the ports that have host bindings so Docker publishes them in bridge mode.
-                    ports=[normalize_container_port_spec(p) for p in sidecar_port_bindings.keys()],
+            try:
+                with self._docker_operation("create egress sidecar", sandbox_id):
+                    sidecar_resp = self.docker_client.api.create_container(
+                        image=egress_image,
+                        name=sidecar_name,
+                        host_config=sidecar_host_config,
+                        labels=sidecar_labels,
+                        environment=sidecar_env,
+                        # Expose the ports that have host bindings so Docker publishes them in bridge mode.
+                        ports=[
+                            normalize_container_port_spec(p) for p in sidecar_port_bindings.keys()
+                        ],
+                    )
+            except DockerException as exc:
+                if not (
+                    include_ipv6_sysctls and _docker_error_indicates_unsupported_ipv6_sysctls(exc)
+                ):
+                    raise
+                logger.warning(
+                    f"sandbox={sandbox_id} | retry egress sidecar without "
+                    f"IPv6 sysctls after daemon rejection: {exc}"
                 )
+                sidecar_host_config = build_sidecar_host_config(include_ipv6_sysctls=False)
+                with self._docker_operation("create egress sidecar", sandbox_id):
+                    sidecar_resp = self.docker_client.api.create_container(
+                        image=egress_image,
+                        name=sidecar_name,
+                        host_config=sidecar_host_config,
+                        labels=sidecar_labels,
+                        environment=sidecar_env,
+                        # Expose the ports that have host bindings so Docker publishes them in bridge mode.
+                        ports=[
+                            normalize_container_port_spec(p) for p in sidecar_port_bindings.keys()
+                        ],
+                    )
             sidecar_container_id = sidecar_resp.get("Id")
             if not sidecar_container_id:
                 raise HTTPException(
@@ -424,6 +635,13 @@ class DockerNetworkingMixin:
             sidecar_container = self.docker_client.containers.get(sidecar_container_id)
             with self._docker_operation("start egress sidecar", sandbox_id):
                 sidecar_container.start()
+            if egress_api_host_port is not None:
+                self._wait_for_egress_sidecar_ready(
+                    sandbox_id,
+                    egress_api_host_port,
+                    egress_token,
+                    timeout_seconds=self.app_config.egress.readiness_timeout_seconds,
+                )
             return sidecar_container
         except Exception as exc:
             if sidecar_container is not None:
@@ -432,9 +650,7 @@ class DockerNetworkingMixin:
                         sidecar_container.remove(force=True)
                 except DockerException as cleanup_exc:
                     logger.warning(
-                        "Failed to cleanup egress sidecar for sandbox %s: %s",
-                        sandbox_id,
-                        cleanup_exc,
+                        f"Failed to cleanup egress sidecar for sandbox {sandbox_id}: {cleanup_exc}"
                     )
             elif sidecar_container_id:
                 try:
@@ -442,9 +658,7 @@ class DockerNetworkingMixin:
                         self.docker_client.api.remove_container(sidecar_container_id, force=True)
                 except DockerException as cleanup_exc:
                     logger.warning(
-                        "Failed to cleanup egress sidecar for sandbox %s: %s",
-                        sandbox_id,
-                        cleanup_exc,
+                        f"Failed to cleanup egress sidecar for sandbox {sandbox_id}: {cleanup_exc}"
                     )
             if isinstance(exc, HTTPException):
                 raise exc
@@ -456,6 +670,45 @@ class DockerNetworkingMixin:
                 },
             ) from exc
 
+    def _wait_for_egress_sidecar_ready(
+        self,
+        sandbox_id: str,
+        host_port: int,
+        egress_token: str,
+        timeout_seconds: float,
+    ) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        url = f"http://{self._resolve_proxy_host()}:{host_port}/healthz"
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            request = urllib.request.Request(
+                url,
+                headers=build_egress_auth_headers(egress_token),
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=1.0) as response:  # nosec B310 - local Docker endpoint
+                    if 200 <= response.status < 300:
+                        return
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code >= 500:
+                    time.sleep(0.2)
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+            time.sleep(0.2)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": SandboxErrorCodes.CONTAINER_START_FAILED,
+                "message": (
+                    f"Egress sidecar did not become ready within {timeout_seconds:.0f}s "
+                    f"for sandbox {sandbox_id}: {last_error}"
+                ),
+            },
+        )
+
     @staticmethod
     def _parse_host_port_label(value: Optional[str], label_name: str) -> Optional[int]:
         if not value:
@@ -466,7 +719,7 @@ class DockerNetworkingMixin:
                 raise ValueError
             return port
         except ValueError:
-            logger.warning("Invalid port label %s=%s", label_name, value)
+            logger.warning(f"Invalid port label {label_name}={value}")
             return None
 
     def _extract_bridge_ip(self, container) -> str:
@@ -482,16 +735,13 @@ class DockerNetworkingMixin:
         ip_address: Optional[str] = None
 
         if self._is_user_defined_network():
-            # Prefer the explicit network entry for the configured named network.
             net_conf = networks.get(self.network_mode) or {}
             ip_address = net_conf.get("IPAddress") or None
 
         if not ip_address:
-            # Default bridge path (or fallback): check the top-level IPAddress first.
             ip_address = network_settings.get("IPAddress") or None
 
         if not ip_address:
-            # Last resort: iterate all network entries and take the first populated IP.
             for net_conf in networks.values():
                 if net_conf and net_conf.get("IPAddress"):
                     ip_address = net_conf.get("IPAddress")

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -75,7 +75,8 @@ internal static class SseParser
                 }
             }
 
-            var message = errorMessage ?? fallbackErrorMessage ?? $"Stream request failed (status={(int)response.StatusCode})";
+            var message = errorMessage ?? $"{fallbackErrorMessage ?? $"Stream request failed (status={(int)response.StatusCode})"}" +
+                (string.IsNullOrEmpty(text) ? string.Empty : $": {text}");
             var sandboxErrorCode = errorCode ?? SandboxErrorCodes.UnexpectedResponse;
 
             throw new SandboxApiException(
@@ -103,7 +104,6 @@ internal static class SseParser
 
             var trimmedLine = line.Trim();
 
-            // Skip empty lines
             if (string.IsNullOrEmpty(trimmedLine))
                 continue;
 
@@ -117,7 +117,6 @@ internal static class SseParser
                 trimmedLine.StartsWith("retry:", StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            // Extract JSON from SSE data line or use as-is for NDJSON
             var jsonLine = trimmedLine.StartsWith("data:", StringComparison.OrdinalIgnoreCase)
                 ? trimmedLine.Substring(5).Trim()
                 : trimmedLine;

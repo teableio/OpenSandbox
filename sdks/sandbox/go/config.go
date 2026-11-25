@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,16 +38,26 @@ type ConnectionConfig struct {
 
 	// UseServerProxy routes execd/egress requests through the sandbox server
 	// instead of connecting directly to the sandbox endpoint.
+	//
+	// Deprecated: the server-proxied data path is in maintenance mode and only
+	// receives security fixes and bug fixes. Route data-plane traffic through
+	// the ingress gateway instead.
 	UseServerProxy bool
 
 	// RequestTimeout is the timeout for non-streaming HTTP requests.
-	// Zero means no timeout. Defaults to DefaultRequestTimeout.
+	// Zero means DefaultRequestTimeout (30s); there is currently no way to
+	// select "no timeout". It does not cap SSE streams or file uploads and
+	// downloads, which bound only the wait for response headers; use the
+	// context to limit those.
 	RequestTimeout time.Duration
 
-	// Headers are custom HTTP headers added to all requests.
+	// Headers are custom HTTP headers added to lifecycle and data-plane
+	// requests. In direct mode, OPEN-SANDBOX-API-KEY is omitted from
+	// execd/egress requests because those endpoints run inside the sandbox.
 	Headers map[string]string
 
 	// HTTPClient is an optional custom HTTP client. If nil, a default is created.
+	// Its transport must honor request context cancellation to bound readiness waits.
 	HTTPClient *http.Client
 
 	// AuthHeader overrides the default lifecycle auth header name.
@@ -55,9 +65,11 @@ type ConnectionConfig struct {
 	AuthHeader string
 
 	// Retry enables automatic retry with exponential backoff for transient
-	// errors. Defaults to retrying 429/502/503/504; override
-	// RetryConfig.RetryableStatusCodes for custom policies. If nil, requests
-	// are not retried.
+	// errors. Idempotent methods default to 429/502/503/504; override
+	// RetryConfig.RetryableStatusCodes for custom idempotent policies. POST
+	// and PATCH do not retry status codes unless listed in
+	// RetryConfig.RetryableStatusCodesNonIdempotent. If nil, requests are not
+	// retried.
 	// Use DefaultRetryConfig() for sensible defaults.
 	Retry *RetryConfig
 
@@ -72,11 +84,23 @@ type ConnectionConfig struct {
 	// resolvable from the host machine.
 	// Example: map[string]string{"host.docker.internal": "localhost"}
 	EndpointHostRewrite map[string]string
+
+	// EndpointCacheTTL is how long a cached endpoint stays valid.
+	// Zero means DefaultEndpointCacheTTL (600s).
+	EndpointCacheTTL time.Duration
+
+	// EndpointCacheSize is the maximum number of cached endpoints.
+	// Zero means DefaultEndpointCacheSize (1024).
+	EndpointCacheSize int
+
+	// EndpointCacheDisabled disables endpoint caching entirely.
+	EndpointCacheDisabled bool
+
+	// DisableMetrics skips SDK telemetry (sandbox.create latency reports).
+	// Also honored via OPENSANDBOX_DISABLE_METRICS=1.
+	DisableMetrics bool
 }
 
-// RewriteEndpointURL applies EndpointHostRewrite rules to an endpoint URL
-// returned by the server. This handles cases like Docker's
-// "host.docker.internal" being unreachable from the host machine.
 func (c *ConnectionConfig) RewriteEndpointURL(endpointURL string) string {
 	for from, to := range c.EndpointHostRewrite {
 		endpointURL = strings.ReplaceAll(endpointURL, from, to)
@@ -84,7 +108,6 @@ func (c *ConnectionConfig) RewriteEndpointURL(endpointURL string) string {
 	return endpointURL
 }
 
-// GetDomain returns the configured domain, falling back to env var and default.
 func (c *ConnectionConfig) GetDomain() string {
 	if c.Domain != "" {
 		return c.Domain
@@ -95,7 +118,6 @@ func (c *ConnectionConfig) GetDomain() string {
 	return DefaultDomain
 }
 
-// GetProtocol returns the configured protocol, falling back to env var and default.
 func (c *ConnectionConfig) GetProtocol() string {
 	if c.Protocol != "" {
 		return c.Protocol
@@ -106,7 +128,6 @@ func (c *ConnectionConfig) GetProtocol() string {
 	return DefaultProtocol
 }
 
-// GetAPIKey returns the configured API key, falling back to env var.
 func (c *ConnectionConfig) GetAPIKey() string {
 	if c.APIKey != "" {
 		return c.APIKey
@@ -114,14 +135,11 @@ func (c *ConnectionConfig) GetAPIKey() string {
 	return os.Getenv("OPEN_SANDBOX_API_KEY")
 }
 
-// GetBaseURL returns the lifecycle API base URL (e.g. "http://localhost:8080").
-// Note: this does NOT append /v1.
-// lifecycleClient() appends /v1 when creating the lifecycle client.
+// GetBaseURL excludes the API version prefix.
 func (c *ConnectionConfig) GetBaseURL() string {
 	domain := c.GetDomain()
 	protocol := c.GetProtocol()
 
-	// If domain already has a scheme, use it as-is.
 	if strings.HasPrefix(domain, "http://") || strings.HasPrefix(domain, "https://") {
 		return strings.TrimRight(domain, "/")
 	}
@@ -129,7 +147,6 @@ func (c *ConnectionConfig) GetBaseURL() string {
 	return fmt.Sprintf("%s://%s", protocol, domain)
 }
 
-// GetAuthHeader returns the auth header name for lifecycle requests.
 func (c *ConnectionConfig) GetAuthHeader() string {
 	if c.AuthHeader != "" {
 		return c.AuthHeader
@@ -137,7 +154,6 @@ func (c *ConnectionConfig) GetAuthHeader() string {
 	return "OPEN-SANDBOX-API-KEY"
 }
 
-// GetRequestTimeout returns the request timeout, defaulting to DefaultRequestTimeout.
 func (c *ConnectionConfig) GetRequestTimeout() time.Duration {
 	if c.RequestTimeout > 0 {
 		return c.RequestTimeout
@@ -145,8 +161,11 @@ func (c *ConnectionConfig) GetRequestTimeout() time.Duration {
 	return DefaultRequestTimeout
 }
 
-// clientOpts builds the common Option slice from config fields.
 func (c *ConnectionConfig) clientOpts(includeAuthHeader bool) []Option {
+	return c.clientOptsWithHeaders(includeAuthHeader, c.Headers)
+}
+
+func (c *ConnectionConfig) clientOptsWithHeaders(includeAuthHeader bool, headers map[string]string) []Option {
 	var opts []Option
 	if includeAuthHeader && c.AuthHeader != "" {
 		opts = append(opts, WithAuthHeader(c.AuthHeader))
@@ -161,8 +180,8 @@ func (c *ConnectionConfig) clientOpts(includeAuthHeader bool) []Option {
 	if t := c.GetRequestTimeout(); t > 0 {
 		opts = append(opts, WithTimeout(t))
 	}
-	if len(c.Headers) > 0 {
-		opts = append(opts, WithHeaders(c.Headers))
+	if len(headers) > 0 {
+		opts = append(opts, WithHeaders(headers))
 	}
 	if c.Retry != nil {
 		opts = append(opts, WithRetry(*c.Retry))
@@ -170,31 +189,43 @@ func (c *ConnectionConfig) clientOpts(includeAuthHeader bool) []Option {
 	return opts
 }
 
-// lifecycleClient creates a LifecycleClient from this config.
-// Appends the API version prefix (/v1) to the base URL, as required by
-// NewLifecycleClient and the OpenSandbox lifecycle API spec.
-func (c *ConnectionConfig) lifecycleClient() *LifecycleClient {
-	return NewLifecycleClient(c.GetBaseURL()+"/"+APIVersion, c.GetAPIKey(), c.clientOpts(true)...)
+// dataPlaneHeaders merges connection and endpoint headers for execd/egress.
+// Endpoint headers take precedence regardless of HTTP header name casing.
+// Direct-mode requests terminate inside the sandbox, so the tenant API key must
+// never be forwarded there, even when a caller supplied it via Headers.
+func (c *ConnectionConfig) dataPlaneHeaders(endpointHeaders map[string]string) map[string]string {
+	if len(c.Headers) == 0 && len(endpointHeaders) == 0 {
+		return nil
+	}
+
+	headers := make(map[string]string, len(c.Headers)+len(endpointHeaders))
+	for key, value := range c.Headers {
+		headers[key] = value
+	}
+	for key, value := range endpointHeaders {
+		deleteHeaderFold(headers, key)
+		headers[key] = value
+	}
+	if !c.UseServerProxy {
+		deleteHeaderFold(headers, serverProxyAuthHeader)
+	}
+	return headers
 }
 
-// execdClient creates an ExecdClient for a resolved endpoint. All headers
-// returned by the lifecycle GetEndpoint call (auth tokens, routing hints,
-// sticky-session keys, etc.) are forwarded as-is on every subsequent request.
-func (c *ConnectionConfig) execdClient(endpointURL string, endpointHeaders map[string]string) *ExecdClient {
-	opts := c.clientOpts(true)
-	if len(endpointHeaders) > 0 {
-		opts = append(opts, WithHeaders(endpointHeaders))
+func (c *ConnectionConfig) lifecycleClient() *LifecycleClient {
+	var cache *EndpointCache
+	if !c.EndpointCacheDisabled {
+		cache = NewEndpointCache(c.EndpointCacheSize, c.EndpointCacheTTL)
 	}
+	return NewLifecycleClientWithCache(c.GetBaseURL()+"/"+APIVersion, c.GetAPIKey(), cache, c.clientOpts(true)...)
+}
+
+func (c *ConnectionConfig) execdClient(endpointURL string, endpointHeaders map[string]string) *ExecdClient {
+	opts := c.clientOptsWithHeaders(true, c.dataPlaneHeaders(endpointHeaders))
 	return NewExecdClient(endpointURL, "", opts...)
 }
 
-// egressClient creates an EgressClient for a resolved endpoint. All headers
-// returned by the lifecycle GetEndpoint call are forwarded as-is on every
-// subsequent request.
 func (c *ConnectionConfig) egressClient(endpointURL string, endpointHeaders map[string]string) *EgressClient {
-	opts := c.clientOpts(false)
-	if len(endpointHeaders) > 0 {
-		opts = append(opts, WithHeaders(endpointHeaders))
-	}
+	opts := c.clientOptsWithHeaders(false, c.dataPlaneHeaders(endpointHeaders))
 	return NewEgressClient(endpointURL, "", opts...)
 }

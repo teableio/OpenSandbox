@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,9 @@ import logging
 import time
 
 import httpx
+from opensandbox.adapters.converter.command_execution import (
+    infer_foreground_exit_code,
+)
 from opensandbox.adapters.converter.event_node import EventNode
 from opensandbox.adapters.converter.exception_converter import (
     ExceptionConverter,
@@ -33,14 +36,15 @@ from opensandbox.adapters.converter.execution_event_dispatcher import (
     ExecutionEventDispatcher,
 )
 from opensandbox.adapters.converter.response_handler import (
-    extract_request_id,
+    build_api_exception_from_httpx,
     handle_api_error,
     require_parsed,
 )
 from opensandbox.config import ConnectionConfig
-from opensandbox.exceptions import InvalidArgumentException, SandboxApiException
+from opensandbox.exceptions import InvalidArgumentException
 from opensandbox.models.execd import Execution, ExecutionHandlers
 from opensandbox.models.sandboxes import SandboxEndpoint
+from opensandbox.transport import streaming_transport
 
 from code_interpreter.adapters.converter.code_execution_converter import (
     CodeExecutionConverter,
@@ -71,18 +75,11 @@ class CodesAdapter(Codes):
     """
     Adapter implementation for code execution service.
 
-    This adapter wraps auto-generated API clients and provides the concrete
-    implementation of the Codes interface. It handles both standard
-    API calls and SSE streaming for real-time code execution output.
-
-    Similar to CommandServiceAdapter, this adapter uses:
-    - Generated API clients for simple operations (create_context, interrupt)
-    - Direct httpx SSE streaming for run
-    - ExceptionConverter for unified exception handling
+    Handles standard API calls plus direct httpx SSE streaming for
+    real-time code execution output.
     """
 
     RUN_CODE_PATH = "/code"
-    CREATE_CONTEXT_PATH = "/code/context"
 
     def __init__(
         self, execd_endpoint: SandboxEndpoint, connection_config: ConnectionConfig
@@ -103,11 +100,7 @@ class CodesAdapter(Codes):
         timeout_seconds = self.connection_config.request_timeout.total_seconds()
         timeout = httpx.Timeout(timeout_seconds)
 
-        headers = {
-            "User-Agent": self.connection_config.user_agent,
-            **self.connection_config.headers,
-            **self.execd_endpoint.headers,
-        }
+        headers = self.execd_endpoint.build_request_headers(self.connection_config)
 
         # Execd API does not require authentication
         self._client = Client(
@@ -115,12 +108,19 @@ class CodesAdapter(Codes):
             timeout=timeout,
         )
 
-        # Inject httpx client (adapter-owned)
+        # Adapter clients must own their transports: aclose() closes them,
+        # and the shared/user connection_config transport must survive that.
+        self._owns_clients = self.connection_config.owns_transport
+        main_transport: httpx.AsyncBaseTransport | None
+        if self._owns_clients:
+            main_transport = self.connection_config.new_owned_transport()
+        else:
+            main_transport = self.connection_config.transport
         self._httpx_client = httpx.AsyncClient(
             base_url=base_url,
             headers=headers,
             timeout=timeout,
-            transport=self.connection_config.transport,
+            transport=main_transport,
         )
         self._client.set_async_httpx_client(self._httpx_client)
 
@@ -130,6 +130,13 @@ class CodesAdapter(Codes):
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache",
         }
+        # SSE bootstraps keep only the wake-timeout retry: a non-idempotent
+        # status opt-in would cause duplicate execution on a resent SSE POST.
+        sse_transport = (
+            self.connection_config.new_owned_transport()
+            if self._owns_clients
+            else self.connection_config.transport
+        )
         self._sse_client = httpx.AsyncClient(
             headers=sse_headers,
             timeout=httpx.Timeout(
@@ -138,7 +145,7 @@ class CodesAdapter(Codes):
                 write=timeout_seconds,
                 pool=None,
             ),
-            transport=self.connection_config.transport,
+            transport=streaming_transport(sse_transport),
         )
 
     async def _get_client(self):
@@ -153,6 +160,21 @@ class CodesAdapter(Codes):
     async def _get_sse_client(self) -> httpx.AsyncClient:
         """Return SSE client (read timeout disabled) for execd streaming."""
         return self._sse_client
+
+    async def aclose(self) -> None:
+        """Release the adapter-owned HTTP clients.
+
+        Never closes the shared ``connection_config.transport``; the sandbox
+        stays usable after ``aclose()``. Clients wrapping a user-supplied
+        transport are left open (httpx would close the caller's transport
+        with them).
+        """
+        if not self._owns_clients:
+            return
+        try:
+            await self._httpx_client.aclose()
+        finally:
+            await self._sse_client.aclose()
 
     async def create_context(self, language: str) -> CodeContext:
         """
@@ -216,7 +238,9 @@ class CodesAdapter(Codes):
             )
             handle_api_error(response_obj, "List code contexts")
             parsed_list = require_parsed(response_obj, list, "List code contexts")
-            return [CodeExecutionConverter.from_api_code_context(c) for c in parsed_list]
+            return [
+                CodeExecutionConverter.from_api_code_context(c) for c in parsed_list
+            ]
         except Exception as e:
             logger.error("Failed to list contexts", exc_info=e)
             raise ExceptionConverter.to_sandbox_exception(e) from e
@@ -262,14 +286,18 @@ class CodesAdapter(Codes):
         """
         Executes code within the specified context using SSE streaming.
 
-        Similar to CommandServiceAdapter.run, this uses direct httpx
+        Uses direct httpx
         streaming to handle SSE responses from the execd service.
         """
         if not code.strip():
             raise InvalidArgumentException("Code cannot be empty")
 
         try:
-            if context is not None and language is not None and context.language != language:
+            if (
+                context is not None
+                and language is not None
+                and context.language != language
+            ):
                 raise InvalidArgumentException(
                     f"language '{language}' must match context.language '{context.language}'"
                 )
@@ -289,6 +317,7 @@ class CodesAdapter(Codes):
                 result=[],
                 error=None,
             )
+            execution._is_code_execution = True
 
             # Use SSE client for streaming responses (read timeout disabled)
             client = await self._get_sse_client()
@@ -297,17 +326,10 @@ class CodesAdapter(Codes):
             async with client.stream("POST", url, json=api_request) as response:
                 if response.status_code != 200:
                     await response.aread()
-                    error_body = response.text
                     logger.error(
-                        "Failed to run code. Status: %s, Body: %s",
-                        response.status_code,
-                        error_body,
+                        f"Failed to run code. Status: {response.status_code}, Body: {response.text}"
                     )
-                    raise SandboxApiException(
-                        message=f"Failed to run code. Status code: {response.status_code}",
-                        status_code=response.status_code,
-                        request_id=extract_request_id(response.headers),
-                    )
+                    raise build_api_exception_from_httpx(response, "Run code")
 
                 dispatcher = ExecutionEventDispatcher(execution, handlers)
 
@@ -323,20 +345,21 @@ class CodesAdapter(Codes):
                     try:
                         event_dict = _normalize_sse_event(json.loads(data))
                         event_node = EventNode(**event_dict)
-                        await dispatcher.dispatch(event_node)
                     except json.JSONDecodeError:
-                        logger.debug("Failed to parse SSE line: %s", line)
+                        logger.debug(f"Failed to parse SSE line: {line}")
                         continue
                     except Exception as e:
-                        logger.error("Error processing event: %s", data, exc_info=e)
+                        logger.error(f"Failed to decode SSE event: {data}", exc_info=e)
                         continue
+                    await dispatcher.dispatch(event_node)
 
+            # Same inference as commands.run and the other SDKs' code interpreters:
+            # 0 on completion, otherwise the error's exit code when it has one.
+            execution.exit_code = infer_foreground_exit_code(execution)
             return execution
 
         except Exception as e:
-            logger.error(
-                "Failed to run code (length: %s)", len(code), exc_info=e
-            )
+            logger.error(f"Failed to run code (length: {len(code)})", exc_info=e)
             raise ExceptionConverter.to_sandbox_exception(e) from e
 
     async def interrupt(self, execution_id: str) -> None:
@@ -359,3 +382,23 @@ class CodesAdapter(Codes):
         except Exception as e:
             logger.error("Failed to interrupt code execution", exc_info=e)
             raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    async def ping(self) -> bool:
+        """
+        Check if the execd code execution service is alive.
+
+        Uses the shared generated API client so the ping exercises the same
+        HTTP client and endpoint that serve code execution requests.
+        """
+        try:
+            from opensandbox.api.execd.api.health import ping as ping_api
+
+            client = await self._get_client()
+            response_obj = await ping_api.asyncio_detailed(client=client)
+
+            handle_api_error(response_obj, "Ping code interpreter")
+            return True
+
+        except Exception as e:
+            logger.debug(f"Code interpreter ping failed: {e}")
+            return False

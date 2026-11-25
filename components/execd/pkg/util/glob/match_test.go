@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -211,15 +211,6 @@ var matchTests = []MatchTest{
 	{"node_modules/!(.cache)/**", "node_modules/file.txt", true, false, nil, false, false, false, !onWindows, 0, 0},
 	{"node_modules/!(.cache)/**", "node_modules/others/others/file.txt", true, true, nil, false, false, false, !onWindows, 0, 0},
 }
-
-// numResultsFilesOnly memoizes results with WithFilesOnly.
-var numResultsFilesOnly []int
-
-// numResultsNoFollow memoizes results with WithNoFollow.
-var numResultsNoFollow []int
-
-// numResultsAllOpts memoizes counts with every option enabled.
-var numResultsAllOpts []int
 
 func TestValidatePattern(t *testing.T) {
 	for idx, tt := range matchTests {

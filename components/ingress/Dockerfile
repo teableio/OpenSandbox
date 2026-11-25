@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.25.9 AS builder
+FROM golang:1.26.11 AS builder
 
 WORKDIR /build
 
@@ -29,6 +29,10 @@ ARG CXXFLAGS=
 ARG CGO_CFLAGS=
 ARG CGO_CXXFLAGS=
 ARG CGO_LDFLAGS=
+# Optional module proxy for restricted build networks; empty keeps Go's
+# environment (proxy.golang.org) untouched.
+ARG GOPROXY=
+ENV GOPROXY=${GOPROXY}
 
 COPY kubernetes ./kubernetes
 # Prepare local modules to satisfy replace directives.

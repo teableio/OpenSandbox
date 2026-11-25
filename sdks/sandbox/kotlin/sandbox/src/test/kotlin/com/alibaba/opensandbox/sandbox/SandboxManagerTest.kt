@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,14 @@
 
 package com.alibaba.opensandbox.sandbox
 
+import com.alibaba.opensandbox.sandbox.domain.exceptions.InvalidArgumentException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxReadyTimeoutException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SnapshotFailedException
 import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContent
+import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContext
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CreateTemplateRequest
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PagedSandboxInfos
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PagedTemplateInfos
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PaginationInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxFilter
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxImageSpec
@@ -25,6 +31,15 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxState
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxStatus
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotInfo
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotMode
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotState
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotStatus
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.TemplateFilter
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.TemplateFormat
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.TemplateInfo
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.TemplatePhase
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.TemplateStatus
 import com.alibaba.opensandbox.sandbox.domain.services.Diagnostics
 import com.alibaba.opensandbox.sandbox.domain.services.Sandboxes
 import io.mockk.Runs
@@ -36,6 +51,7 @@ import io.mockk.mockk
 import io.mockk.verify
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertSame
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.extension.ExtendWith
@@ -58,6 +74,15 @@ class SandboxManagerTest {
     @BeforeEach
     fun setUp() {
         sandboxManager = SandboxManager(sandboxService, httpClientProvider, diagnosticsService)
+    }
+
+    @Test
+    fun `diagnostic context uses diagnostics service`() {
+        val id = "sandbox-id"
+        val expected = mockk<DiagnosticContext>()
+        every { diagnosticsService.getContext(id) } returns expected
+        assertSame(expected, sandboxManager.getDiagnosticContext(id))
+        verify { diagnosticsService.getContext(id) }
     }
 
     @Test
@@ -190,4 +215,196 @@ class SandboxManagerTest {
 
         verify { httpClientProvider.close() }
     }
+
+    private fun snapshot(state: String): SnapshotInfo =
+        SnapshotInfo(
+            id = "snapshot-id",
+            sandboxId = "sandbox-id",
+            name = "snap",
+            status = SnapshotStatus(state = state, reason = null, message = null, lastTransitionAt = null),
+            createdAt = OffsetDateTime.now(),
+        )
+
+    @Test
+    fun `waitForSnapshotReady returns once the snapshot becomes ready`() {
+        val sequence = listOf(snapshot(SnapshotState.CREATING), snapshot(SnapshotState.READY))
+        var index = 0
+        every { sandboxService.getSnapshot("snapshot-id") } answers { sequence[index++] }
+
+        val result =
+            sandboxManager.waitForSnapshotReady(
+                "snapshot-id",
+                Duration.ofSeconds(5),
+                Duration.ofMillis(10),
+            )
+
+        assertEquals(SnapshotState.READY, result.status.state)
+        verify(exactly = 2) { sandboxService.getSnapshot("snapshot-id") }
+    }
+
+    @Test
+    fun `waitForSnapshotReady throws SnapshotFailedException when the snapshot fails`() {
+        every { sandboxService.getSnapshot("snapshot-id") } returns snapshot(SnapshotState.FAILED)
+
+        assertThrows(SnapshotFailedException::class.java) {
+            sandboxManager.waitForSnapshotReady("snapshot-id", Duration.ofSeconds(5), Duration.ofMillis(10))
+        }
+    }
+
+    @Test
+    fun `waitForSnapshotReady throws SandboxReadyTimeoutException when it never becomes ready`() {
+        every { sandboxService.getSnapshot("snapshot-id") } returns snapshot(SnapshotState.CREATING)
+
+        assertThrows(SandboxReadyTimeoutException::class.java) {
+            sandboxManager.waitForSnapshotReady("snapshot-id", Duration.ofMillis(30), Duration.ofMillis(10))
+        }
+    }
+
+    @Test
+    fun `waitForSnapshotReady rejects a non-positive polling interval`() {
+        assertThrows(InvalidArgumentException::class.java) {
+            sandboxManager.waitForSnapshotReady("snapshot-id", Duration.ofSeconds(5), Duration.ZERO)
+        }
+    }
+
+    @Test
+    fun `waitForSnapshotReady keeps polling within the window instead of giving up early`() {
+        // Several non-ready polls within a generous window must not trigger a premature timeout.
+        val sequence =
+            listOf(
+                snapshot(SnapshotState.CREATING),
+                snapshot(SnapshotState.CREATING),
+                snapshot(SnapshotState.READY),
+            )
+        var index = 0
+        every { sandboxService.getSnapshot("snapshot-id") } answers { sequence[index++] }
+
+        val result =
+            sandboxManager.waitForSnapshotReady(
+                "snapshot-id",
+                Duration.ofSeconds(1),
+                Duration.ofMillis(20),
+            )
+
+        assertEquals(SnapshotState.READY, result.status.state)
+        verify(exactly = 3) { sandboxService.getSnapshot("snapshot-id") }
+    }
+
+    @Test
+    fun `waitForSnapshotReady does not accept a snapshot that turns ready only after the deadline`() {
+        // The interval (100ms) outlasts the timeout (80ms): after the single sleep the deadline has
+        // passed, so the late READY must be rejected with a timeout rather than returned as success.
+        val sequence = listOf(snapshot(SnapshotState.CREATING), snapshot(SnapshotState.READY))
+        var index = 0
+        every { sandboxService.getSnapshot("snapshot-id") } answers { sequence[index++] }
+
+        assertThrows(SandboxReadyTimeoutException::class.java) {
+            sandboxManager.waitForSnapshotReady("snapshot-id", Duration.ofMillis(80), Duration.ofMillis(100))
+        }
+    }
+
+    @Test
+    fun `waitForSnapshotReady rejects a READY response that blocks past the deadline`() {
+        // Each poll blocks ~80ms; with a 100ms timeout the READY response is produced only after the
+        // deadline elapses, so it must surface as a timeout rather than a late success.
+        val sequence = listOf(snapshot(SnapshotState.CREATING), snapshot(SnapshotState.READY))
+        var index = 0
+        every { sandboxService.getSnapshot("snapshot-id") } answers {
+            Thread.sleep(80)
+            sequence[index++]
+        }
+
+        assertThrows(SandboxReadyTimeoutException::class.java) {
+            sandboxManager.waitForSnapshotReady("snapshot-id", Duration.ofMillis(100), Duration.ofMillis(10))
+        }
+    }
+
+    @Test
+    fun `createSnapshot should delegate name and mode to service`() {
+        val expected =
+            SnapshotInfo(
+                id = "snapshot-id",
+                sandboxId = "sandbox-id",
+                name = "workspace-state",
+                status =
+                    SnapshotStatus(
+                        state = SnapshotState.CREATING,
+                        reason = null,
+                        message = null,
+                        lastTransitionAt = null,
+                    ),
+                createdAt = OffsetDateTime.now(),
+                mode = SnapshotMode.ROOTFS_ONLY,
+            )
+
+        every { sandboxService.createSnapshot("sandbox-id", "workspace-state", SnapshotMode.ROOTFS_ONLY) } returns expected
+
+        val result = sandboxManager.createSnapshot("sandbox-id", "workspace-state", SnapshotMode.ROOTFS_ONLY)
+
+        assertEquals(expected, result)
+        verify { sandboxService.createSnapshot("sandbox-id", "workspace-state", SnapshotMode.ROOTFS_ONLY) }
+    }
+
+    @Test
+    fun `createTemplate should delegate to service`() {
+        val request =
+            CreateTemplateRequest
+                .builder()
+                .image("ubuntu:22.04")
+                .publish("s3://bucket/publish")
+                .build()
+        val expected = templateInfo(TemplatePhase.PENDING)
+
+        every { sandboxService.createTemplate(request) } returns expected
+
+        val result = sandboxManager.createTemplate(request)
+
+        assertEquals(expected, result)
+        verify { sandboxService.createTemplate(request) }
+    }
+
+    @Test
+    fun `getTemplate should delegate to service`() {
+        val expected = templateInfo(TemplatePhase.SUCCEEDED)
+
+        every { sandboxService.getTemplate("tpl_1") } returns expected
+
+        val result = sandboxManager.getTemplate("tpl_1")
+
+        assertEquals(expected, result)
+        verify { sandboxService.getTemplate("tpl_1") }
+    }
+
+    @Test
+    fun `listTemplates should delegate to service`() {
+        val filter = TemplateFilter.builder().metadata(mapOf("env" to "prod")).build()
+        val expected = PagedTemplateInfos(listOf(templateInfo(TemplatePhase.PENDING)), PaginationInfo(1, 20, 1, 1, false))
+
+        every { sandboxService.listTemplates(filter) } returns expected
+
+        val result = sandboxManager.listTemplates(filter)
+
+        assertEquals(expected, result)
+        verify { sandboxService.listTemplates(filter) }
+    }
+
+    @Test
+    fun `deleteTemplate should delegate to service`() {
+        every { sandboxService.deleteTemplate("tpl_1") } returns Unit
+
+        sandboxManager.deleteTemplate("tpl_1")
+
+        verify { sandboxService.deleteTemplate("tpl_1") }
+    }
+
+    private fun templateInfo(phase: String): TemplateInfo =
+        TemplateInfo(
+            templateId = "tpl_1",
+            image = "ubuntu:22.04",
+            publish = "s3://bucket/publish",
+            format = TemplateFormat.OVERLAYBD,
+            status = TemplateStatus(phase = phase),
+            createdAt = OffsetDateTime.now(),
+            updatedAt = OffsetDateTime.now(),
+        )
 }

@@ -1,3 +1,17 @@
+# Copyright 2026 The OpenSandbox Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import asyncio
@@ -9,8 +23,12 @@ from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 from test_redis_pool_store import _FakeRedis
 
-from opensandbox.exceptions import PoolStateStoreUnavailableException
+from opensandbox.exceptions import (
+    PoolDestroyedException,
+    PoolStateStoreUnavailableException,
+)
 from opensandbox.pool_redis import AsyncRedisPoolStateStore
+from opensandbox.pool_types import PoolDestroyState
 
 
 @pytest.fixture()
@@ -69,6 +87,51 @@ async def test_async_redis_store_reap_expired_idle(
 
 
 @pytest.mark.asyncio
+async def test_async_redis_store_try_take_idle_min_ttl_surfaces_alive_below_threshold(
+    async_redis_store: tuple[AsyncRedisPoolStateStore, Any, str],
+) -> None:
+    store, _, _ = async_redis_store
+    await store.set_idle_entry_ttl("pool", timedelta(seconds=5))
+    await store.put_idle("pool", "id-1")
+    await store.put_idle("pool", "id-2")
+
+    result = await store.try_take_idle_min_ttl("pool", timedelta(seconds=60))
+    assert result.sandbox_id is None
+    assert set(result.discarded_alive_sandbox_ids) == {"id-1", "id-2"}
+    assert (await store.snapshot_counters("pool")).idle_count == 0
+
+
+@pytest.mark.asyncio
+async def test_async_redis_store_try_take_idle_min_ttl_returns_above_threshold(
+    async_redis_store: tuple[AsyncRedisPoolStateStore, Any, str],
+) -> None:
+    store, _, _ = async_redis_store
+    await store.set_idle_entry_ttl("pool", timedelta(minutes=10))
+    await store.put_idle("pool", "id-1")
+
+    result = await store.try_take_idle_min_ttl("pool", timedelta(seconds=60))
+    assert result.sandbox_id == "id-1"
+    assert result.discarded_alive_sandbox_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_async_redis_store_reap_expired_idle_min_ttl_returns_alive_evicted(
+    async_redis_store: tuple[AsyncRedisPoolStateStore, Any, str],
+) -> None:
+    store, _, _ = async_redis_store
+    await store.set_idle_entry_ttl("pool", timedelta(seconds=5))
+    await store.put_idle("pool", "id-1")
+    await store.put_idle("pool", "id-2")
+
+    discarded_alive = await store.reap_expired_idle_min_ttl(
+        "pool", datetime.now(timezone.utc), timedelta(seconds=60)
+    )
+
+    assert set(discarded_alive) == {"id-1", "id-2"}
+    assert (await store.snapshot_counters("pool")).idle_count == 0
+
+
+@pytest.mark.asyncio
 async def test_async_redis_store_primary_lock_owner_semantics(
     async_redis_store: tuple[AsyncRedisPoolStateStore, Any, str],
 ) -> None:
@@ -102,6 +165,37 @@ async def test_async_redis_store_max_idle_is_shared(
     assert await store.get_max_idle("pool") == 7
     await store.set_max_idle("pool", 0)
     assert await store.get_max_idle("pool") == 0
+
+
+@pytest.mark.asyncio
+async def test_async_redis_store_destroy_fences_writes_and_preserves_tombstone(
+    async_redis_store: tuple[AsyncRedisPoolStateStore, Any, str],
+) -> None:
+    store, _, _ = async_redis_store
+    await store.put_idle("pool", "id-1")
+    assert await store.try_acquire_primary_lock("pool", "owner-1", timedelta(seconds=60))
+
+    await store.begin_destroy("pool", "destroyer")
+
+    assert await store.get_destroy_state("pool") == PoolDestroyState.DESTROYING
+    assert not await store.try_acquire_primary_lock(
+        "pool", "owner-1", timedelta(seconds=60)
+    )
+    assert not await store.renew_primary_lock("pool", "owner-1", timedelta(seconds=60))
+    with pytest.raises(PoolDestroyedException):
+        await store.put_idle("pool", "id-2")
+    with pytest.raises(PoolDestroyedException):
+        await store.set_max_idle("pool", 2)
+
+    await store.clear_pool_state("pool")
+    assert (await store.snapshot_counters("pool")).idle_count == 0
+    assert await store.get_destroy_state("pool") == PoolDestroyState.DESTROYING
+
+    await store.mark_destroyed("pool", "destroyer", timedelta(seconds=60))
+    assert await store.get_destroy_state("pool") == PoolDestroyState.DESTROYED
+    with pytest.raises(PoolDestroyedException):
+        await store.begin_destroy("pool", "destroyer-2")
+    assert await store.get_destroy_state("pool") == PoolDestroyState.DESTROYED
 
 
 @pytest.mark.asyncio
@@ -152,6 +246,9 @@ class _BrokenAsyncRedis(AsyncRedis):
     async def hgetall(self, key: str) -> dict[str, str]:
         raise RuntimeError("redis unavailable")
 
+    async def delete(self, *keys: str) -> int:
+        raise RuntimeError("redis unavailable")
+
 
 class _FakeSyncRedis(Redis):
     def __init__(self) -> None:
@@ -192,3 +289,6 @@ class _FakeAsyncRedis(AsyncRedis):
 
     async def hgetall(self, key: str) -> dict[str, str]:
         return self._sync.hgetall(key)
+
+    async def delete(self, *keys: str) -> int:
+        return self._sync.delete(*keys)

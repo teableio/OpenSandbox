@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,8 @@ import com.alibaba.opensandbox.sandbox.api.models.execd.RunCommandRequest as Api
 object ExecutionConverter {
     fun RunCommandRequest.toApiRunCommandRequest(): ApiRunCommandRequest {
         return ApiRunCommandRequest(
-            command = command,
+            command = command.takeIf { argv == null },
+            argv = argv,
             background = background,
             cwd = workingDirectory,
             timeout = timeout?.toCommandTimeoutMillis(),
@@ -51,7 +52,8 @@ object ExecutionConverter {
 internal fun Duration.toCommandTimeoutMillis(): Long {
     require(!isNegative) { "Timeout must be non-negative, got: $this" }
     return try {
-        toMillis()
+        val millis = toMillis()
+        if (minusMillis(millis).isZero) millis else Math.addExact(millis, 1L)
     } catch (e: ArithmeticException) {
         throw IllegalArgumentException("Timeout is too large to represent in milliseconds: $this", e)
     }

@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,10 +18,150 @@ Factory for creating snapshot runtime implementations.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Iterable, Optional
 
 from opensandbox_server.config import AppConfig, KubernetesRuntimeConfig, get_config
-from opensandbox_server.services.snapshot_runtime import SnapshotRuntime
+from opensandbox_server.services.snapshot_runtime import (
+    SnapshotRuntime,
+    SnapshotRuntimeStatus,
+    is_snapshot_source_state_supported,
+)
+
+_FSB_SOURCE_PREFIX = "fsb-"
+
+
+class CompositeSnapshotRuntime:
+    """Dispatch snapshot operations between coexisting backends.
+
+    Sandbox creation (and therefore snapshot preflight/create) is selected by
+    the source sandbox id prefix: ``fsb-`` sandboxes snapshot through the
+    fast-sandbox runtime, everything else through the default runtime. Status
+    and delete operations carry ``source_sandbox_id`` for the same dispatch.
+    Watch and close fan out to every backend.
+    """
+
+    def __init__(self, default: SnapshotRuntime, fsb: Optional[SnapshotRuntime] = None) -> None:
+        self._default = default
+        self._fsb = fsb
+
+    @property
+    def default(self) -> SnapshotRuntime:
+        return self._default
+
+    @property
+    def fsb(self) -> Optional[SnapshotRuntime]:
+        return self._fsb
+
+    def _for_source(self, source_sandbox_id: Optional[str]) -> SnapshotRuntime:
+        if (
+            self._fsb is not None
+            and source_sandbox_id
+            and source_sandbox_id.startswith(_FSB_SOURCE_PREFIX)
+        ):
+            return self._fsb
+        return self._default
+
+    def supports_create_snapshot(self) -> bool:
+        return self._default.supports_create_snapshot() or (
+            self._fsb is not None and self._fsb.supports_create_snapshot()
+        )
+
+    def supports_synchronous_create(self) -> bool:
+        if not self._default.supports_synchronous_create():
+            return False
+        return self._fsb is None or self._fsb.supports_synchronous_create()
+
+    def create_snapshot_unsupported_message(self) -> str:
+        return self._default.create_snapshot_unsupported_message()
+
+    def supports_snapshot_source_state(
+        self,
+        sandbox_id: str,
+        state: str,
+        *,
+        namespace: str | None = None,
+    ) -> bool:
+        return is_snapshot_source_state_supported(
+            self._for_source(sandbox_id),
+            sandbox_id,
+            state,
+            namespace=namespace,
+        )
+
+    def preflight_create_snapshot(
+        self,
+        sandbox_id: str,
+        *,
+        namespace: str | None = None,
+        mode: str | None = None,
+    ) -> None:
+        self._for_source(sandbox_id).preflight_create_snapshot(
+            sandbox_id, namespace=namespace, mode=mode
+        )
+
+    def create_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        *,
+        namespace: str | None = None,
+        mode: str | None = None,
+    ) -> Optional[SnapshotRuntimeStatus]:
+        return self._for_source(sandbox_id).create_snapshot(
+            snapshot_id,
+            sandbox_id,
+            namespace=namespace,
+            mode=mode,
+        )
+
+    def get_snapshot_status(self, snapshot_id: str) -> Optional[SnapshotRuntimeStatus]:
+        return self._default.get_snapshot_status(snapshot_id)
+
+    def delete_snapshot(
+        self,
+        snapshot_id: str,
+        image: Optional[str] = None,
+        *,
+        namespace: str | None = None,
+        source_sandbox_id: str | None = None,
+    ) -> None:
+        self._for_source(source_sandbox_id).delete_snapshot(
+            snapshot_id,
+            image,
+            namespace=namespace,
+            source_sandbox_id=source_sandbox_id,
+        )
+
+    def inspect_snapshot(
+        self,
+        snapshot_id: str,
+        image: Optional[str] = None,
+        *,
+        namespace: str | None = None,
+        source_sandbox_id: str | None = None,
+    ) -> SnapshotRuntimeStatus:
+        return self._for_source(source_sandbox_id).inspect_snapshot(
+            snapshot_id,
+            image,
+            namespace=namespace,
+            source_sandbox_id=source_sandbox_id,
+        )
+
+    def start_status_watch(
+        self,
+        on_change: Callable[[str, str], None],
+        namespaces: Iterable[str] = (),
+    ) -> None:
+        for runtime in (self._default, self._fsb):
+            start = getattr(runtime, "start_status_watch", None)
+            if start is not None:
+                start(on_change, namespaces)
+
+    def close(self) -> None:
+        for runtime in (self._default, self._fsb):
+            close = getattr(runtime, "close", None)
+            if close is not None:
+                close()
 
 
 def create_snapshot_runtime(
@@ -41,6 +181,11 @@ def create_snapshot_runtime(
         return DockerSnapshotRuntime(docker_client)
 
     if runtime_type == "kubernetes":
+
+        from opensandbox_server.services.fast_sandbox.fastpath_client import FastPathClient
+        from opensandbox_server.services.fast_sandbox.snapshot_runtime import (
+            FastSandboxSnapshotRuntime,
+        )
         from opensandbox_server.services.k8s.client import K8sClient
         from opensandbox_server.services.k8s.snapshot_runtime import KubernetesSnapshotRuntime
 
@@ -49,15 +194,44 @@ def create_snapshot_runtime(
             k8s_client = K8sClient(kubernetes_config)
 
         namespace = kubernetes_config.namespace or "default"
-        return KubernetesSnapshotRuntime(
+        kubernetes_runtime: SnapshotRuntime = KubernetesSnapshotRuntime(
             k8s_client,
             namespace=namespace,
-            wait_timeout_seconds=kubernetes_config.snapshot_create_timeout_seconds,
+            postgresql_ha_enabled=active_config.store.type == "postgresql",
+            workload_provider_type=kubernetes_config.workload_provider,
         )
+        # fsb sandboxes (fsb-*) coexist with pod sandboxes under the same
+        # Kubernetes-mode server; their snapshots go through FastPath. Both
+        # runtimes share the client (informer keys differ by API group, and
+        # stop_informers is idempotent).
+        from opensandbox_server.services.fast_sandbox.auth import TokenSource
+
+        fastpath_client = FastPathClient(
+            endpoint=kubernetes_config.fastpath_endpoint,
+            timeout_seconds=kubernetes_config.fastpath_timeout_seconds,
+            auth_enabled=kubernetes_config.fastpath_auth_enabled,
+            token_source=(
+                TokenSource(
+                    lambda: k8s_client.get_core_v1_api(),
+                    in_cluster=not bool(kubernetes_config.kubeconfig_path),
+                )
+                if kubernetes_config.fastpath_auth_enabled
+                else None
+            ),
+            tls_ca_file=kubernetes_config.fastpath_tls_ca_file,
+            tls_server_name=kubernetes_config.fastpath_tls_server_name,
+        )
+        fsb_runtime: SnapshotRuntime = FastSandboxSnapshotRuntime(
+            fastpath_client,
+            k8s_client,
+            namespace=namespace,
+        )
+        return CompositeSnapshotRuntime(kubernetes_runtime, fsb_runtime)
 
     raise ValueError(f"Unsupported snapshot runtime type: {runtime_type}")
 
 
 __all__ = [
+    "CompositeSnapshotRuntime",
     "create_snapshot_runtime",
 ]

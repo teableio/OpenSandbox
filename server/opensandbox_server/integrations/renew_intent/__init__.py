@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,11 +13,8 @@
 # limitations under the License.
 
 from opensandbox_server.integrations.renew_intent.consumer import RenewIntentConsumer, start_renew_intent_consumer
-from opensandbox_server.integrations.renew_intent.runner import RenewIntentRunner, start_renew_intent_runner
 
 __all__ = [
     "RenewIntentConsumer",
-    "RenewIntentRunner",
     "start_renew_intent_consumer",
-    "start_renew_intent_runner",
 ]

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,17 +32,52 @@ type Task struct {
 	PodStatus     *corev1.PodStatus `json:"podStatus,omitempty"`
 }
 
+// ExecMode defines where a process should be executed.
+type ExecMode string
+
+const (
+	// ExecModeLocal executes in the task-executor container.
+	ExecModeLocal ExecMode = "Local"
+	// ExecModeRemote executes in the main container via nsenter.
+	ExecModeRemote ExecMode = "Remote"
+)
+
 type Process struct {
-	// Command command
-	Command []string `json:"command"`
-	// Arguments to the entrypoint.
-	Args []string `json:"args,omitempty"`
-	// List of environment variables to set in the process.
-	Env []corev1.EnvVar `json:"env,omitempty"`
-	// WorkingDir process working directory.
-	WorkingDir string `json:"workingDir,omitempty"`
-	// TimeoutSeconds process timeout seconds.
+	Command        []string        `json:"command"`
+	Args           []string        `json:"args,omitempty"`
+	Env            []corev1.EnvVar `json:"env,omitempty"`
+	WorkingDir     string          `json:"workingDir,omitempty"`
+	TimeoutSeconds *int64          `json:"timeoutSeconds,omitempty"`
+	// ExecMode controls where the process runs. If empty, execution follows the
+	// task-executor sidecar mode configuration.
+	ExecMode ExecMode `json:"execMode,omitempty"`
+	// Lifecycle defines actions to be executed before and after the main process.
+	Lifecycle *ProcessLifecycle `json:"lifecycle,omitempty"`
+}
+
+// ProcessLifecycle defines lifecycle hooks for a process.
+type ProcessLifecycle struct {
+	PreStart *LifecycleHandler `json:"preStart,omitempty"`
+	PostStop *LifecycleHandler `json:"postStop,omitempty"`
+}
+
+// LifecycleHandler defines a lifecycle action.
+type LifecycleHandler struct {
+	Exec *ExecAction `json:"exec,omitempty"`
+	// ExecMode controls where the hook runs. If empty, the hook runs locally in
+	// the task-executor container.
+	ExecMode ExecMode `json:"execMode,omitempty"`
+	// TimeoutSeconds is the maximum number of seconds the hook may run.
+	// If the hook does not complete within this time, it is killed and the
+	// enclosing operation (Start or Stop) is treated as failed.
+	// If not set or zero, there is no timeout.
+	// +optional
 	TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
+}
+
+// ExecAction describes a "run in container" action.
+type ExecAction struct {
+	Command []string `json:"command"`
 }
 
 // ProcessStatus holds a possible state of process.

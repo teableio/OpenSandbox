@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
+import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -68,10 +70,12 @@ def test_create_snapshot_returns_202_and_location_header(
     assert calls[0][1].name == "checkpoint-before-import"
 
 
+@pytest.mark.parametrize("request_kwargs", [{}, {"json": {}}], ids=["no-body", "empty-object"])
 def test_create_snapshot_accepts_empty_body(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
+    request_kwargs: dict,
 ) -> None:
     now = datetime.now(timezone.utc)
 
@@ -84,9 +88,43 @@ def test_create_snapshot_accepts_empty_body(
 
     monkeypatch.setattr(lifecycle, "snapshot_service", StubService())
 
-    response = client.post("/v1/sandboxes/sbx-001/snapshots", headers=auth_headers)
+    response = client.post(
+        "/v1/sandboxes/sbx-001/snapshots", headers=auth_headers, **request_kwargs,
+    )
 
     assert response.status_code == 202
+
+
+@pytest.mark.parametrize(
+    ("body", "unknown_field"),
+    [
+        ({"nmae": "checkpoint-before-import"}, "nmae"),
+        ({"name": "checkpoint-before-import", "extra": 1}, "extra"),
+    ],
+)
+def test_create_snapshot_rejects_unknown_fields(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+    body: dict,
+    unknown_field: str,
+) -> None:
+    create = MagicMock(return_value=_sample_snapshot(datetime.now(timezone.utc)))
+    monkeypatch.setattr(lifecycle.snapshot_service, "create_snapshot", create)
+
+    response = client.post("/v1/sandboxes/sbx-001/snapshots", headers=auth_headers, json=body)
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "extra_forbidden",
+                "loc": ["body", unknown_field],
+                "msg": "Extra inputs are not permitted",
+            }
+        ]
+    }
+    create.assert_not_called()
 
 
 def test_list_snapshots_parses_filters_and_pagination(
@@ -116,7 +154,13 @@ def test_list_snapshots_parses_filters_and_pagination(
 
     response = client.get(
         "/v1/snapshots",
-        params={"sandboxId": "sbx-001", "state": ["Ready", "Failed"], "page": 2, "pageSize": 5},
+        params={
+            "sandboxId": "sbx-001",
+            "name": "toolchain:python@rev-1",
+            "state": ["Ready", "Failed"],
+            "page": 2,
+            "pageSize": 5,
+        },
         headers=auth_headers,
     )
 
@@ -124,6 +168,7 @@ def test_list_snapshots_parses_filters_and_pagination(
     payload = response.json()
     assert payload["items"][0]["id"] == "snap-001"
     assert captured_requests[0].filter.sandbox_id == "sbx-001"
+    assert captured_requests[0].filter.name == "toolchain:python@rev-1"
     assert captured_requests[0].filter.state == ["Ready", "Failed"]
     assert captured_requests[0].pagination.page == 2
     assert captured_requests[0].pagination.page_size == 5
@@ -215,11 +260,24 @@ def test_snapshot_routes_can_use_persisted_service(
             return True
 
         @staticmethod
+        def supports_synchronous_create() -> bool:
+            return False
+
+        @staticmethod
         def create_snapshot_unsupported_message() -> str:
             return ""
 
         @staticmethod
-        def create_snapshot(snapshot_id: str, sandbox_id: str):
+        def preflight_create_snapshot(
+            sandbox_id: str,
+            *,
+            namespace: str | None = None,
+            mode: str | None = None,
+        ) -> None:
+            return None
+
+        @staticmethod
+        def create_snapshot(snapshot_id: str, sandbox_id: str, *, mode: str | None = None):
             return None
 
         @staticmethod

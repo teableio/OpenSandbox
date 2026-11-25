@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Pytest configuration for K8s runtime tests.
-"""
-
 # Import fixtures directly to avoid using pytest_plugins
 import pytest
 from tests.k8s.fixtures.k8s_fixtures import *  # noqa: F401, F403
@@ -23,17 +19,11 @@ from tests.k8s.fixtures.k8s_fixtures import *  # noqa: F401, F403
 
 @pytest.fixture(autouse=True)
 def stub_workload_informer(monkeypatch):
-    """
-    Prevent real informer threads in unit tests.
-    
-    Stubs the WorkloadInformer used inside K8sClient so that watch threads are
-    not started during unit tests. Cache is always empty (has_synced=False),
-    so get_custom_object falls through to the mocked API call.
-    """
+    """Keep unit tests on mocked API calls instead of starting informer threads."""
 
     class _FakeInformer:
         def __init__(self, *args, **kwargs):
-            self.has_synced = False
+            pass
 
         def start(self):
             return None
@@ -41,10 +31,19 @@ def stub_workload_informer(monkeypatch):
         def stop(self):
             return None
 
-        def get(self, name):
+        def get_if_synced(self, name):
             return None
 
-        def update_cache(self, obj):
+        def list_if_synced(self):
+            return None
+
+        def invalidate(self):
+            return None
+
+        def track_write(self, response):
+            return None
+
+        def track_delete(self, name, response):
             return None
 
     monkeypatch.setattr(

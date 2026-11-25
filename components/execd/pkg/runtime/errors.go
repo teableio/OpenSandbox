@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,70 @@
 
 package runtime
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var ErrContextNotFound = errors.New("context not found")
+
+// ErrCommandNotFound indicates that no command is tracked under the given ID.
+var ErrCommandNotFound = errors.New("command not found")
+
+// ErrUidModeUnavailable indicates that the requested isolation uid mode did
+// not pass the startup capability probe in the current environment.
+var ErrUidModeUnavailable = errors.New("requested uid mode is unavailable")
+
+// ErrSessionPrivateNetUnavailable indicates that a share_net=false request
+// could not be served because the requested uid mode cannot create the
+// private network namespace (bwrap --unshare-net, whose loopback setup needs
+// CAP_NET_ADMIN in the execd container). Create rejects such requests before
+// starting bwrap so callers get a named error instead of an opaque workload
+// gate failure.
+var ErrSessionPrivateNetUnavailable = errors.New("requested private network namespace is unavailable")
+
+// ErrSessionTeardownTimeout indicates that a session workload could not be
+// reaped within the bounded teardown window. The caller must retain ownership
+// and retry cleanup rather than treating deletion as successful.
+var ErrSessionTeardownTimeout = errors.New("isolated session teardown timed out")
+
+// ErrSessionLifecycleUnavailable indicates that the selected isolator cannot
+// provide a fail-closed startup gate and verified host workload identity.
+var ErrSessionLifecycleUnavailable = errors.New("isolated session lifecycle is unavailable")
+
+// ErrSessionNamespaceUnavailable indicates that a private-network session
+// could not install stable NetNS and owning UserNS pins before its workload
+// gate was released.
+var ErrSessionNamespaceUnavailable = errors.New("isolated session namespace pinning is unavailable")
+
+// ErrSessionNamespaceCleanup indicates that namespace pins are still owned by
+// the session. The caller must retain the session and retry cleanup rather than
+// releasing its upper directory or forgetting the bind mounts.
+var ErrSessionNamespaceCleanup = errors.New("isolated session namespace cleanup is incomplete")
+
+// ErrIsolatedRunnerClosed indicates that shutdown has stopped admission of new
+// isolated sessions. Existing sessions may still be undergoing cleanup.
+var ErrIsolatedRunnerClosed = errors.New("isolated session runner is closed")
+
+// ErrSessionNotActive indicates that a terminal or stopping session no longer
+// accepts run or filesystem operations. Cleanup may still be retried through
+// Delete while the controller retains ownership of the session resources.
+var ErrSessionNotActive = errors.New("isolated session is not active")
+
+// ErrUnsupportedLanguage indicates that the language runtime is reachable but
+// offers no kernel for the requested language, so retrying cannot succeed.
+var ErrUnsupportedLanguage = errors.New("unsupported language")
+
+// ErrInvalidContextCwd indicates that a code context's working directory
+// cannot be resolved or created, so retrying the Jupyter request cannot help.
+var ErrInvalidContextCwd = errors.New("invalid code context cwd")
+
+// ExitCodeError reports that code run in an isolated session finished with a
+// non-zero exit status.
+type ExitCodeError struct {
+	Code int
+}
+
+func (e *ExitCodeError) Error() string {
+	return fmt.Sprintf("command exited with code %d", e.Code)
+}

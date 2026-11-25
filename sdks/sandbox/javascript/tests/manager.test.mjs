@@ -1,3 +1,17 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -29,6 +43,7 @@ function createSandboxesStub() {
     },
     async renewSandboxExpiration(sandboxId, body) {
       calls.push({ method: "renewSandboxExpiration", args: [sandboxId, body] });
+      return { expiresAt: new Date(body.expiresAt) };
     },
     async createSnapshot(sandboxId, body) {
       calls.push({ method: "createSnapshot", args: [sandboxId, body] });
@@ -51,15 +66,14 @@ function createSandboxesStub() {
 
 test("SandboxManager delegates lifecycle operations and closes its transport", async () => {
   const { sandboxes, calls } = createSandboxesStub();
-  const connectionConfig = new ConnectionConfig({ domain: "http://127.0.0.1:8080" });
+  const originalClose = ConnectionConfig.prototype.closeTransport;
   let closeCalls = 0;
-  connectionConfig.closeTransport = async () => {
+  // The manager owns the transport it initialized from an uninitialized config.
+  ConnectionConfig.prototype.closeTransport = async function () {
     closeCalls += 1;
   };
-  connectionConfig.withTransportIfMissing = () => connectionConfig;
 
   const manager = SandboxManager.create({
-    connectionConfig,
     adapterFactory: {
       createLifecycleStack() {
         return { sandboxes };
@@ -87,10 +101,19 @@ test("SandboxManager delegates lifecycle operations and closes its transport", a
   await manager.pauseSandbox("sbx-42");
   await manager.resumeSandbox("sbx-42");
   await manager.killSandbox("sbx-42");
-  await manager.renewSandbox("sbx-42", 30);
-  const snapshot = await manager.createSnapshot("sbx-42", { name: "before-upgrade" });
+  const renewed = await manager.renewSandbox("sbx-42", 30);
+  assert.ok(renewed.expiresAt instanceof Date);
+  const snapshot = await manager.createSnapshot("sbx-42", { name: "before-upgrade", mode: "rootfsOnly" });
   assert.equal(snapshot.id, "snap-1");
-  const snapshots = await manager.listSnapshots({ sandboxId: "sbx-42", states: ["Ready"] });
+  assert.deepEqual(
+    calls.find((entry) => entry.method === "createSnapshot").args,
+    ["sbx-42", { name: "before-upgrade", mode: "rootfsOnly" }],
+  );
+  const snapshots = await manager.listSnapshots({
+    sandboxId: "sbx-42",
+    name: "toolchain:node@rev-1",
+    states: ["Ready"],
+  });
   assert.equal(snapshots.items[0].id, "snap-1");
   const loadedSnapshot = await manager.getSnapshot("snap-1");
   assert.equal(loadedSnapshot.id, "snap-1");
@@ -123,9 +146,39 @@ test("SandboxManager delegates lifecycle operations and closes its transport", a
   assert.equal(calls[6].args[0], "sbx-42");
   assert.ok(typeof calls[6].args[1].expiresAt === "string");
   assert.ok(Number.isFinite(Date.parse(calls[6].args[1].expiresAt)));
-  assert.deepEqual(calls[7].args, ["sbx-42", { name: "before-upgrade" }]);
-  assert.deepEqual(calls[8].args[0], { sandboxId: "sbx-42", states: ["Ready"] });
+  assert.deepEqual(calls[7].args, ["sbx-42", { name: "before-upgrade", mode: "rootfsOnly" }]);
+  assert.deepEqual(calls[8].args[0], {
+    sandboxId: "sbx-42",
+    name: "toolchain:node@rev-1",
+    states: ["Ready"],
+  });
   assert.equal(calls[9].args[0], "snap-1");
   assert.equal(calls[10].args[0], "snap-1");
   assert.equal(closeCalls, 1);
+  ConnectionConfig.prototype.closeTransport = originalClose;
+});
+
+test("SandboxManager.close leaves caller-initialized transports open", async () => {
+  const { sandboxes } = createSandboxesStub();
+  // Caller-initialized configs may back other SDK resources.
+  const connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+  }).withTransportIfMissing();
+  let closeCalls = 0;
+  connectionConfig.closeTransport = async () => {
+    closeCalls += 1;
+  };
+
+  const manager = SandboxManager.create({
+    connectionConfig,
+    adapterFactory: {
+      createLifecycleStack() {
+        return { sandboxes };
+      },
+    },
+  });
+  await manager.close();
+
+  assert.equal(closeCalls, 0);
+  await connectionConfig.closeTransport();
 });

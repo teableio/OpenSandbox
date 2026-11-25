@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@ const (
 	AuthURLParamKey       = "token"
 )
 
-// NewAuth creates an empty authentication configuration.
 func NewAuth() *Auth {
 	return &Auth{}
 }
@@ -31,9 +30,4 @@ func NewAuth() *Auth {
 // IsValid reports whether token or username/password are present.
 func (a *Auth) IsValid() bool {
 	return a.Token != "" || (a.Username != "" && a.Password != "")
-}
-
-// GetAuthType returns token/basic/none.
-func (a *Auth) GetAuthType() string {
-	return a.Validate()
 }

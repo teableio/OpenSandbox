@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,13 +28,17 @@ class RenewIntent:
     observed_at: datetime
     port: Optional[int] = None
     request_uri: Optional[str] = None
+    # Namespace of the sandbox at ingress time. Ingress includes it in the
+    # payload (omitempty); older messages carry no such key and leave it None.
+    namespace: Optional[str] = None
 
 
 def _parse_rfc3339_time(value: str) -> Optional[datetime]:
     s = value.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
-    # Ingress uses Go RFC3339Nano (up to 9 fractional digits); CPython fromisoformat allows at most 6.
+    # Ingress uses Go RFC3339Nano (up to 9 fractional digits); CPython
+    # fromisoformat allows at most 6.
     dot = s.find(".")
     if dot != -1:
         end = dot + 1
@@ -58,6 +62,8 @@ def parse_renew_intent_json(raw: str) -> Optional[RenewIntent]:
         data: dict[str, Any] = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
+    if not isinstance(data, dict):
+        return None
     sid = data.get("sandbox_id")
     if not isinstance(sid, str) or not sid.strip():
         return None
@@ -78,9 +84,13 @@ def parse_renew_intent_json(raw: str) -> Optional[RenewIntent]:
     uri = data.get("request_uri")
     request_uri = uri if isinstance(uri, str) else None
 
+    ns = data.get("namespace")
+    namespace = ns.strip() or None if isinstance(ns, str) else None
+
     return RenewIntent(
         sandbox_id=sid.strip(),
         observed_at=observed_at,
         port=port,
         request_uri=request_uri,
+        namespace=namespace,
     )

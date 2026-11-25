@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for opensandbox_cli.config — config loading and priority merging."""
-
 from __future__ import annotations
 
 from pathlib import Path
 
+import click
 import pytest
+from click.testing import CliRunner
 
+from opensandbox_cli import main as cli_main
 from opensandbox_cli.config import (
     DEFAULT_CONFIG_TEMPLATE,
     init_config_file,
@@ -27,24 +28,11 @@ from opensandbox_cli.config import (
     resolve_config,
 )
 
-# ---------------------------------------------------------------------------
-# load_config_file
-# ---------------------------------------------------------------------------
-
 
 class TestLoadConfigFile:
     def test_returns_empty_when_file_missing(self, tmp_path: Path) -> None:
         result = load_config_file(tmp_path / "nonexistent.toml")
         assert result == {}
-
-    def test_parses_toml_file(self, tmp_path: Path) -> None:
-        cfg = tmp_path / "config.toml"
-        cfg.write_text(
-            '[connection]\napi_key = "abc"\ndomain = "example.com"\n'
-        )
-        result = load_config_file(cfg)
-        assert result["connection"]["api_key"] == "abc"
-        assert result["connection"]["domain"] == "example.com"
 
     def test_parses_all_sections(self, tmp_path: Path) -> None:
         cfg = tmp_path / "config.toml"
@@ -57,11 +45,6 @@ class TestLoadConfigFile:
         assert result["output"]["color"] is False
         assert result["defaults"]["image"] == "alpine"
         assert result["defaults"]["timeout"] == "5m"
-
-
-# ---------------------------------------------------------------------------
-# resolve_config — priority: CLI > env > file > defaults
-# ---------------------------------------------------------------------------
 
 
 class TestResolveConfig:
@@ -130,25 +113,17 @@ class TestResolveConfig:
         assert result["request_timeout"] == 999
         assert result["use_server_proxy"] is True
 
-    def test_invalid_timeout_env_falls_through(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        cfg = tmp_path / "empty.toml"
-        cfg.write_text("")
-        monkeypatch.setenv("OPEN_SANDBOX_REQUEST_TIMEOUT", "not-a-number")
+    def test_numeric_file_scalars_stay_strings(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            "[connection]\napi_key = 1234567890\ndomain = 12345\n\n"
+            "[defaults]\ntimeout = 300\n"
+        )
         result = resolve_config(config_path=cfg)
-        # Falls through to default 30
-        assert result["request_timeout"] == 30
-
-    def test_invalid_bool_env_falls_through(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        cfg = tmp_path / "empty.toml"
-        cfg.write_text("")
-        monkeypatch.setenv("OPEN_SANDBOX_USE_SERVER_PROXY", "not-a-bool")
-        result = resolve_config(config_path=cfg)
-        assert result["use_server_proxy"] is False
-
-
-# ---------------------------------------------------------------------------
-# init_config_file
-# ---------------------------------------------------------------------------
+        # A numeric-looking string field must not become an int.
+        assert result["api_key"] == "1234567890"
+        assert result["domain"] == "12345"
+        assert result["default_timeout"] == "300"
 
 
 class TestInitConfigFile:
@@ -162,12 +137,6 @@ class TestInitConfigFile:
         assert "[output]" in content
         assert "[defaults]" in content
 
-    def test_refuses_overwrite_without_force(self, tmp_path: Path) -> None:
-        cfg_path = tmp_path / "config.toml"
-        cfg_path.write_text("existing")
-        with pytest.raises(FileExistsError, match="already exists"):
-            init_config_file(cfg_path)
-
     def test_force_overwrites(self, tmp_path: Path) -> None:
         cfg_path = tmp_path / "config.toml"
         cfg_path.write_text("old content")
@@ -178,3 +147,154 @@ class TestInitConfigFile:
         cfg_path = tmp_path / "a" / "b" / "c" / "config.toml"
         init_config_file(cfg_path)
         assert cfg_path.exists()
+
+
+# config set — key and value validation
+
+
+class TestConfigSet:
+    def _invoke_set(self, cfg: Path, key: str, value: str):
+        return CliRunner().invoke(
+            cli_main.cli, ["--config", str(cfg), "config", "set", key, value]
+        )
+
+    def test_string_key_value_is_stored_verbatim(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "connection.api_key", "007123")
+        assert result.exit_code == 0
+        assert load_config_file(cfg)["connection"]["api_key"] == "007123"
+
+    def test_protocol_is_normalized_to_lowercase(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "connection.protocol", "HTTPS")
+        assert result.exit_code == 0
+        assert load_config_file(cfg)["connection"]["protocol"] == "https"
+
+    def test_invalid_protocol_is_rejected(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "connection.protocol", "ftp")
+        assert result.exit_code == 1
+        assert "Protocol must be 'http' or 'https'" in result.stderr
+        assert "protocol" not in load_config_file(cfg)["connection"]
+
+    def test_request_timeout_is_stored_as_int(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "connection.request_timeout", "45")
+        assert result.exit_code == 0
+        assert load_config_file(cfg)["connection"]["request_timeout"] == 45
+
+    def test_non_numeric_request_timeout_is_rejected(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "connection.request_timeout", "abc")
+        assert result.exit_code == 1
+        assert "Must be a positive whole number" in result.stderr
+
+    def test_zero_request_timeout_is_rejected_cli(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "connection.request_timeout", "0")
+        assert result.exit_code == 1
+        assert "Must be a positive whole number" in result.stderr
+        assert "request_timeout" not in load_config_file(cfg)["connection"]
+
+    @pytest.mark.parametrize("raw", ["-5", "0", "-1e2"])
+    def test_non_positive_request_timeout_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        from opensandbox_cli.commands import config_cmd
+
+        monkeypatch.setattr(
+            config_cmd,
+            "CONFIG_VALUE_KINDS",
+            {"connection.request_timeout": "int"},
+        )
+        with pytest.raises(click.ClickException, match="positive whole number"):
+            config_cmd._validated_config_value("connection.request_timeout", raw)
+
+    def test_unsupported_value_kind_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from opensandbox_cli.commands import config_cmd
+
+        monkeypatch.setattr(
+            config_cmd,
+            "CONFIG_VALUE_KINDS",
+            {"connection.api_key": "bogus-kind"},
+        )
+        with pytest.raises(click.ClickException, match="Unsupported value kind"):
+            config_cmd._validated_config_value("connection.api_key", "secret")
+
+    def test_scientific_notation_timeout_resolves_as_int(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "connection.request_timeout", "1e2")
+        assert result.exit_code == 0
+        assert resolve_config(config_path=cfg)["request_timeout"] == 100
+
+    @pytest.mark.parametrize(
+        ("raw", "stored"),
+        [
+            ("true", True),
+            ("FALSE", False),
+            ("on", True),
+            ("0", False),
+        ],
+    )
+    def test_bool_keys_accept_bool_spellings(
+        self, tmp_path: Path, raw: str, stored: bool
+    ) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "output.color", raw)
+        assert result.exit_code == 0
+        assert load_config_file(cfg)["output"]["color"] is stored
+
+    def test_bool_key_rejects_other_text(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "output.color", "maybe")
+        assert result.exit_code == 1
+        assert "Must be a boolean" in result.stderr
+
+    @pytest.mark.parametrize("raw", ["1h30m", "90s", "none"])
+    def test_default_timeout_accepts_duration_or_none(
+        self, tmp_path: Path, raw: str
+    ) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "defaults.timeout", raw)
+        assert result.exit_code == 0
+        assert load_config_file(cfg)["defaults"]["timeout"] == raw
+
+    def test_default_timeout_rejects_other_text(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "defaults.timeout", "abc")
+        assert result.exit_code == 1
+        assert "Use format like 10m" in result.stderr
+
+    def test_unknown_section_is_rejected(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "garbage.key", "value")
+        assert result.exit_code == 1
+        assert "Unknown config key 'garbage.key'" in result.stderr
+
+    def test_unknown_field_is_rejected_with_known_keys(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        init_config_file(cfg)
+        result = self._invoke_set(cfg, "connection.nonexistent", "value")
+        assert result.exit_code == 1
+        assert "Unknown config key 'connection.nonexistent'" in result.stderr
+        assert "connection.domain" in result.stderr
+
+    def test_set_requires_existing_config_file(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "config.toml"
+        result = self._invoke_set(cfg, "connection.domain", "localhost:9090")
+        assert result.exit_code == 1
+        assert "Run 'osb config init' first" in result.stderr

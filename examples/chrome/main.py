@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +31,6 @@ async def main():
             )
         )
 
-        # Got execd process endpoint
         execd = await sandbox.get_endpoint(44772)
         print(f"execd daemon running with {execd.endpoint}")
 
@@ -42,7 +41,6 @@ async def main():
         print(f"DevTools running with {devtools.endpoint}/json")
 
     except SandboxException as e:
-        # Handle Sandbox specific exceptions
         print(f"Sandbox Error: [{e.error.code}] {e.error.message}")
     except Exception as e:
         print(f"Error: {e}")

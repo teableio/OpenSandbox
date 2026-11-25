@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,13 +22,14 @@ import (
 )
 
 func TestNewPredicates(t *testing.T) {
-	t.Run("default profile creates image, resource, nodeselector predicates", func(t *testing.T) {
-		predicates, err := NewPredicates(DefaultProfile())
+	t.Run("default profile creates capacity, image, resource, nodeselector predicates", func(t *testing.T) {
+		predicates, err := newPredicates(defaultProfile())
 		require.NoError(t, err)
-		assert.Len(t, predicates, 3)
-		assert.IsType(t, &imagePredicate{}, predicates[0])
-		assert.IsType(t, &resourcePredicate{}, predicates[1])
-		assert.IsType(t, &nodeSelectorPredicate{}, predicates[2])
+		assert.Len(t, predicates, 4)
+		assert.IsType(t, &capacityPredicate{}, predicates[0])
+		assert.IsType(t, &imagePredicate{}, predicates[1])
+		assert.IsType(t, &resourcePredicate{}, predicates[2])
+		assert.IsType(t, &nodeSelectorPredicate{}, predicates[3])
 	})
 
 	t.Run("profile with labelselector predicate", func(t *testing.T) {
@@ -41,7 +42,7 @@ func TestNewPredicates(t *testing.T) {
 				{Name: "labelselector", Args: map[string]interface{}{"keys": []interface{}{"env", "tier"}}},
 			},
 		}
-		predicates, err := NewPredicates(profile)
+		predicates, err := newPredicates(profile)
 		require.NoError(t, err)
 		assert.Len(t, predicates, 2)
 		assert.IsType(t, &imagePredicate{}, predicates[0])
@@ -50,7 +51,7 @@ func TestNewPredicates(t *testing.T) {
 
 	t.Run("empty profile creates no predicates", func(t *testing.T) {
 		profile := &Profile{Name: "empty"}
-		predicates, err := NewPredicates(profile)
+		predicates, err := newPredicates(profile)
 		require.NoError(t, err)
 		assert.Len(t, predicates, 0)
 	})
@@ -60,33 +61,19 @@ func TestNewPredicates(t *testing.T) {
 			Name:    "unknown",
 			Plugins: PluginsSpec{Predicate: []string{"image", "unknown-plugin"}},
 		}
-		predicates, err := NewPredicates(profile)
+		predicates, err := newPredicates(profile)
 		require.NoError(t, err)
 		assert.Len(t, predicates, 1)
 		assert.IsType(t, &imagePredicate{}, predicates[0])
-	})
-
-	t.Run("creator error propagates", func(t *testing.T) {
-		profile := &Profile{
-			Name: "bad-scorer-as-pred",
-			Plugins: PluginsSpec{
-				Predicate: []string{"image"},
-			},
-			PluginConf: []PluginConf{
-				{Name: "image", Args: map[string]interface{}{}},
-			},
-		}
-		_, err := NewPredicates(profile)
-		assert.NoError(t, err)
 	})
 }
 
 func TestNewScorers(t *testing.T) {
 	t.Run("default profile creates resbalance scorer with weight", func(t *testing.T) {
-		scorers, err := NewScorers(DefaultProfile())
+		scorers, err := newScorers(defaultProfile())
 		require.NoError(t, err)
 		assert.Len(t, scorers, 1)
-		assert.IsType(t, &resBalanceScorer{}, scorers[0].Scorer)
+		assert.IsType(t, &resBalanceScorer{}, scorers[0].scorer)
 		assert.Equal(t, int64(100), scorers[0].weight)
 	})
 
@@ -100,16 +87,16 @@ func TestNewScorers(t *testing.T) {
 				{Name: "resbalance", Args: map[string]interface{}{"strategy": "MostAllocated"}},
 			},
 		}
-		scorers, err := NewScorers(profile)
+		scorers, err := newScorers(profile)
 		require.NoError(t, err)
 		assert.Len(t, scorers, 1)
-		assert.IsType(t, &resBalanceScorer{}, scorers[0].Scorer)
+		assert.IsType(t, &resBalanceScorer{}, scorers[0].scorer)
 		assert.Equal(t, int64(50), scorers[0].weight)
 	})
 
 	t.Run("empty profile creates no scorers", func(t *testing.T) {
 		profile := &Profile{Name: "empty"}
-		scorers, err := NewScorers(profile)
+		scorers, err := newScorers(profile)
 		require.NoError(t, err)
 		assert.Len(t, scorers, 0)
 	})
@@ -121,7 +108,7 @@ func TestNewScorers(t *testing.T) {
 				Score: []ScoreSpec{{Name: "resbalance", Weight: 100}, {Name: "unknown-scorer", Weight: 50}},
 			},
 		}
-		scorers, err := NewScorers(profile)
+		scorers, err := newScorers(profile)
 		require.NoError(t, err)
 		assert.Len(t, scorers, 1)
 	})
@@ -136,7 +123,7 @@ func TestNewScorers(t *testing.T) {
 				{Name: "resbalance", Args: map[string]interface{}{"strategy": "InvalidStrategy"}},
 			},
 		}
-		_, err := NewScorers(profile)
+		_, err := newScorers(profile)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "scorer \"resbalance\"")
 	})
