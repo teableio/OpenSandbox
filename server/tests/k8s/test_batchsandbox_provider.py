@@ -119,9 +119,7 @@ def _app_config_with_sandbox_resource_requests(resource_requests: dict[str, str]
         ),
     )
 
-def _app_config_with_execd_delivery(
-    execd_delivery: str, *, egress_disable_ipv6: bool = False
-) -> AppConfig:
+def _app_config_with_execd_delivery(execd_delivery: str) -> AppConfig:
     """Build an AppConfig with ``kubernetes.execd_delivery`` set."""
     return AppConfig(
         runtime=RuntimeConfig(type="kubernetes", execd_image="execd:test"),
@@ -129,7 +127,6 @@ def _app_config_with_execd_delivery(
             namespace="test-ns",
             execd_delivery=execd_delivery,
         ),
-        egress=EgressConfig(disable_ipv6=egress_disable_ipv6),
     )
 
 
@@ -609,13 +606,13 @@ spec:
         assert bin_volume == {"name": "opensandbox-bin", "image": {"reference": "execd:test"}}
         # The main container keeps the same mount and bootstrap wrapper.
         main = pod_spec["containers"][0]
-        assert {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox/bin"} in main["volumeMounts"]
-        assert main["command"][0] == "/opt/opensandbox/bin/bootstrap.sh"
+        assert {"name": "opensandbox-bin", "mountPath": "/opt/opensandbox"} in main["volumeMounts"]
+        assert main["command"][0] == "/opt/opensandbox/bootstrap.sh"
 
     def test_create_workload_image_volume_delivery_keeps_init_for_egress_disable_ipv6(self, mock_k8s_client):
         provider = BatchSandboxProvider(
             mock_k8s_client,
-            _app_config_with_execd_delivery("image_volume", egress_disable_ipv6=True),
+            _app_config_with_execd_delivery("image_volume"),
         )
         mock_k8s_client.create_custom_object.return_value = {
             "metadata": {"name": "test", "uid": "uid"}
@@ -631,11 +628,13 @@ spec:
             labels={},
             expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
             execd_image="execd:test",
-            network_policy=NetworkPolicy(
-                default_action="deny",
-                egress=[NetworkRule(action="allow", target="pypi.org")],
+            egress_settings=_egress_settings(
+                NetworkPolicy(
+                    default_action="deny",
+                    egress=[NetworkRule(action="allow", target="pypi.org")],
+                ),
+                disable_ipv6=True,
             ),
-            egress_image="opensandbox/egress:v1.0.12",
         )
 
         pod_spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"]["template"]["spec"]
@@ -2909,7 +2908,7 @@ spec:
         env = {item["name"]: item["value"] for item in main_container["env"]}
         assert env["FOO"] == "bar"
         assert env["NODE_EXTRA_CA_CERTS"] == "/etc/ssl/certs/pg-ingress-common.crt"
-        assert env["EXECD"] == "/opt/opensandbox/bin/execd"
+        assert env["EXECD"] == "/opt/opensandbox/execd"
 
         mount_names = [mount["name"] for mount in main_container["volumeMounts"]]
         volume_names = [volume["name"] for volume in body["spec"]["template"]["spec"]["volumes"]]
@@ -3867,11 +3866,12 @@ spec:
 
         self._create(
             provider,
-            network_policy=NetworkPolicy(
-                default_action="deny",
-                egress=[NetworkRule(action="allow", target="pypi.org")],
+            egress_settings=_egress_settings(
+                NetworkPolicy(
+                    default_action="deny",
+                    egress=[NetworkRule(action="allow", target="pypi.org")],
+                ),
             ),
-            egress_image="opensandbox/egress:test",
         )
 
         spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"][
@@ -3903,11 +3903,12 @@ spec:
 
         self._create(
             provider,
-            network_policy=NetworkPolicy(
-                default_action="deny",
-                egress=[NetworkRule(action="allow", target="pypi.org")],
+            egress_settings=_egress_settings(
+                NetworkPolicy(
+                    default_action="deny",
+                    egress=[NetworkRule(action="allow", target="pypi.org")],
+                ),
             ),
-            egress_image="opensandbox/egress:test",
         )
 
         spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"][
