@@ -27,7 +27,9 @@ jobs:
   # every supported version covered nightly.
   controller-e2e-core-matrix:
     name: Controller E2E Core Full Matrix (Kubernetes v${{ matrix.version }})
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Upstream only: a fork that does not patch kubernetes/ would re-run the
+    # same sweep on identical controller code every night.
+    if: github.repository == 'opensandbox-group/OpenSandbox' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     strategy:
       fail-fast: false
       matrix:
@@ -382,7 +384,9 @@ jobs:
   # nightly/dispatch only, KVM runner.
   fast-sandbox-full-stack:
     name: Fast Sandbox Full-Stack E2E (KVM)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Upstream's KVM runner only: a fork has no runner with this label, so
+    # the job would sit queued on every scheduled run.
+    if: github.repository == 'opensandbox-group/OpenSandbox' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: kvm
     timeout-minutes: 180
     env:
@@ -461,7 +465,9 @@ jobs:
   publish-nightly-latest:
     name: Publish latest (${{ matrix.component }} nightly)
     needs: [k8s-mini-e2e, k8s-pool-e2e, execd-init-e2e]
-    if: github.event_name != 'pull_request'
+    # Upstream only: build.sh pushes to upstream's Docker Hub and ACR
+    # namespaces, and a fork has neither the credentials nor the right to.
+    if: github.repository == 'opensandbox-group/OpenSandbox' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
