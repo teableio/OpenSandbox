@@ -16,6 +16,9 @@ concurrency:
 jobs:
   system-prune:
     name: Runner system prune
+    # Upstream's runner fleet only: forks run schedules on their default
+    # branch, and this must not prune Docker on anyone else's runners.
+    if: github.repository == 'opensandbox-group/OpenSandbox'
     runs-on: self-hosted
     strategy:
       fail-fast: false
