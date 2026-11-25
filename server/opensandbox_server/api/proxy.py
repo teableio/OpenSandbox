@@ -43,7 +43,6 @@ from websockets.typing import Origin
 from opensandbox_server.api import lifecycle
 from opensandbox_server.config import get_config
 from opensandbox_server.api.schema import Endpoint
-from opensandbox_server.config import get_config
 from opensandbox_server.middleware.auth import SANDBOX_API_KEY_HEADER
 from opensandbox_server.services.constants import (
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
