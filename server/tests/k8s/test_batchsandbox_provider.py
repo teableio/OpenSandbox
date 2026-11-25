@@ -3918,10 +3918,16 @@ spec:
         assert main_sc["capabilities"]["drop"] == ["ALL", "NET_ADMIN"]
         assert main_sc["allowPrivilegeEscalation"] is False
 
-    def test_template_add_cannot_regrant_runtime_dropped_capability(
+    def test_template_add_keeps_runtime_dropped_capability_dropped(
         self, mock_k8s_client, tmp_path
     ):
-        """A template `add` must not undo the egress NET_ADMIN drop."""
+        """A template `add` must not remove the egress NET_ADMIN drop.
+
+        The template add survives next to the runtime drop (upstream's merge);
+        the container runtime applies drops after adds, so NET_ADMIN stays
+        dropped. In egress forward mode such a template is rejected instead
+        (test_egress_forward_mode_k8s).
+        """
         provider = self._provider_with_template(
             mock_k8s_client,
             tmp_path,
@@ -3952,8 +3958,7 @@ spec:
         ]["spec"]
         caps = spec["containers"][0]["securityContext"]["capabilities"]
         assert caps["drop"] == ["NET_ADMIN"]
-        assert "NET_ADMIN" not in caps["add"]
-        assert caps["add"] == ["SYS_PTRACE"]
+        assert caps["add"] == ["NET_ADMIN", "SYS_PTRACE"]
 
     def test_windows_profile_skips_template_security_context(
         self, mock_k8s_client, tmp_path
