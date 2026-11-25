@@ -475,13 +475,17 @@ class BatchSandboxProvider(WorkloadProvider):
         )
 
         containers = [_container_to_dict(main_container)]
-        # The Windows profile installs execd via install.bat and the egress
+        # The Windows profile installs execd via install.bat, the egress
         # disable_ipv6 path needs the privileged init container for sysctl,
-        # so both keep the init container regardless of execd_delivery.
+        # and execd isolation needs bwrap and the session gate, which the init
+        # container copies into /opt/opensandbox from elsewhere in the execd
+        # image (an image volume exposes only the image root). All three keep
+        # the init container regardless of execd_delivery.
         use_image_volume = (
             self.execd_delivery == "image_volume"
             and not windows_profile
             and not disable_ipv6_for_egress
+            and not isolation_enabled
         )
         if use_image_volume:
             # execd and bootstrap.sh sit at the execd image root, so mounting

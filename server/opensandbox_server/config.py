@@ -912,8 +912,12 @@ class KubernetesRuntimeConfig(BaseModel):
             "read-only as a Kubernetes image volume (ImageVolume: beta and "
             "enabled by default in Kubernetes 1.35, GA in 1.36; off by "
             "default before 1.35), which skips the init container lifecycle. "
-            "Windows profiles and egress with disable_ipv6 always use the "
-            "init container."
+            "Windows profiles, egress with disable_ipv6 and sandboxes that "
+            "request execd isolation always use the init container. An image "
+            "volume exposes only the execd image root, so bwrap, the session "
+            "gate and the hardening launcher are not staged; keep "
+            "'init_container' when runtime.execd_isolation_config enables the "
+            "hardening floor."
         ),
     )
     volume_subpath_precreate: Optional["VolumeSubpathPrecreate"] = Field(

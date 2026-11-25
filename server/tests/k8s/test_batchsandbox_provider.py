@@ -645,6 +645,39 @@ spec:
         bin_volume = next(v for v in pod_spec["volumes"] if v["name"] == "opensandbox-bin")
         assert bin_volume == {"name": "opensandbox-bin", "emptyDir": {}}
 
+    def test_create_workload_image_volume_delivery_keeps_init_for_execd_isolation(self, mock_k8s_client):
+        provider = BatchSandboxProvider(
+            mock_k8s_client,
+            _app_config_with_execd_delivery("image_volume"),
+        )
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test", "uid": "uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:test",
+            extensions={"bootstrap.execd.isolation": "enable"},
+        )
+
+        pod_spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"]["template"]["spec"]
+
+        # bwrap and the session gate live outside the execd image root; only
+        # the init container copies them into /opt/opensandbox.
+        installer = pod_spec["initContainers"][0]
+        assert installer["name"] == "execd-installer"
+        assert "/opt/opensandbox/bwrap" in installer["args"][0]
+        bin_volume = next(v for v in pod_spec["volumes"] if v["name"] == "opensandbox-bin")
+        assert bin_volume == {"name": "opensandbox-bin", "emptyDir": {}}
+        assert any(v["name"] == "isolation-upper" for v in pod_spec["volumes"])
+
     def test_create_workload_init_container_with_configured_resources(self, mock_k8s_client):
         provider = BatchSandboxProvider(
             mock_k8s_client,
