@@ -1197,7 +1197,10 @@ spec:
         assert container["command"] == ["/opt/opensandbox/bootstrap.sh", "/bin/bash"]
         env = {entry["name"]: entry["value"] for entry in container["env"]}
         assert env["RUNTIME_ONLY"] == "retained"
-        assert "TEMPLATE_ONLY" not in env
+        # Fork: template-only env names are merged into the main container
+        # (runtime names still win; see
+        # test_create_workload_merges_template_env_into_main_container).
+        assert env["TEMPLATE_ONLY"] == "ignored"
         # Only capabilities.drop is unioned. Runtime add/profile conflicts still
         # win, even for credentials: this narrow fix is not full Pod isolation.
         assert container["securityContext"] == {
