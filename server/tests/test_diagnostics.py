@@ -369,3 +369,47 @@ def test_diagnostics_events_rejects_unsupported_scope(
 
     assert response.status_code == 400
     assert response.json()["code"] == "DIAGNOSTICS_SCOPE_UNSUPPORTED"
+
+
+# Teable fork: the deprecated inspect route upstream removed in 1.3.0-rc.1 is kept
+# for the Teable backend, which calls /v1/sandboxes/{id}/diagnostics/inspect.
+def test_diagnostics_inspect_returns_plain_text(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_sandbox_inspect(sandbox_id: str) -> str:
+            assert sandbox_id == "sbx-001"
+            return "Phase:          Running"
+
+    monkeypatch.setattr(diagnostics, "sandbox_service", StubService())
+
+    response = client.get(
+        "/v1/sandboxes/sbx-001/diagnostics/inspect",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.text == "Phase:          Running"
+
+
+def test_diagnostics_inspect_is_marked_deprecated(client: TestClient) -> None:
+    spec = client.app.openapi()
+
+    operation = spec["paths"]["/v1/sandboxes/{sandbox_id}/diagnostics/inspect"]["get"]
+    assert operation["deprecated"] is True
+
+
+def test_sandbox_service_inspect_defaults_to_not_implemented() -> None:
+    from typing import cast
+
+    import pytest
+
+    from opensandbox_server.services.sandbox_service import SandboxService
+
+    with pytest.raises(HTTPException) as exc:
+        SandboxService.get_sandbox_inspect(cast(SandboxService, object()), "sbx-001")
+    assert exc.value.status_code == 501

@@ -261,6 +261,93 @@ class K8sDiagnosticsMixin:
         # explicit instead of silently None-ing the container kwarg.
         return DEFAULT_LOG_CONTAINER
 
+    # Teable fork: upstream removed this deprecated DevOps inspect in 1.3.0-rc.1
+    # (92a6f29e1). The Teable backend still parses its plain text to detect pods
+    # that died after start-up and OOM kills, because controller v0.2.0 keeps such
+    # sandboxes Running. Restored verbatim; drop once the backend reads the
+    # sandbox status (controller >= 1.1.0 reports PodFailed / status.message).
+    def get_sandbox_inspect(self, sandbox_id: str) -> str:
+        pod = self._find_pod_for_sandbox(sandbox_id)
+        meta = pod.metadata
+        spec = pod.spec
+        pod_status = pod.status
+
+        lines: list[str] = []
+        lines.append(f"Pod Name:       {meta.name}")
+        lines.append(f"Namespace:      {meta.namespace}")
+        lines.append(f"Node:           {spec.node_name or 'N/A'}")
+        lines.append(f"Phase:          {pod_status.phase if pod_status else 'Unknown'}")
+        lines.append(f"Pod IP:         {pod_status.pod_ip if pod_status else 'N/A'}")
+        lines.append(f"Host IP:        {pod_status.host_ip if pod_status else 'N/A'}")
+        lines.append(f"Start Time:     {pod_status.start_time if pod_status else 'N/A'}")
+
+        if spec.runtime_class_name:
+            lines.append(f"Runtime Class:  {spec.runtime_class_name}")
+
+        if pod_status and pod_status.container_statuses:
+            lines.append("")
+            lines.append("Containers:")
+            for cs in pod_status.container_statuses:
+                lines.append(f"  {cs.name}:")
+                lines.append(f"    Ready:          {cs.ready}")
+                lines.append(f"    Restart Count:  {cs.restart_count}")
+                lines.append(f"    Image:          {cs.image}")
+                if cs.state:
+                    if cs.state.running:
+                        lines.append(f"    State:          Running (since {cs.state.running.started_at})")
+                    elif cs.state.waiting:
+                        lines.append(f"    State:          Waiting ({cs.state.waiting.reason})")
+                        if cs.state.waiting.message:
+                            lines.append(f"    Message:        {cs.state.waiting.message}")
+                    elif cs.state.terminated:
+                        t = cs.state.terminated
+                        lines.append(f"    State:          Terminated (exit={t.exit_code}, reason={t.reason})")
+                        if t.message:
+                            lines.append(f"    Message:        {t.message}")
+                if cs.last_state and cs.last_state.terminated:
+                    t = cs.last_state.terminated
+                    lines.append(f"    Last State:     Terminated (exit={t.exit_code}, reason={t.reason})")
+
+        if pod_status and pod_status.init_container_statuses:
+            lines.append("")
+            lines.append("Init Containers:")
+            for cs in pod_status.init_container_statuses:
+                lines.append(f"  {cs.name}:")
+                lines.append(f"    Ready:          {cs.ready}")
+                if cs.state:
+                    if cs.state.terminated:
+                        t = cs.state.terminated
+                        lines.append(f"    State:          Terminated (exit={t.exit_code}, reason={t.reason})")
+                    elif cs.state.waiting:
+                        lines.append(f"    State:          Waiting ({cs.state.waiting.reason})")
+
+        if pod_status and pod_status.conditions:
+            lines.append("")
+            lines.append("Conditions:")
+            for cond in pod_status.conditions:
+                lines.append(f"  {cond.type}: {cond.status} (reason={cond.reason or 'N/A'})")
+                if cond.message:
+                    lines.append(f"    Message: {cond.message}")
+
+        if meta.labels:
+            lines.append("")
+            lines.append("Labels:")
+            for k, v in sorted(meta.labels.items()):
+                lines.append(f"  {k}={v}")
+
+        if spec.containers:
+            lines.append("")
+            lines.append("Resources:")
+            for container in spec.containers:
+                if container.resources:
+                    lines.append(f"  {container.name}:")
+                    if container.resources.requests:
+                        lines.append(f"    Requests: {dict(container.resources.requests)}")
+                    if container.resources.limits:
+                        lines.append(f"    Limits:   {dict(container.resources.limits)}")
+
+        return "\n".join(lines)
+
     def get_sandbox_events(self, sandbox_id: str, limit: int = 50) -> str:
         pod = self._find_pod_for_sandbox(sandbox_id)
         pod_name = pod.metadata.name

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import re
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import call, MagicMock
@@ -521,3 +522,87 @@ def test_get_sandbox_events_maps_kubernetes_api_errors(
     assert typed_detail["code"] == expected_code
     assert "pod-1" in typed_detail["message"]
     assert api_exc.body in typed_detail["message"]
+
+
+def test_get_sandbox_inspect_formats_runtime_statuses_and_resources() -> None:
+    running_status = _status(running=SimpleNamespace(started_at="2026-01-01T00:00:01Z"))
+    waiting_status = _status(waiting=SimpleNamespace(reason="ImagePullBackOff", message="pull failed"))
+    terminated_status = _status(
+        terminated=SimpleNamespace(exit_code=1, reason="Error", message="boom"),
+        last_terminated=SimpleNamespace(exit_code=2, reason="PreviousError"),
+    )
+    init_status = _status(terminated=SimpleNamespace(exit_code=0, reason="Completed"))
+    waiting_init = _status(waiting=SimpleNamespace(reason="PodInitializing"))
+    condition = SimpleNamespace(type="Ready", status="False", reason="ContainersNotReady", message="not ready")
+    service = _DiagnosticsService(
+        [
+            _pod(
+                container_statuses=[running_status, waiting_status, terminated_status],
+                init_container_statuses=[init_status, waiting_init],
+                conditions=[condition],
+            )
+        ]
+    )
+
+    output = service.get_sandbox_inspect("sbx-1")
+
+    assert "Pod Name:       pod-1" in output
+    assert "Runtime Class:  gvisor" in output
+    assert "State:          Running (since 2026-01-01T00:00:01Z)" in output
+    assert "Waiting (ImagePullBackOff)" in output
+    assert "Terminated (exit=1, reason=Error)" in output
+    assert "Last State:     Terminated (exit=2, reason=PreviousError)" in output
+    assert "Init Containers:" in output
+    assert "Ready: False (reason=ContainersNotReady)" in output
+    assert f"{SANDBOX_ID_LABEL}=sbx-1" in output
+    assert "Requests: {'cpu': '500m'}" in output
+    assert "Limits:   {'memory': '512Mi'}" in output
+
+
+# Teable fork: the Teable backend parses this plain text with the regexes below
+# (opensandbox-diagnostics.ts) to detect pods that died after start-up and OOM
+# kills. Keep the shapes they match stable while the compat route exists.
+def _parse_like_teable_backend(text: str) -> dict:
+    phase = re.search(r"^Phase:\s+(\S+)", text, re.M)
+    parts = re.split(r"^Containers:\s*$", text, flags=re.M)
+    result: dict = {"phase": phase.group(1) if phase else None}
+    if len(parts) < 2:
+        return result
+    containers = re.split(
+        r"^(?:Init Containers|Conditions|Labels|Resources):\s*$", parts[1], flags=re.M
+    )[0]
+    name = re.search(r"^ {2}(\S+):\s*$", containers, re.M)
+    state = re.search(
+        r"^ {4}State:\s+(Running|Waiting|Terminated)(?:\s*\(([^)]*)\))?", containers, re.M
+    )
+    if not name or not state:
+        return result
+    detail = state.group(2) or ""
+    exit_code = re.search(r"exit=(\d+)", detail)
+    reason = re.search(r"reason=([^,)\s]+)", detail)
+    result["container"] = {
+        "name": name.group(1),
+        "state": state.group(1),
+        "exitCode": int(exit_code.group(1)) if exit_code else None,
+        "reason": reason.group(1) if reason else None,
+    }
+    return result
+
+
+def test_get_sandbox_inspect_keeps_the_format_the_teable_backend_parses() -> None:
+    pod = _pod(
+        container_statuses=[
+            _status(terminated=SimpleNamespace(exit_code=137, reason="OOMKilled", message=None))
+        ],
+        init_container_statuses=[_status(terminated=SimpleNamespace(exit_code=0, reason="Completed"))],
+        conditions=[SimpleNamespace(type="Ready", status="False", reason="PodFailed", message=None)],
+    )
+    pod.status.phase = "Failed"
+    service = _DiagnosticsService([pod])
+
+    parsed = _parse_like_teable_backend(service.get_sandbox_inspect("sbx-1"))
+
+    assert parsed == {
+        "phase": "Failed",
+        "container": {"name": "main", "state": "Terminated", "exitCode": 137, "reason": "OOMKilled"},
+    }

@@ -170,3 +170,51 @@ def test_get_sandbox_events_reports_state_health_and_fallback() -> None:
 
     quiet = _DiagnosticsService(_container({"State": {"Status": "running"}}))
     assert "(no notable events)" in quiet.get_sandbox_events("sbx-1")
+
+
+def test_get_sandbox_inspect_formats_state_resources_ports_and_safe_env() -> None:
+    container = _container(
+        {
+            "Created": "2026-01-01T00:00:00Z",
+            "State": {
+                "Status": "running",
+                "Running": True,
+                "Paused": False,
+                "OOMKilled": False,
+                "ExitCode": 0,
+                "StartedAt": "2026-01-01T00:00:01Z",
+                "FinishedAt": "0001-01-01T00:00:00Z",
+                "Error": "minor warning",
+            },
+            "Config": {
+                "Image": "python:3.12",
+                "Labels": {"b": "2", "a": "1"},
+                "Env": ["PLAIN=value", "API_TOKEN=secret"],
+            },
+            "NetworkSettings": {
+                "Networks": {"bridge": {"IPAddress": "172.17.0.2"}},
+                "Ports": {
+                    "80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}],
+                    "81/tcp": None,
+                },
+            },
+            "HostConfig": {
+                "NanoCpus": 2_000_000_000,
+                "Memory": 512 * 1024 * 1024,
+                "PidsLimit": 256,
+            },
+        }
+    )
+    service = _DiagnosticsService(container)
+
+    output = service.get_sandbox_inspect("sbx-1")
+
+    assert "Container ID:   abcdef123456" in output
+    assert "CPU:          2.00 cores" in output
+    assert "Memory:       512 MiB" in output
+    assert "bridge: 172.17.0.2" in output
+    assert "80/tcp -> 127.0.0.1:8080" in output
+    assert "81/tcp (not bound)" in output
+    assert "a=1" in output
+    assert "PLAIN=value" in output
+    assert "API_TOKEN=***" in output

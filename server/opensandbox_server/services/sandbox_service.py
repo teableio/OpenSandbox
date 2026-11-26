@@ -211,6 +211,20 @@ class SandboxService(ABC):
         """Return the trailing tail log lines as plain text."""
         pass
 
+    def get_sandbox_inspect(self, sandbox_id: str) -> str:
+        """Return the deprecated plain-text inspect output (Teable fork compat).
+
+        Kept for the Teable backend; see K8sDiagnosticsMixin.get_sandbox_inspect.
+        Backends without an implementation answer 501.
+        """
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "code": "DIAGNOSTICS_NOT_IMPLEMENTED",
+                "message": "diagnostics/inspect is not implemented by this backend.",
+            },
+        )
+
     @abstractmethod
     def get_sandbox_events(self, sandbox_id: str, limit: int = 50) -> str:
         """Return at most limit events as plain text."""

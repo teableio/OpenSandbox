@@ -20,7 +20,7 @@ sandbox logs and events, selected by a required ``scope`` query parameter.
 """
 
 from fastapi import APIRouter, Query, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from opensandbox_server.api.lifecycle import sandbox_service
 from opensandbox_server.services.diagnostics import DiagnosticContext, DiagnosticResult
@@ -83,6 +83,25 @@ def get_sandbox_logs(
     """Retrieve a diagnostic descriptor for sandbox log text."""
     result = sandbox_service.get_sandbox_log_diagnostics(sandbox_id, scope)
     return _diagnostic_inline_response(result)
+
+
+# Teable fork: upstream removed this deprecated route in 1.3.0-rc.1 (92a6f29e1).
+# The Teable backend still calls it; see K8sDiagnosticsMixin.get_sandbox_inspect.
+@router.get(
+    "/sandboxes/{sandbox_id}/diagnostics/inspect",
+    response_class=PlainTextResponse,
+    status_code=status.HTTP_200_OK,
+    deprecated=True,
+    responses={
+        200: {"description": "Container inspection as plain text", "content": {"text/plain": {}}},
+        404: {"description": "Sandbox not found"},
+        501: {"description": "Not implemented by this backend"},
+    },
+)
+def get_sandbox_inspect(sandbox_id: str) -> PlainTextResponse:
+    """Retrieve detailed inspection info for a sandbox container."""
+    text = sandbox_service.get_sandbox_inspect(sandbox_id)
+    return PlainTextResponse(content=text)
 
 
 @router.get(
