@@ -489,7 +489,7 @@ class BatchSandboxProvider(WorkloadProvider):
         )
         if use_image_volume:
             # execd and bootstrap.sh sit at the execd image root, so mounting
-            # the image rootfs at /opt/opensandbox/bin yields the same layout
+            # the image rootfs at /opt/opensandbox yields the same layout
             # the init container produces, minus one container lifecycle.
             # pullPolicy is left unset so Kubernetes applies the same default
             # the init container had (Always for :latest, else IfNotPresent).
