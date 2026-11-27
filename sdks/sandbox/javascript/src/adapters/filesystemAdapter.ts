@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import type { ExecdClient } from "../openapi/execdClient.js";
-import { throwOnOpenApiFetchError } from "./openapiError.js";
+import { createExecdClient, type ExecdClient } from "../openapi/execdClient.js";
+import { throwOnFailedResponse, throwOnOpenApiFetchError } from "./openapiError.js";
 import type { SandboxFiles } from "../services/filesystem.js";
 import type { paths as ExecdPaths } from "../api/execd.js";
 import type {
   ContentReplaceEntry,
+  ContentReplaceResult,
+  DirectoryListEntry,
   FileInfo,
   FileMetadata,
   FilesInfoResponse,
@@ -25,12 +27,15 @@ import type {
   Permission,
   RenameFileItem,
   ReplaceFileContentItem,
+  ReadBytesResponse,
+  ReadBytesStream,
   SearchEntry,
   SearchFilesResponse,
   SetPermissionEntry,
   WriteEntry,
 } from "../models/filesystem.js";
-import { SandboxApiException, SandboxError } from "../core/exceptions.js";
+import { throwOnUploadFailure } from "./uploadFailure.js";
+import { createReadBytesResponse, readResponseBody } from "./downloadResponse.js";
 
 function joinUrl(baseUrl: string, pathname: string): string {
   const base = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
@@ -73,7 +78,7 @@ async function collectBytes(
         const { done, value } = await reader.read();
         if (done) break;
         if (value) {
-          chunks.push(value);
+          chunks.push(Uint8Array.from(value));
           total += value.length;
         }
       }
@@ -82,7 +87,7 @@ async function collectBytes(
     }
   } else {
     for await (const chunk of source) {
-      chunks.push(chunk);
+      chunks.push(Uint8Array.from(chunk));
       total += chunk.length;
     }
   }
@@ -126,6 +131,24 @@ function encodeUtf8(s: string): Uint8Array {
   return new TextEncoder().encode(s);
 }
 
+// `filename` is a quoted-string header parameter, so a backslash, a quote or a
+// line break in the basename would truncate the part header and make the whole
+// body unparseable.
+//
+// The backslash opens a quoted-pair, so it has to be doubled the way
+// `multipart.CreateFormFile` does on the Go side and `_multipart_header_filename`
+// does on the Python side; it is escaped first so it does not double the
+// backslashes we introduce. The remaining three are escaped the way the platform
+// `FormData` used on the in-memory path below does, so the two upload paths emit
+// the same header for the characters `FormData` handles.
+function multipartHeaderFilename(filename: string): string {
+  return filename
+    .replace(/\\/g, "\\\\")
+    .replace(/\r/g, "%0D")
+    .replace(/\n/g, "%0A")
+    .replace(/"/g, "%22");
+}
+
 async function* multipartUploadBody(opts: {
   boundary: string;
   metadataJson: string;
@@ -147,7 +170,7 @@ async function* multipartUploadBody(opts: {
   // Part 2: file
   yield encodeUtf8(`--${b}\r\n`);
   yield encodeUtf8(
-    `Content-Disposition: form-data; name="file"; filename="${opts.fileName}"\r\n`
+    `Content-Disposition: form-data; name="file"; filename="${multipartHeaderFilename(opts.fileName)}"\r\n`
   );
   yield encodeUtf8(`Content-Type: ${opts.fileContentType}\r\n\r\n`);
 
@@ -157,14 +180,14 @@ async function* multipartUploadBody(opts: {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (value) yield value;
+        if (value) yield Uint8Array.from(value);
       }
     } finally {
       reader.releaseLock();
     }
   } else {
     for await (const chunk of opts.file) {
-      yield chunk;
+      yield Uint8Array.from(chunk);
     }
   }
 
@@ -178,6 +201,12 @@ export interface FilesystemAdapterOptions {
    */
   baseUrl: string;
   fetch?: typeof fetch;
+  /**
+   * No-overall-timeout fetch used for uploads, whose request body is produced
+   * by the caller and may take longer than the connection's request timeout.
+   * See `ConnectionConfig.uploadFetch`. Falls back to `fetch`.
+   */
+  uploadFetch?: typeof fetch;
   headers?: Record<string, string>;
 }
 
@@ -202,7 +231,23 @@ function toPermission(e: {
  * - Implements streaming upload/download helpers
  */
 export class FilesystemAdapter implements SandboxFiles {
+  private static readonly MAX_IDENTITY_ID = 4294967294;
+  // Assert that every generated identity route starts with this prefix.
+  private static readonly identityBasePath:
+    Extract<keyof ExecdPaths, `/v1/filesystem/${string}`> extends never
+      ? never
+      : Exclude<
+          Extract<keyof ExecdPaths, `/v1/filesystem/${string}`>,
+          `/v1/filesystem/{uid}/{gid}/${string}`
+        > extends never ? "/v1/filesystem/{uid}/{gid}" : never =
+    "/v1/filesystem/{uid}/{gid}";
+  private static identityPath(uid: number, gid: number): string {
+    return FilesystemAdapter.identityBasePath
+      .replace("{uid}", String(uid))
+      .replace("{gid}", String(gid));
+  }
   private readonly fetch: typeof fetch;
+  private readonly uploadFetch: typeof fetch;
 
   private static readonly Api = {
     // This is intentionally derived from OpenAPI schema types so API changes surface quickly.
@@ -210,6 +255,8 @@ export class FilesystemAdapter implements SandboxFiles {
       null as unknown as ExecdPaths["/files/search"]["get"]["responses"][200]["content"]["application/json"],
     FilesInfoOk:
       null as unknown as ExecdPaths["/files/info"]["get"]["responses"][200]["content"]["application/json"],
+    ListDirectoryOk:
+      null as unknown as ExecdPaths["/directories/list"]["get"]["responses"][200]["content"]["application/json"],
     MakeDirsRequest:
       null as unknown as ExecdPaths["/directories"]["post"]["requestBody"]["content"]["application/json"],
     SetPermissionsRequest:
@@ -218,13 +265,31 @@ export class FilesystemAdapter implements SandboxFiles {
       null as unknown as ExecdPaths["/files/mv"]["post"]["requestBody"]["content"]["application/json"],
     ReplaceContentsRequest:
       null as unknown as ExecdPaths["/files/replace"]["post"]["requestBody"]["content"]["application/json"],
+    ReplaceContentsOk:
+      null as unknown as ExecdPaths["/files/replace"]["post"]["responses"][200]["content"]["application/json"],
   };
 
   constructor(
     private readonly client: ExecdClient,
-    private readonly opts: FilesystemAdapterOptions
+    private readonly opts: FilesystemAdapterOptions,
+    private readonly identityBaseUrl: string = opts.baseUrl
   ) {
     this.fetch = opts.fetch ?? fetch;
+    this.uploadFetch = opts.uploadFetch ?? this.fetch;
+  }
+
+  withIdentity(uid: number, gid: number): SandboxFiles {
+    for (const [name, value] of [["uid", uid], ["gid", gid]] as const) {
+      if (!Number.isInteger(value) || value < 0 || value > FilesystemAdapter.MAX_IDENTITY_ID) {
+        throw new RangeError(name + " must be an integer between 0 and " + FilesystemAdapter.MAX_IDENTITY_ID);
+      }
+    }
+    const opts = {
+      ...this.opts,
+      baseUrl: this.identityBaseUrl.replace(/\/+$/, "") +
+        FilesystemAdapter.identityPath(uid, gid),
+    };
+    return new FilesystemAdapter(createExecdClient(opts), opts, this.identityBaseUrl);
   }
 
   private parseIsoDate(field: string, v: unknown): Date {
@@ -242,12 +307,13 @@ export class FilesystemAdapter implements SandboxFiles {
     null as unknown as (typeof FilesystemAdapter.Api.SearchFilesOk)[number];
 
   private mapApiFileInfo(raw: typeof FilesystemAdapter._ApiFileInfo): FileInfo {
-    const { path, size, created_at, modified_at, mode, owner, group, ...rest } =
+    const { path, type, size, created_at, modified_at, mode, owner, group, ...rest } =
       raw;
 
     return {
       ...rest,
       path,
+      type,
       size,
       mode,
       owner,
@@ -313,6 +379,22 @@ export class FilesystemAdapter implements SandboxFiles {
     throwOnOpenApiFetchError({ error, response }, "Delete directories failed");
   }
 
+  async listDirectory(entry: DirectoryListEntry): Promise<FileInfo[]> {
+    const { data, error, response } = await this.client.GET("/directories/list", {
+      params: { query: { path: entry.path, depth: entry.depth } },
+    });
+    throwOnOpenApiFetchError({ error, response }, "List directory failed");
+
+    const ok = data as typeof FilesystemAdapter.Api.ListDirectoryOk | undefined;
+    if (!ok) return [];
+    if (!Array.isArray(ok)) {
+      throw new Error(
+        `List directory failed: unexpected response shape (expected array, got ${typeof ok})`
+      );
+    }
+    return ok.map((x) => this.mapApiFileInfo(x));
+  }
+
   async setPermissions(entries: SetPermissionEntry[]): Promise<void> {
     const req: Record<string, Permission> = {};
     for (const e of entries) {
@@ -348,8 +430,48 @@ export class FilesystemAdapter implements SandboxFiles {
       req as unknown as typeof FilesystemAdapter.Api.ReplaceContentsRequest;
     const { error, response } = await this.client.POST("/files/replace", {
       body,
+      parseAs: "text",
     });
     throwOnOpenApiFetchError({ error, response }, "Replace contents failed");
+  }
+
+  async replaceContentsDetailed(entries: ContentReplaceEntry[]): Promise<ContentReplaceResult[]> {
+    const req: Record<string, ReplaceFileContentItem> = {};
+    for (const e of entries) {
+      req[e.path] = { old: e.oldContent, new: e.newContent };
+    }
+    const body =
+      req as unknown as typeof FilesystemAdapter.Api.ReplaceContentsRequest;
+    const { data, error, response } = await this.client.POST("/files/replace", {
+      params: { query: { verbose: true } },
+      body,
+      parseAs: "text",
+    });
+    throwOnOpenApiFetchError({ error, response }, "Replace contents failed");
+
+    const text = data?.trim() ?? "";
+    if (!text) return [];
+
+    let ok: typeof FilesystemAdapter.Api.ReplaceContentsOk | undefined;
+    try {
+      ok = JSON.parse(text) as typeof FilesystemAdapter.Api.ReplaceContentsOk;
+    } catch (e) {
+      throw new Error(
+        `Replace contents failed: unexpected response shape (${e instanceof Error ? e.message : String(e)})`
+      );
+    }
+    if (typeof ok !== "object" || ok === null || Array.isArray(ok)) {
+      throw new Error("Replace contents failed: unexpected response shape (expected object)");
+    }
+    return Object.entries(ok).map(([path, result]) => {
+      const replacedCount = (result as { replacedCount?: unknown } | null)?.replacedCount;
+      if (typeof replacedCount !== "number") {
+        throw new Error(
+          `Replace contents failed: unexpected response shape (invalid entry for ${path})`
+        );
+      }
+      return { path, replacedCount };
+    });
   }
 
   async search(entry: SearchEntry): Promise<SearchFilesResponse> {
@@ -403,7 +525,7 @@ export class FilesystemAdapter implements SandboxFiles {
       });
       const stream = toReadableStream(bodyIt);
 
-      const res = await this.fetch(url, {
+      const res = await this.uploadFetch(url, {
         method: "POST",
         headers: {
           "content-type": `multipart/form-data; boundary=${boundary}`,
@@ -412,22 +534,13 @@ export class FilesystemAdapter implements SandboxFiles {
         body: stream as any,
         // Node fetch (undici) requires duplex for streaming request bodies.
         duplex: "half" as any,
+        // Uploads never follow redirects: the multipart body cannot always be
+        // replayed, and a redirect could otherwise replay credentials. A 3xx is
+        // surfaced below as a SandboxApiException with the original status.
+        redirect: "manual" as RequestRedirect,
       } as any);
 
-      if (!res.ok) {
-        const requestId = res.headers.get("x-request-id") ?? undefined;
-        const rawBody = await res.text().catch(() => undefined);
-        throw new SandboxApiException({
-          message: `Upload failed (status=${res.status})`,
-          statusCode: res.status,
-          requestId,
-          error: new SandboxError(
-            SandboxError.UNEXPECTED_RESPONSE,
-            "Upload failed"
-          ),
-          rawBody,
-        });
-      }
+      await throwOnUploadFailure(res);
       return;
     }
 
@@ -450,76 +563,68 @@ export class FilesystemAdapter implements SandboxFiles {
       form.append("file", fileBlob, fileName);
     }
 
-    const res = await this.fetch(url, {
+    const res = await this.uploadFetch(url, {
       method: "POST",
       headers: {
         ...(this.opts.headers ?? {}),
       },
       body: form,
+      // Uploads never follow redirects (see the streaming path above).
+      redirect: "manual",
     });
 
-    if (!res.ok) {
-      const requestId = res.headers.get("x-request-id") ?? undefined;
-      const rawBody = await res.text().catch(() => undefined);
-      throw new SandboxApiException({
-        message: `Upload failed (status=${res.status})`,
-        statusCode: res.status,
-        requestId,
-        error: new SandboxError(
-          SandboxError.UNEXPECTED_RESPONSE,
-          "Upload failed"
-        ),
-        rawBody,
-      });
-    }
+    await throwOnUploadFailure(res);
   }
 
   async readBytes(
     path: string,
-    opts?: { range?: string }
+    opts?: { range?: string; offset?: number; limit?: number }
   ): Promise<Uint8Array> {
-    const url =
-      joinUrl(this.opts.baseUrl, "/files/download") +
-      `?path=${encodeURIComponent(path)}`;
-    const res = await this.fetch(url, {
-      method: "GET",
-      headers: {
-        ...(this.opts.headers ?? {}),
-        ...(opts?.range ? { Range: opts.range } : {}),
-      },
-    });
-    if (!res.ok) {
-      const requestId = res.headers.get("x-request-id") ?? undefined;
-      const rawBody = await res.text().catch(() => undefined);
-      throw new SandboxApiException({
-        message: "Download failed",
-        statusCode: res.status,
-        requestId,
-        error: new SandboxError(
-          SandboxError.UNEXPECTED_RESPONSE,
-          "Download failed"
-        ),
-        rawBody,
-      });
-    }
+    return (await this.readBytesDetailed(path, opts)).body;
+  }
+
+  async readBytesDetailed(
+    path: string,
+    opts?: { range?: string; offset?: number; limit?: number }
+  ): Promise<ReadBytesResponse<Uint8Array>> {
+    const res = await this.fetchDownload(path, opts, "Download failed");
     const ab = await res.arrayBuffer();
-    return new Uint8Array(ab);
+    return createReadBytesResponse(
+      res,
+      new Uint8Array(ab),
+      opts?.offset != null || opts?.limit != null,
+    );
   }
 
   readBytesStream(
     path: string,
-    opts?: { range?: string }
+    opts?: { range?: string; offset?: number; limit?: number }
   ): AsyncIterable<Uint8Array> {
     return this.downloadStream(path, opts);
   }
 
-  private async *downloadStream(
+  async readBytesStreamDetailed(
     path: string,
-    opts?: { range?: string }
-  ): AsyncIterable<Uint8Array> {
-    const url =
+    opts?: { range?: string; offset?: number; limit?: number }
+  ): Promise<ReadBytesResponse<ReadBytesStream>> {
+    const res = await this.fetchDownload(path, opts, "Download stream failed");
+    return createReadBytesResponse(
+      res,
+      readResponseBody(res),
+      opts?.offset != null || opts?.limit != null,
+    );
+  }
+
+  private async fetchDownload(
+    path: string,
+    opts: { range?: string; offset?: number; limit?: number } | undefined,
+    errorMessage: string,
+  ): Promise<Response> {
+    let url =
       joinUrl(this.opts.baseUrl, "/files/download") +
       `?path=${encodeURIComponent(path)}`;
+    if (opts?.offset != null) url += `&offset=${opts.offset}`;
+    if (opts?.limit != null) url += `&limit=${opts.limit}`;
     const res = await this.fetch(url, {
       method: "GET",
       headers: {
@@ -528,35 +633,24 @@ export class FilesystemAdapter implements SandboxFiles {
       },
     });
     if (!res.ok) {
-      const requestId = res.headers.get("x-request-id") ?? undefined;
-      const rawBody = await res.text().catch(() => undefined);
-      throw new SandboxApiException({
-        message: "Download stream failed",
-        statusCode: res.status,
-        requestId,
-        error: new SandboxError(
-          SandboxError.UNEXPECTED_RESPONSE,
-          "Download stream failed"
-        ),
-        rawBody,
-      });
+      await throwOnFailedResponse(res, errorMessage);
     }
+    return res;
+  }
 
-    const body = res.body as ReadableStream<Uint8Array> | null;
-    if (!body) return;
-    const reader = body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      if (value) yield value;
-    }
+  private async *downloadStream(
+    path: string,
+    opts?: { range?: string; offset?: number; limit?: number }
+  ): AsyncIterable<Uint8Array> {
+    const response = await this.readBytesStreamDetailed(path, opts);
+    yield* response.body;
   }
 
   async readFile(
     path: string,
-    opts?: { encoding?: string; range?: string }
+    opts?: { encoding?: string; range?: string; offset?: number; limit?: number }
   ): Promise<string> {
-    const bytes = await this.readBytes(path, { range: opts?.range });
+    const bytes = await this.readBytes(path, { range: opts?.range, offset: opts?.offset, limit: opts?.limit });
     const encoding = opts?.encoding ?? "utf-8";
     return new TextDecoder(encoding).decode(bytes);
   }

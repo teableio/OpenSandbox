@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,12 @@ package com.alibaba.opensandbox.sandbox.domain.models.execd.executions
  * @property result List of structured results produced by the code execution
  * @property error Error information if the execution failed
  * @property complete Completion metadata for the streamed execution
- * @property exitCode Command exit code when available; null for code execution or unfinished/background commands
+ * @property exitCode Foreground command exit code: `0` for completed
+ *   foreground commands, the numeric `error.value` when the command failed
+ *   with one, `null` for unfinished/background commands. For streamed code
+ *   runs (the code-interpreter SDKs) it is inferred best-effort the same
+ *   way: `0` on completion, or the numeric kernel `error.value` (e.g. a
+ *   `SystemExit` code).
  * @property logs Container for stdout and stderr output messages
  */
 class Execution(
@@ -137,12 +142,21 @@ class ExecutionResult(
  * @property timestamp Unix timestamp in milliseconds when the error occurred
  * @property traceback List of traceback lines showing the complete error stack trace
  */
-class ExecutionError(
-    val name: String,
-    val value: String,
-    val timestamp: Long,
-    val traceback: List<String> = emptyList(),
-)
+class ExecutionError
+    @JvmOverloads
+    constructor(
+        val name: String,
+        val value: String,
+        val timestamp: Long,
+        val traceback: List<String> = emptyList(),
+        /**
+         * Exit status for CommandExecError or CommandTimeout after a command exits
+         * non-zero (-1 when terminated by a signal). Null when the process failed to
+         * start, no exit status was observed, or the error is not from a command.
+         * Also null on servers that predate error.exit_code.
+         */
+        val exitCode: Int? = null,
+    )
 
 /**
  * Execution complete event.
@@ -150,17 +164,25 @@ class ExecutionError(
  * Represents the completion of a code execution,
  * including timing information about when the execution finished.
  */
-class ExecutionComplete(
-    /**
-     * Timestamp when the execution completed.
-     * Unix timestamp in milliseconds indicating when the execution finished.
-     */
-    val timestamp: Long,
-    /**
-     * Execution time in mills
-     */
-    val executionTimeInMillis: Long,
-)
+class ExecutionComplete
+    @JvmOverloads
+    constructor(
+        /**
+         * Timestamp when the execution completed.
+         * Unix timestamp in milliseconds indicating when the execution finished.
+         */
+        val timestamp: Long,
+        /**
+         * Execution time in mills
+         */
+        val executionTimeInMillis: Long,
+        /**
+         * Successful foreground POST /command exit status (0), when present on the
+         * wire execution_complete event. Null for background startup, code
+         * execution, and servers that omit execution_complete.exit_code.
+         */
+        val exitCode: Int? = null,
+    )
 
 /**
  * Execution init event.
@@ -216,6 +238,12 @@ class ExecutionHandlers private constructor(
      * Called when code execution starts.
      */
     val onInit: OutputHandler<ExecutionInit>? = null,
+    /**
+     * When true, stdout/stderr messages are only delivered to handlers without
+     * being accumulated in [ExecutionLogs]. Use this for long-running executions
+     * to prevent unbounded memory growth.
+     */
+    val skipAccumulation: Boolean = false,
 ) {
     companion object {
         @JvmStatic
@@ -229,6 +257,7 @@ class ExecutionHandlers private constructor(
         private var onExecutionComplete: OutputHandler<ExecutionComplete>? = null
         private var onError: OutputHandler<ExecutionError>? = null
         private var onInit: OutputHandler<ExecutionInit>? = null
+        private var skipAccumulation: Boolean = false
 
         fun onStdout(handler: OutputHandler<OutputMessage>): Builder {
             this.onStdout = handler
@@ -260,6 +289,11 @@ class ExecutionHandlers private constructor(
             return this
         }
 
+        fun skipAccumulation(skip: Boolean): Builder {
+            this.skipAccumulation = skip
+            return this
+        }
+
         fun build(): ExecutionHandlers {
             return ExecutionHandlers(
                 onStdout = onStdout,
@@ -268,6 +302,7 @@ class ExecutionHandlers private constructor(
                 onExecutionComplete = onExecutionComplete,
                 onError = onError,
                 onInit = onInit,
+                skipAccumulation = skipAccumulation,
             )
         }
     }

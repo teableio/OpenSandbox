@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -67,13 +67,15 @@ class ExecutionEventDispatcherSync:
 
     def _handle_stdout(self, event_node: EventNode, timestamp: int) -> None:
         message = OutputMessage(text=event_node.text or "", timestamp=timestamp, is_error=False)
-        self.execution.logs.add_stdout(message)
+        if not (self.handlers and self.handlers.skip_accumulation):
+            self.execution.logs.add_stdout(message)
         if self.handlers and self.handlers.on_stdout:
             self.handlers.on_stdout(message)
 
     def _handle_stderr(self, event_node: EventNode, timestamp: int) -> None:
         message = OutputMessage(text=event_node.text or "", timestamp=timestamp, is_error=True)
-        self.execution.logs.add_stderr(message)
+        if not (self.handlers and self.handlers.skip_accumulation):
+            self.execution.logs.add_stderr(message)
         if self.handlers and self.handlers.on_stderr:
             self.handlers.on_stderr(message)
 
@@ -93,6 +95,7 @@ class ExecutionEventDispatcherSync:
             value=error_data.value or "",
             timestamp=timestamp,
             traceback=error_data.traceback,
+            exit_code=error_data.exit_code,
         )
         self.execution.error = error
         if self.handlers and self.handlers.on_error:

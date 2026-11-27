@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ from ...types import Response
 def _get_kwargs(
     sandbox_id: str,
 ) -> dict[str, Any]:
+
     _kwargs: dict[str, Any] = {
         "method": "delete",
         "url": "/sandboxes/{sandbox_id}".format(
@@ -45,27 +46,42 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return response_204
 
     if response.status_code == 401:
-        response_401 = ErrorResponse.from_dict(response.json())
+        try:
+            response_401 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_401
 
     if response.status_code == 403:
-        response_403 = ErrorResponse.from_dict(response.json())
+        try:
+            response_403 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_403
 
     if response.status_code == 404:
-        response_404 = ErrorResponse.from_dict(response.json())
+        try:
+            response_404 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_404
 
     if response.status_code == 409:
-        response_409 = ErrorResponse.from_dict(response.json())
+        try:
+            response_409 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_409
 
     if response.status_code == 500:
-        response_500 = ErrorResponse.from_dict(response.json())
+        try:
+            response_500 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_500
 
@@ -91,8 +107,13 @@ def sync_detailed(
 ) -> Response[Any | ErrorResponse]:
     """Delete a sandbox
 
-     Delete a sandbox, terminating its execution. The sandbox will transition through Stopping state to
-    Terminated.
+     Request sandbox deletion. Runtime cleanup may continue after the response.
+    For Kubernetes BatchSandbox workloads, queries report Stopping during cleanup
+    and return 404 once the resource is removed.
+    A 204 response means deletion was accepted, not that the sandbox's runtime
+    execution has terminated: the control object can disappear (and queries
+    can start returning 404) while runtime cleanup is still in progress, so a
+    404 after deletion must not be read as confirmed termination.
 
     Args:
         sandbox_id (str):
@@ -123,8 +144,13 @@ def sync(
 ) -> Any | ErrorResponse | None:
     """Delete a sandbox
 
-     Delete a sandbox, terminating its execution. The sandbox will transition through Stopping state to
-    Terminated.
+     Request sandbox deletion. Runtime cleanup may continue after the response.
+    For Kubernetes BatchSandbox workloads, queries report Stopping during cleanup
+    and return 404 once the resource is removed.
+    A 204 response means deletion was accepted, not that the sandbox's runtime
+    execution has terminated: the control object can disappear (and queries
+    can start returning 404) while runtime cleanup is still in progress, so a
+    404 after deletion must not be read as confirmed termination.
 
     Args:
         sandbox_id (str):
@@ -150,8 +176,13 @@ async def asyncio_detailed(
 ) -> Response[Any | ErrorResponse]:
     """Delete a sandbox
 
-     Delete a sandbox, terminating its execution. The sandbox will transition through Stopping state to
-    Terminated.
+     Request sandbox deletion. Runtime cleanup may continue after the response.
+    For Kubernetes BatchSandbox workloads, queries report Stopping during cleanup
+    and return 404 once the resource is removed.
+    A 204 response means deletion was accepted, not that the sandbox's runtime
+    execution has terminated: the control object can disappear (and queries
+    can start returning 404) while runtime cleanup is still in progress, so a
+    404 after deletion must not be read as confirmed termination.
 
     Args:
         sandbox_id (str):
@@ -180,8 +211,13 @@ async def asyncio(
 ) -> Any | ErrorResponse | None:
     """Delete a sandbox
 
-     Delete a sandbox, terminating its execution. The sandbox will transition through Stopping state to
-    Terminated.
+     Request sandbox deletion. Runtime cleanup may continue after the response.
+    For Kubernetes BatchSandbox workloads, queries report Stopping during cleanup
+    and return 404 once the resource is removed.
+    A 204 response means deletion was accepted, not that the sandbox's runtime
+    execution has terminated: the control object can disappear (and queries
+    can start returning 404) while runtime cleanup is still in progress, so a
+    404 after deletion must not be read as confirmed termination.
 
     Args:
         sandbox_id (str):

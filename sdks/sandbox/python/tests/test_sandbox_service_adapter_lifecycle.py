@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import pytest
 
 from opensandbox.adapters.sandboxes_adapter import SandboxesAdapter
 from opensandbox.config import ConnectionConfig
+from opensandbox.config.connection_sync import ConnectionConfigSync
 from opensandbox.exceptions import SandboxApiException
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
@@ -30,6 +31,9 @@ from opensandbox.models.sandboxes import (
     SandboxFilter,
     SandboxImageSpec,
     SnapshotFilter,
+)
+from opensandbox.sync.adapters.sandboxes_adapter import (
+    SandboxesAdapterSync as SyncSandboxesAdapter,
 )
 
 
@@ -83,9 +87,10 @@ def _api_list_sandboxes_response():
     )
 
 
-def _api_snapshot(snapshot_id: str):
+def _api_snapshot(snapshot_id: str, mode=None):
     from opensandbox.api.lifecycle.models.snapshot import Snapshot
     from opensandbox.api.lifecycle.models.snapshot_status import SnapshotStatus
+    from opensandbox.api.lifecycle.types import UNSET
 
     return Snapshot(
         id=snapshot_id,
@@ -93,6 +98,7 @@ def _api_snapshot(snapshot_id: str):
         name="before-upgrade",
         status=SnapshotStatus(state="Ready"),
         created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        mode=UNSET if mode is None else mode,
     )
 
 
@@ -147,14 +153,23 @@ async def test_create_sandbox_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(out.id, str)
     assert "image" in called["body"].to_dict()
     assert called["body"].to_dict()["secureAccess"] is True
-    assert called["body"].to_dict()["extensions"] == {"storage.id": "abc123", "debug": "true"}
+    assert called["body"].to_dict()["extensions"] == {
+        "storage.id": "abc123",
+        "debug": "true",
+    }
+    assert called["body"].to_dict()["extensions"] == {
+        "storage.id": "abc123",
+        "debug": "true",
+    }
     network_policy = called["body"].to_dict()["networkPolicy"]
     assert network_policy["defaultAction"] == "deny"
     assert network_policy["egress"] == [{"action": "allow", "target": "pypi.org"}]
 
 
 @pytest.mark.asyncio
-async def test_create_sandbox_manual_cleanup_preserves_null_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_create_sandbox_manual_cleanup_preserves_null_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     called = {}
 
     async def _fake_asyncio_detailed(*, client, body):
@@ -184,7 +199,9 @@ async def test_create_sandbox_manual_cleanup_preserves_null_timeout(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_create_sandbox_restore_from_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_create_sandbox_restore_from_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     called = {}
 
     async def _fake_asyncio_detailed(*, client, body):
@@ -302,7 +319,9 @@ async def test_create_sandbox_unexpected_status_preserves_fastapi_detail_payload
 
 
 @pytest.mark.asyncio
-async def test_create_sandbox_empty_response_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_create_sandbox_empty_response_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def _fake_asyncio_detailed(*, client, body):
         return _Resp(status_code=200, parsed=None)
 
@@ -328,7 +347,11 @@ async def test_create_sandbox_empty_response_raises(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_list_sandboxes_metadata_double_encoded(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_list_sandboxes_metadata_percent_encoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from urllib.parse import parse_qsl
+
     from opensandbox.api.lifecycle.types import UNSET as API_UNSET
 
     captured = {}
@@ -345,10 +368,12 @@ async def test_list_sandboxes_metadata_double_encoded(monkeypatch: pytest.Monkey
     )
 
     adapter = SandboxesAdapter(ConnectionConfig())
-    f = SandboxFilter(metadata={"k k": "v/v"})
-    await adapter.list_sandboxes(f)
+    raw = {"k k": "v/v", "a": "x&y=b", "p": "50%"}
+    await adapter.list_sandboxes(SandboxFilter(metadata=raw))
 
-    assert captured["metadata"] == "k k=v/v"
+    # The server decodes the query layer then splits with parse_qsl, so the
+    # encoded filter must round-trip through parse_qsl losslessly.
+    assert dict(parse_qsl(captured["metadata"])) == raw
     assert captured["state"] is API_UNSET
 
 
@@ -391,7 +416,9 @@ async def test_pause_resume_kill_call_openapi(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
-async def test_patch_sandbox_metadata_sends_metadata_body(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_patch_sandbox_metadata_sends_metadata_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sbx_id = str(uuid4())
     captured = {}
 
@@ -419,7 +446,9 @@ async def test_patch_sandbox_metadata_sends_metadata_body(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_renew_sandbox_expiration_sends_timezone_aware(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_renew_sandbox_expiration_sends_timezone_aware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured = {}
 
     async def _fake_asyncio_detailed(*, client, sandbox_id, body):
@@ -445,7 +474,9 @@ async def test_renew_sandbox_expiration_sends_timezone_aware(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_snapshot_lifecycle_calls_openapi(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_snapshot_lifecycle_calls_openapi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[tuple[str, object]] = []
 
     async def _create_snapshot(*, client, sandbox_id, body):
@@ -456,8 +487,8 @@ async def test_snapshot_lifecycle_calls_openapi(monkeypatch: pytest.MonkeyPatch)
         calls.append(("get", snapshot_id))
         return _Resp(status_code=200, parsed=_api_snapshot(snapshot_id))
 
-    async def _list_snapshots(*, client, sandbox_id, state, page, page_size):
-        calls.append(("list", (sandbox_id, state, page, page_size)))
+    async def _list_snapshots(*, client, sandbox_id, name, state, page, page_size):
+        calls.append(("list", (sandbox_id, name, state, page, page_size)))
         from opensandbox.api.lifecycle.models.list_snapshots_response import (
             ListSnapshotsResponse,
         )
@@ -499,10 +530,18 @@ async def test_snapshot_lifecycle_calls_openapi(monkeypatch: pytest.MonkeyPatch)
     )
 
     adapter = SandboxesAdapter(ConnectionConfig())
-    created = await adapter.create_snapshot("sbx-1", CreateSnapshotRequest(name="before-upgrade"))
+    created = await adapter.create_snapshot(
+        "sbx-1", CreateSnapshotRequest(name="before-upgrade")
+    )
     loaded = await adapter.get_snapshot("snap-1")
     listed = await adapter.list_snapshots(
-        SnapshotFilter(sandbox_id="sbx-1", states=["Ready"], page=1, page_size=10)
+        SnapshotFilter(
+            sandbox_id="sbx-1",
+            name="toolchain:python@rev-1",
+            states=["Ready"],
+            page=1,
+            page_size=10,
+        )
     )
     await adapter.delete_snapshot("snap-1")
 
@@ -512,6 +551,157 @@ async def test_snapshot_lifecycle_calls_openapi(monkeypatch: pytest.MonkeyPatch)
     assert calls == [
         ("create", ("sbx-1", "before-upgrade")),
         ("get", "snap-1"),
-        ("list", ("sbx-1", ["Ready"], 1, 10)),
+        ("list", ("sbx-1", "toolchain:python@rev-1", ["Ready"], 1, 10)),
         ("delete", "snap-1"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_create_snapshot_sends_mode_and_maps_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensandbox.api.lifecycle.models.snapshot_mode import SnapshotMode
+
+    seen: list[object] = []
+
+    async def _create_snapshot(*, client, sandbox_id, body):
+        seen.append(body)
+        return _Resp(
+            status_code=202,
+            parsed=_api_snapshot("snap-rootfs", mode=SnapshotMode.ROOTFSONLY),
+        )
+
+    monkeypatch.setattr(
+        "opensandbox.api.lifecycle.api.snapshots.post_sandboxes_sandbox_id_snapshots.asyncio_detailed",
+        _create_snapshot,
+    )
+
+    adapter = SandboxesAdapter(ConnectionConfig())
+    created = await adapter.create_snapshot(
+        "sbx-1", CreateSnapshotRequest(name="workspace-state", mode="rootfsOnly")
+    )
+
+    assert seen[0].mode.value == "rootfsOnly"
+    assert created.mode == "rootfsOnly"
+
+
+@pytest.mark.asyncio
+async def test_adapter_create_snapshot_omits_mode_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[object] = []
+
+    async def _create_snapshot(*, client, sandbox_id, body):
+        seen.append(body)
+        return _Resp(status_code=202, parsed=_api_snapshot("snap-full"))
+
+    monkeypatch.setattr(
+        "opensandbox.api.lifecycle.api.snapshots.post_sandboxes_sandbox_id_snapshots.asyncio_detailed",
+        _create_snapshot,
+    )
+
+    adapter = SandboxesAdapter(ConnectionConfig())
+    created = await adapter.create_snapshot("sbx-1")
+
+    # Omitted mode serializes to nothing: legacy servers never see the field.
+    assert "mode" not in seen[0].to_dict()
+    assert created.mode == "full"
+
+
+def test_sync_list_snapshots_forwards_name_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def _list_snapshots(*, client, sandbox_id, name, state, page, page_size):
+        calls.append((sandbox_id, name, state, page, page_size))
+        from opensandbox.api.lifecycle.models.list_snapshots_response import (
+            ListSnapshotsResponse,
+        )
+        from opensandbox.api.lifecycle.models.pagination_info import PaginationInfo
+
+        return _Resp(
+            status_code=200,
+            parsed=ListSnapshotsResponse(
+                items=[_api_snapshot("snap-1")],
+                pagination=PaginationInfo(
+                    page=1,
+                    page_size=20,
+                    total_items=1,
+                    total_pages=1,
+                    has_next_page=False,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "opensandbox.api.lifecycle.api.snapshots.get_snapshots.sync_detailed",
+        _list_snapshots,
+    )
+
+    adapter = SyncSandboxesAdapter(ConnectionConfigSync())
+    listed = adapter.list_snapshots(
+        SnapshotFilter(name="toolchain:python@rev-1")
+    )
+
+    assert listed.snapshot_infos[0].id == "snap-1"
+    assert len(calls) == 1
+    assert calls[0][1] == "toolchain:python@rev-1"
+
+
+async def test_get_sandbox_endpoint_logs_warning_and_not_error_on_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _boom(*, client, sandbox_id, port, use_server_proxy=False):
+        raise RuntimeError("endpoint exploded")
+
+    monkeypatch.setattr(
+        "opensandbox.api.lifecycle.api.sandboxes.get_sandboxes_sandbox_id_endpoints_port.asyncio_detailed",
+        _boom,
+    )
+
+    adapter = SandboxesAdapter(ConnectionConfig())
+
+    with caplog.at_level("WARNING", logger="opensandbox.adapters.sandboxes_adapter"):
+        with pytest.raises(Exception) as exc_info:
+            await adapter.get_sandbox_endpoint("sbx-1", 8080)
+
+    assert "endpoint exploded" in str(exc_info.value)
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    debug_messages = [
+        r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+    ]
+    assert any(
+        "Failed to retrieve sandbox endpoint for sandbox sbx-1" in msg
+        for msg in debug_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_sandbox_logs_warning_and_not_error_on_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _boom(*, client, sandbox_id):
+        raise RuntimeError("resume exploded")
+
+    monkeypatch.setattr(
+        "opensandbox.api.lifecycle.api.sandboxes.post_sandboxes_sandbox_id_resume.asyncio_detailed",
+        _boom,
+    )
+
+    adapter = SandboxesAdapter(ConnectionConfig())
+
+    with caplog.at_level("WARNING", logger="opensandbox.adapters.sandboxes_adapter"):
+        with pytest.raises(Exception) as exc_info:
+            await adapter.resume_sandbox("sbx-2")
+
+    assert "resume exploded" in str(exc_info.value)
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    debug_messages = [
+        r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+    ]
+    assert any(
+        "Failed to resume sandbox sbx-2: resume exploded" in msg
+        for msg in debug_messages
+    )
+    assert all(r.exc_info is None for r in caplog.records if r.levelname == "WARNING")

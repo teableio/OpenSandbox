@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 Sandbox-related exception definitions.
 """
 
+from datetime import timedelta
+
 
 class SandboxError:
     """
@@ -28,11 +30,17 @@ class SandboxError:
     UNHEALTHY = "UNHEALTHY"
     INVALID_ARGUMENT = "INVALID_ARGUMENT"
     UNEXPECTED_RESPONSE = "UNEXPECTED_RESPONSE"
+    COMMAND_STREAM_INCOMPLETE = "COMMAND_STREAM_INCOMPLETE"
     POOL_EMPTY = "POOL_EMPTY"
     POOL_ACQUIRE_FAILED = "POOL_ACQUIRE_FAILED"
     POOL_STATE_STORE_UNAVAILABLE = "POOL_STATE_STORE_UNAVAILABLE"
-    POOL_STATE_STORE_CONTENTION = "POOL_STATE_STORE_CONTENTION"
     POOL_NOT_RUNNING = "POOL_NOT_RUNNING"
+    POOL_DESTROYED = "POOL_DESTROYED"
+    POOL_DESTROY_INCOMPLETE = "POOL_DESTROY_INCOMPLETE"
+    TIMEOUT = "TIMEOUT"
+    CONNECTION = "CONNECTION"
+    RATE_LIMIT = "RATE_LIMIT"
+    WAKE_TIMEOUT = "WAKE_TIMEOUT"
 
     def __init__(self, code: str, message: str | None = None) -> None:
         self.code = code
@@ -46,8 +54,10 @@ class SandboxException(Exception):
     """
     Base exception class for all sandbox-related errors.
 
-    This is the root exception class that all other sandbox exceptions inherit from.
-    It provides a consistent error structure across the SDK.
+    Provides a consistent error structure across the SDK. ``is_retryable``
+    reflects whether the SDK actually decided to retry this failure:
+    budget exhaustion, deadline expiry, and caller cancellation all
+    force it to ``False`` even for transient causes.
     """
 
     def __init__(
@@ -56,17 +66,36 @@ class SandboxException(Exception):
         cause: Exception | None = None,
         error: SandboxError | None = None,
         request_id: str | None = None,
+        is_retryable: bool = False,
     ) -> None:
         super().__init__(message)
         self.__cause__ = cause
         self.error = error or SandboxError(SandboxError.INTERNAL_UNKNOWN_ERROR)
         self.request_id = request_id
+        self._is_retryable = is_retryable
+
+    @property
+    def is_retryable(self) -> bool:
+        """True iff the SDK considered this failure retryable at emission time."""
+        return self._is_retryable
+
+    def __str__(self) -> str:
+        parts = [super().__str__()]
+        if self.error and self.error.message:
+            parts.append(f"[{self.error.code}] {self.error.message}")
+        if self.request_id:
+            parts.append(f"request_id={self.request_id}")
+        return " | ".join(parts)
 
 
 class SandboxApiException(SandboxException):
     """
     Thrown when the Sandbox API returns an error response (e.g., HTTP 4xx or 5xx)
     or meets unexpected error when calling API.
+
+    ``response_body`` carries the raw response bytes from the server so
+    callers can inspect payloads the SDK could not parse into a
+    structured ``SandboxError``.
     """
 
     def __init__(
@@ -76,14 +105,87 @@ class SandboxApiException(SandboxException):
         status_code: int | None = None,
         error: SandboxError | None = None,
         request_id: str | None = None,
+        response_body: bytes | None = None,
+        is_retryable: bool = False,
     ) -> None:
         super().__init__(
             message,
             cause,
             error or SandboxError(SandboxError.UNEXPECTED_RESPONSE),
             request_id=request_id,
+            is_retryable=is_retryable,
         )
         self.status_code = status_code
+        self.response_body = response_body
+
+
+class SandboxRateLimitException(SandboxApiException):
+    """
+    Thrown when the API returns HTTP 429.
+
+    ``retry_after`` carries the server-supplied header value as a
+    ``timedelta`` when present, so fast-fail callers can still act on it.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        cause: Exception | None = None,
+        status_code: int | None = 429,
+        error: SandboxError | None = None,
+        request_id: str | None = None,
+        retry_after: timedelta | None = None,
+        response_body: bytes | None = None,
+        is_retryable: bool = False,
+    ) -> None:
+        super().__init__(
+            message,
+            cause,
+            status_code=status_code,
+            error=error or SandboxError(SandboxError.RATE_LIMIT, message),
+            request_id=request_id,
+            response_body=response_body,
+            is_retryable=is_retryable,
+        )
+        self.retry_after = retry_after
+
+
+class SandboxWakeTimeoutException(SandboxApiException):
+    """
+    Thrown when the OSEP-0024 wake retry budget is exhausted.
+
+    The gateway answered ``503`` with the ``OpenSandbox-Wake: expired``
+    marker on every attempt: the sandbox restore did not finish within
+    the wake retry policy's budget. The request was never forwarded, so
+    retrying later is safe — the server-side resume continues in the
+    background regardless.
+
+    ``attempts`` carries the number of marked wake-timeout responses
+    received; ``waited`` carries the total wall-clock time spent across
+    waits, retries, and request time.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        cause: Exception | None = None,
+        attempts: int = 0,
+        waited: timedelta | None = None,
+        error: SandboxError | None = None,
+        request_id: str | None = None,
+        response_body: bytes | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            cause,
+            status_code=503,
+            error=error or SandboxError(SandboxError.WAKE_TIMEOUT, message),
+            request_id=request_id,
+            response_body=response_body,
+            is_retryable=False,
+        )
+        self.attempts = attempts
+        self.waited = waited if waited is not None else timedelta(0)
 
 
 class SandboxInternalException(SandboxException):
@@ -95,9 +197,53 @@ class SandboxInternalException(SandboxException):
         self,
         message: str | None = None,
         cause: Exception | None = None,
+        error: SandboxError | None = None,
+        is_retryable: bool = False,
     ) -> None:
         super().__init__(
-            message, cause, SandboxError(SandboxError.INTERNAL_UNKNOWN_ERROR)
+            message,
+            cause,
+            error or SandboxError(SandboxError.INTERNAL_UNKNOWN_ERROR),
+            is_retryable=is_retryable,
+        )
+
+
+class SandboxTimeoutException(SandboxInternalException):
+    """
+    Thrown when a per-attempt timeout or overall retry deadline fires.
+
+    Distinct from :class:`SandboxReadyTimeoutException`, which is the
+    health-poll timeout during sandbox startup.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        cause: Exception | None = None,
+        is_retryable: bool = False,
+    ) -> None:
+        super().__init__(
+            message,
+            cause,
+            error=SandboxError(SandboxError.TIMEOUT, message),
+            is_retryable=is_retryable,
+        )
+
+
+class SandboxConnectionException(SandboxInternalException):
+    """Transport-layer failure: DNS, TCP connect, TLS, or connection reset."""
+
+    def __init__(
+        self,
+        message: str | None = None,
+        cause: Exception | None = None,
+        is_retryable: bool = False,
+    ) -> None:
+        super().__init__(
+            message,
+            cause,
+            error=SandboxError(SandboxError.CONNECTION, message),
+            is_retryable=is_retryable,
         )
 
 
@@ -184,21 +330,6 @@ class PoolStateStoreUnavailableException(SandboxException):
         )
 
 
-class PoolStateStoreContentionException(SandboxException):
-    """Thrown when atomic store operations encounter contention."""
-
-    def __init__(
-        self,
-        message: str | None = None,
-        cause: Exception | None = None,
-    ) -> None:
-        super().__init__(
-            message,
-            cause,
-            SandboxError(SandboxError.POOL_STATE_STORE_CONTENTION, message),
-        )
-
-
 class PoolNotRunningException(SandboxException):
     """Thrown when acquire is called while the pool is not running."""
 
@@ -209,4 +340,32 @@ class PoolNotRunningException(SandboxException):
     ) -> None:
         super().__init__(
             message, cause, SandboxError(SandboxError.POOL_NOT_RUNNING, message)
+        )
+
+
+class PoolDestroyedException(SandboxException):
+    """Thrown when a pool namespace is being destroyed or has been destroyed."""
+
+    def __init__(
+        self,
+        message: str | None = "Pool namespace is destroyed",
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(
+            message, cause, SandboxError(SandboxError.POOL_DESTROYED, message)
+        )
+
+
+class PoolDestroyIncompleteException(SandboxException):
+    """Thrown when pool destroy starts but does not complete."""
+
+    def __init__(
+        self,
+        message: str | None = "Pool destroy did not complete",
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            cause,
+            SandboxError(SandboxError.POOL_DESTROY_INCOMPLETE, message),
         )

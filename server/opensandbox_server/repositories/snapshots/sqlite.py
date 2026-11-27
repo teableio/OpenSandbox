@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,8 +57,10 @@ class SQLiteSnapshotRepository:
                 INSERT INTO snapshots (
                     id,
                     source_sandbox_id,
+                    namespace,
                     name,
                     description,
+                    mode,
                     restore_config,
                     state,
                     reason,
@@ -66,7 +68,7 @@ class SQLiteSnapshotRepository:
                     last_transition_at,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._to_db_tuple(record),
             )
@@ -79,8 +81,10 @@ class SQLiteSnapshotRepository:
                 SELECT
                     id,
                     source_sandbox_id,
+                    namespace,
                     name,
                     description,
+                    mode,
                     restore_config,
                     state,
                     reason,
@@ -99,15 +103,26 @@ class SQLiteSnapshotRepository:
         clauses: list[str] = []
         params: list[object] = []
 
+        if query.namespace is not None:
+            clauses.append("namespace = ?")
+            params.append(query.namespace)
+
         if query.source_sandbox_id:
             clauses.append("source_sandbox_id = ?")
             params.append(query.source_sandbox_id)
 
+        if query.name is not None:
+            clauses.append("name = ?")
+            params.append(query.name)
+
         if query.states:
-            clauses.append(
-                f"state IN ({', '.join('?' for _ in query.states)})"
-            )
+            clauses.append(f"state IN ({', '.join('?' for _ in query.states)})")
             params.extend(query.states)
+
+        if query.after_created_at is not None and query.after_id is not None:
+            after_created_at = self._datetime_to_str(query.after_created_at)
+            clauses.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            params.extend([after_created_at, after_created_at, query.after_id])
 
         where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         page = max(query.page, 1)
@@ -124,8 +139,10 @@ class SQLiteSnapshotRepository:
                 SELECT
                     id,
                     source_sandbox_id,
+                    namespace,
                     name,
                     description,
+                    mode,
                     restore_config,
                     state,
                     reason,
@@ -153,8 +170,10 @@ class SQLiteSnapshotRepository:
                 UPDATE snapshots
                 SET
                     source_sandbox_id = ?,
+                    namespace = ?,
                     name = ?,
                     description = ?,
+                    mode = ?,
                     restore_config = ?,
                     state = ?,
                     reason = ?,
@@ -164,19 +183,7 @@ class SQLiteSnapshotRepository:
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (
-                    record.source_sandbox_id,
-                    record.name,
-                    record.description,
-                    json.dumps(self._restore_config_to_dict(record.restore_config), sort_keys=True),
-                    record.status.state.value,
-                    record.status.reason,
-                    record.status.message,
-                    self._datetime_to_str(record.status.last_transition_at),
-                    self._datetime_to_str(record.created_at),
-                    self._datetime_to_str(record.updated_at),
-                    record.id,
-                ),
+                self._to_update_tuple(record) + (record.id,),
             )
         return record
 
@@ -191,8 +198,10 @@ class SQLiteSnapshotRepository:
                 UPDATE snapshots
                 SET
                     source_sandbox_id = ?,
+                    namespace = ?,
                     name = ?,
                     description = ?,
+                    mode = ?,
                     restore_config = ?,
                     state = ?,
                     reason = ?,
@@ -202,26 +211,16 @@ class SQLiteSnapshotRepository:
                     updated_at = ?
                 WHERE id = ? AND state = ?
                 """,
-                (
-                    record.source_sandbox_id,
-                    record.name,
-                    record.description,
-                    json.dumps(self._restore_config_to_dict(record.restore_config), sort_keys=True),
-                    record.status.state.value,
-                    record.status.reason,
-                    record.status.message,
-                    self._datetime_to_str(record.status.last_transition_at),
-                    self._datetime_to_str(record.created_at),
-                    self._datetime_to_str(record.updated_at),
-                    record.id,
-                    expected_state.value,
-                ),
+                self._to_update_tuple(record) + (record.id, expected_state.value),
             )
             return cursor.rowcount == 1
 
     def delete(self, snapshot_id: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
+
+    def close(self) -> None:
+        """SQLite connections are scoped to individual operations."""
 
     def _initialize_schema(self) -> None:
         with self._connect() as conn:
@@ -230,8 +229,10 @@ class SQLiteSnapshotRepository:
                 CREATE TABLE IF NOT EXISTS snapshots (
                     id TEXT PRIMARY KEY,
                     source_sandbox_id TEXT NOT NULL,
+                    namespace TEXT DEFAULT NULL,
                     name TEXT,
                     description TEXT,
+                    mode TEXT,
                     restore_config TEXT NOT NULL,
                     state TEXT NOT NULL,
                     reason TEXT,
@@ -251,6 +252,74 @@ class SQLiteSnapshotRepository:
                     ON snapshots(created_at DESC);
                 """
             )
+            self._migrate_add_namespace(conn)
+            self._migrate_namespace_nullable(conn)
+            self._migrate_add_mode(conn)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_snapshots_name_namespace
+                    ON snapshots(name, namespace)
+                """
+            )
+
+    @staticmethod
+    def _migrate_add_namespace(conn: sqlite3.Connection) -> None:
+        """Add namespace column if missing (added for multi-tenant isolation)."""
+        rows = conn.execute("PRAGMA table_info(snapshots)").fetchall()
+        columns = {row["name"] for row in rows}
+        if "namespace" not in columns:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN namespace TEXT DEFAULT NULL")
+
+    @staticmethod
+    def _migrate_add_mode(conn: sqlite3.Connection) -> None:
+        """Add mode column if missing (snapshot artifact class, rootfs-only support)."""
+        rows = conn.execute("PRAGMA table_info(snapshots)").fetchall()
+        columns = {row["name"] for row in rows}
+        if "mode" not in columns:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN mode TEXT")
+
+    @staticmethod
+    def _migrate_namespace_nullable(conn: sqlite3.Connection) -> None:
+        """Convert namespace from NOT NULL to nullable for non-tenant mode."""
+        rows = conn.execute("PRAGMA table_info(snapshots)").fetchall()
+        for row in rows:
+            if row["name"] == "namespace" and row["notnull"]:
+                conn.executescript(
+                    """
+                    CREATE TABLE snapshots_new (
+                        id TEXT PRIMARY KEY,
+                        source_sandbox_id TEXT NOT NULL,
+                        namespace TEXT DEFAULT NULL,
+                        name TEXT,
+                        description TEXT,
+                        restore_config TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        reason TEXT,
+                        message TEXT,
+                        last_transition_at TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO snapshots_new (
+                        id, source_sandbox_id, namespace, name, description,
+                        restore_config, state, reason, message,
+                        last_transition_at, created_at, updated_at
+                    ) SELECT
+                        id, source_sandbox_id, namespace, name, description,
+                        restore_config, state, reason, message,
+                        last_transition_at, created_at, updated_at
+                    FROM snapshots;
+                    DROP TABLE snapshots;
+                    ALTER TABLE snapshots_new RENAME TO snapshots;
+                    CREATE INDEX IF NOT EXISTS idx_snapshots_source_sandbox_id
+                        ON snapshots(source_sandbox_id);
+                    CREATE INDEX IF NOT EXISTS idx_snapshots_state
+                        ON snapshots(state);
+                    CREATE INDEX IF NOT EXISTS idx_snapshots_created_at
+                        ON snapshots(created_at DESC);
+                    """
+                )
+                break
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)
@@ -263,9 +332,11 @@ class SQLiteSnapshotRepository:
         return (
             record.id,
             record.source_sandbox_id,
+            record.namespace,
             record.name,
             record.description,
-            json.dumps(self._restore_config_to_dict(record.restore_config), sort_keys=True),
+            record.mode,
+            json.dumps(record.restore_config.to_dict(), sort_keys=True),
             record.status.state.value,
             record.status.reason,
             record.status.message,
@@ -274,11 +345,9 @@ class SQLiteSnapshotRepository:
             self._datetime_to_str(record.updated_at),
         )
 
-    @staticmethod
-    def _restore_config_to_dict(config: SnapshotRestoreConfig) -> dict[str, str | None]:
-        return {
-            "image": config.image,
-        }
+    def _to_update_tuple(self, record: SnapshotRecord) -> tuple[object, ...]:
+        """Column values in UPDATE SET order (no leading id)."""
+        return self._to_db_tuple(record)[1:]
 
     @staticmethod
     def _datetime_to_str(value) -> str | None:
@@ -290,16 +359,18 @@ class SQLiteSnapshotRepository:
         return SnapshotRecord(
             id=row["id"],
             source_sandbox_id=row["source_sandbox_id"],
+            namespace=row["namespace"],
             name=row["name"],
             description=row["description"],
-            restore_config=SnapshotRestoreConfig(
-                image=restore_config.get("image"),
-            ),
+            mode=row["mode"],
+            restore_config=SnapshotRestoreConfig.from_dict(restore_config),
             status=SnapshotStatusRecord(
                 state=SnapshotState(row["state"]),
                 reason=row["reason"],
                 message=row["message"],
-                last_transition_at=SQLiteSnapshotRepository._str_to_datetime(row["last_transition_at"]),
+                last_transition_at=SQLiteSnapshotRepository._str_to_datetime(
+                    row["last_transition_at"]
+                ),
             ),
             created_at=SQLiteSnapshotRepository._str_to_datetime(row["created_at"]),
             updated_at=SQLiteSnapshotRepository._str_to_datetime(row["updated_at"]),

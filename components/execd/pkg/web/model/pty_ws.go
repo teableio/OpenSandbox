@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,11 @@
 
 package model
 
-// ClientFrame is a JSON frame sent from the WebSocket client to the server.
+const (
+	PTYWebSocketProtocol    = "opensandbox-pty"
+	PTYWebSocketTokenPrefix = "base64url.bearer.execd.opensandbox."
+)
+
 type ClientFrame struct {
 	Type   string `json:"type"`
 	Data   string `json:"data,omitempty"`
@@ -23,11 +27,11 @@ type ClientFrame struct {
 	Signal string `json:"signal,omitempty"`
 }
 
-// ServerFrame is a JSON frame sent from the server to the WebSocket client.
 type ServerFrame struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id,omitempty"`
 	Mode      string `json:"mode,omitempty"`
+	Role      string `json:"role,omitempty"`
 	Data      string `json:"data,omitempty"`
 	Offset    int64  `json:"offset,omitempty"`
 	ExitCode  *int   `json:"exit_code,omitempty"`
@@ -51,5 +55,14 @@ const (
 	WSErrCodeStdinWriteFailed = "STDIN_WRITE_FAILED"
 	WSErrCodeInvalidFrame     = "INVALID_FRAME"
 	WSErrCodeAlreadyConnected = "ALREADY_CONNECTED"
+	WSErrCodeTakenOver        = "TAKEN_OVER"
+	WSErrCodeReadOnly         = "READ_ONLY"
+	WSErrCodeViewerNotRunning = "VIEWER_REQUIRES_RUNNING_SESSION"
 	WSErrCodeRuntimeError     = "RUNTIME_ERROR"
 )
+
+// WSCloseTakenOver is the WebSocket close code sent to a client whose session was
+// taken over by another client (via ?takeover=1). It lives in the application-private
+// range (4000–4999, RFC 6455 §7.4.2) so clients can distinguish an intentional
+// handoff from a network drop and avoid auto-reconnecting into the new holder.
+const WSCloseTakenOver = 4001

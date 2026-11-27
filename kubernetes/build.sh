@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,10 +22,10 @@ build_arg_if_set() {
     fi
 }
 
-# Default values
 TAG=${TAG:-latest}
 COMPONENT=${COMPONENT:-controller}
 PUSH=${PUSH:-true}
+GHCR_REPO=${GHCR_REPO:-}
 BUILD_METADATA_FILE=${BUILD_METADATA_FILE:-build/${COMPONENT}-image-metadata.json}
 BUILD_ARGS=()
 for name in GOFLAGS LDFLAGS CGO_ENABLED CC CXX CFLAGS CXXFLAGS CGO_CFLAGS CGO_CXXFLAGS CGO_LDFLAGS; do
@@ -38,7 +38,6 @@ mkdir -p "$(dirname "${BUILD_METADATA_FILE}")"
 DOCKERHUB_REPO="opensandbox"
 ACR_REPO="sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox"
 
-# Component specific settings
 DOCKERFILE="Dockerfile"
 if [ "$COMPONENT" == "controller" ]; then
     IMAGE_NAME="controller"
@@ -63,17 +62,19 @@ echo "Tag: $TAG"
 echo "Push: $PUSH"
 echo "========================================="
 
-# Build for multiple platforms
 PLATFORMS="linux/amd64,linux/arm64"
 
 if [ "$PUSH" == "true" ]; then
-    # Build and push to registry
+    IMAGE_TAGS=(-t "${DOCKERHUB_REPO}/${IMAGE_NAME}:${TAG}" -t "${ACR_REPO}/${IMAGE_NAME}:${TAG}")
+    if [[ -n "${GHCR_REPO}" ]]; then
+        IMAGE_TAGS+=(-t "${GHCR_REPO}/${IMAGE_NAME}:${TAG}")
+    fi
+
     docker buildx build \
         --platform $PLATFORMS \
         $BUILD_ARG \
         "${BUILD_ARGS[@]}" \
-        -t "${DOCKERHUB_REPO}/${IMAGE_NAME}:${TAG}" \
-        -t "${ACR_REPO}/${IMAGE_NAME}:${TAG}" \
+        "${IMAGE_TAGS[@]}" \
         --metadata-file "${BUILD_METADATA_FILE}" \
         --push \
         -f "$DOCKERFILE" \
@@ -83,20 +84,22 @@ if [ "$PUSH" == "true" ]; then
     echo "Successfully built and pushed:"
     echo "  ${DOCKERHUB_REPO}/${IMAGE_NAME}:${TAG}"
     echo "  ${ACR_REPO}/${IMAGE_NAME}:${TAG}"
+    if [[ -n "${GHCR_REPO}" ]]; then
+        echo "  ${GHCR_REPO}/${IMAGE_NAME}:${TAG}"
+    fi
     echo "========================================="
 else
-    # Build only (for local testing)
     docker buildx build \
         --platform linux/amd64 \
         $BUILD_ARG \
         "${BUILD_ARGS[@]}" \
-        -t ${IMAGE_NAME}:${TAG} \
+        -t "${DOCKERHUB_REPO}/${IMAGE_NAME}:${TAG}" \
         -f "$DOCKERFILE" \
         --load \
         .
     
     echo "========================================="
     echo "Successfully built (local only):"
-    echo "  ${IMAGE_NAME}:${TAG}"
+    echo "  ${DOCKERHUB_REPO}/${IMAGE_NAME}:${TAG}"
     echo "========================================="
 fi

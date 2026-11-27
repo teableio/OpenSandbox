@@ -1,0 +1,28 @@
+---
+title: Feature Guides
+description: Guides to sandbox lifecycle, isolation, networking, and security.
+---
+
+# Feature Guides
+
+Use these guides to add capabilities to a working [sandbox application](/getting-started/). Check the [SDK capability matrix](/sdks/#capability-coverage) for language support.
+
+## Lifecycle and security
+
+- [Pause and resume](/guides/pause-resume)
+- [Lifecycle hooks](/guides/lifecycle-hooks)
+- [Isolation sessions](/guides/isolation-sessions)
+- [In-sandbox privilege reduction](/guides/privilege-reduction)
+- [Credential Vault](/guides/credential-vault)
+- [Chained upstream proxy](/guides/egress-upstream-proxy)
+- [Egress forward mode](/guides/egress-forward-mode)
+- [Secure access](/guides/secure-access)
+- [Fast Sandbox system authentication](/guides/fast-sandbox-system-auth)
+- [Secure container runtimes](/guides/secure-container)
+- [Sandbox network security](/guides/network-security)
+- [Multi-tenancy](/guides/multi-tenancy)
+- [Windows sandboxes](/guides/windows-sandbox)
+
+## Operations
+
+- [Telemetry](/guides/telemetry)

@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,13 +18,18 @@ from typing import Any, Callable, Dict, Optional
 
 from fastapi import HTTPException, status
 from kubernetes.client import (
+    V1AppArmorProfile,
+    V1Capabilities,
     V1Container,
     V1EnvVar,
     V1ResourceRequirements,
+    V1SeccompProfile,
+    V1SecurityContext,
     V1VolumeMount,
 )
 
 from opensandbox_server.api.schema import ImageSpec
+from opensandbox_server.extensions.keys import ISOLATION_UPPER_MOUNT_PATH
 from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.helpers import parse_gpu_request
 from opensandbox_server.services.k8s.egress_helper import (
@@ -46,30 +51,26 @@ _GPU_RESOURCE_LIMIT_KEY = "gpu"
 # (e.g. amd.com/gpu, gpu.intel.com/i915) can be added as a follow-up.
 _K8S_NVIDIA_GPU_RESOURCE = "nvidia.com/gpu"
 
+# resourceLimits disk-quota aliases, resolved with the same precedence as the
+# Docker runtime (_resolve_resource_limits) and the Windows profile
+# (windows_common). Kubernetes only accepts the canonical container resource
+# name `ephemeral-storage`, so the aliases must be translated instead of being
+# passed through verbatim as unknown resource keys (which the API server
+# rejects).
+_DISK_RESOURCE_LIMIT_KEYS = ("disk", "storage", "ephemeral-storage")
+_K8S_EPHEMERAL_STORAGE_RESOURCE = "ephemeral-storage"
+
 
 def _translate_resource_limits_for_k8s(
     resource_limits: Dict[str, str],
 ) -> Dict[str, str]:
     """Translate request-level resource limits into Kubernetes resource keys.
 
-    The lifecycle API exposes a portable ``gpu`` key on ``resourceLimits``.
-    Kubernetes requires the canonical extended-resource name
-    (``nvidia.com/gpu``) so the device plugin can schedule the request;
-    otherwise the value is silently treated as an unknown extended resource.
-
-    Args:
-        resource_limits: Raw resource limits from the create request.
-
-    Returns:
-        A new dict with the ``gpu`` key translated to ``nvidia.com/gpu``
-        and any unparseable GPU value dropped. Other keys (cpu, memory, ...)
-        are passed through unchanged.
-
-    Raises:
-        HTTPException: If ``gpu`` is the ``"all"`` sentinel. Docker accepts
-            ``"all"`` (mapped to an unbounded DeviceRequest), but Kubernetes
-            extended resources require an integer count, so we surface a
-            400 rather than silently scheduling without a GPU.
+    The portable ``gpu`` key becomes the canonical ``nvidia.com/gpu`` extended
+    resource; the ``disk``/``storage``/``ephemeral-storage`` aliases become the
+    ``ephemeral-storage`` container resource with Docker-runtime precedence;
+    other keys pass through unchanged. Raises HTTPException (400) for the
+    ``gpu="all"`` sentinel, which Kubernetes extended resources cannot express.
     """
     if not resource_limits:
         return {}
@@ -77,8 +78,17 @@ def _translate_resource_limits_for_k8s(
     translated: Dict[str, str] = {
         key: value
         for key, value in resource_limits.items()
-        if key != _GPU_RESOURCE_LIMIT_KEY
+        if key != _GPU_RESOURCE_LIMIT_KEY and key not in _DISK_RESOURCE_LIMIT_KEYS
     }
+
+    # The portable disk-quota key (canonical name `disk`, aliases `storage` /
+    # `ephemeral-storage`) becomes the Kubernetes container storage resource;
+    # the value keeps its Docker/Kubernetes-style quantity form, which the
+    # API server's quantity parser accepts.
+    for alias in _DISK_RESOURCE_LIMIT_KEYS:
+        if alias in resource_limits:
+            translated[_K8S_EPHEMERAL_STORAGE_RESOURCE] = resource_limits[alias]
+            break
 
     raw_gpu = resource_limits.get(_GPU_RESOURCE_LIMIT_KEY)
     if raw_gpu is None:
@@ -133,10 +143,20 @@ def _build_execd_init_container(
     disable_ipv6_for_egress: bool = False,
 ) -> V1Container:
     script = (
-        "cp ./execd /opt/opensandbox/bin/execd && "
-        "cp ./bootstrap.sh /opt/opensandbox/bin/bootstrap.sh && "
-        "chmod +x /opt/opensandbox/bin/execd && "
-        "chmod +x /opt/opensandbox/bin/bootstrap.sh"
+        "cp ./execd /opt/opensandbox/execd && "
+        "cp ./bootstrap.sh /opt/opensandbox/bootstrap.sh && "
+        "chmod +x /opt/opensandbox/execd && "
+        "chmod +x /opt/opensandbox/bootstrap.sh && "
+        "(cp /usr/local/bin/bwrap /opt/opensandbox/bwrap && "
+        "chmod +x /opt/opensandbox/bwrap || true) && "
+        "(test ! -e /usr/local/libexec/opensandbox-session-gate || "
+        "(cp /usr/local/libexec/opensandbox-session-gate "
+        "/opt/opensandbox/opensandbox-session-gate && "
+        "chmod 0555 /opt/opensandbox/opensandbox-session-gate)) && "
+        "(test ! -e /usr/local/libexec/opensandbox-launcher || "
+        "(cp /usr/local/libexec/opensandbox-launcher "
+        "/opt/opensandbox/opensandbox-launcher && "
+        "chmod 0555 /opt/opensandbox/opensandbox-launcher))"
     )
     security_context = None
     if disable_ipv6_for_egress:
@@ -158,7 +178,7 @@ def _build_execd_init_container(
         volume_mounts=[
             V1VolumeMount(
                 name="opensandbox-bin",
-                mount_path="/opt/opensandbox/bin",
+                mount_path="/opt/opensandbox",
             )
         ],
         resources=resources,
@@ -172,19 +192,26 @@ def _build_main_container(
     env: Dict[str, str],
     resource_limits: Dict[str, str],
     *,
-    resource_requests: Optional[Dict[str, str]] = None,
     has_network_policy: bool = False,
+    drop_net_raw: bool = False,
+    isolation_enabled: bool = False,
     image_pull_policy: Optional[str] = None,
+    resource_requests: Optional[Dict[str, str]] = None,
+    default_resource_requests: Optional[Dict[str, str]] = None,
 ) -> V1Container:
     env_vars = [V1EnvVar(name=k, value=v) for k, v in env.items()]
-    env_vars.append(V1EnvVar(name="EXECD", value="/opt/opensandbox/bin/execd"))
+    env_vars.append(V1EnvVar(name="EXECD", value="/opt/opensandbox/execd"))
 
     translated_limits = _translate_resource_limits_for_k8s(resource_limits)
     resources = None
     if translated_limits:
-        translated_requests = _build_resource_requests_for_k8s(
-            translated_limits,
-            resource_requests,
+        translated_requests = (
+            _translate_resource_limits_for_k8s(resource_requests)
+            if resource_requests
+            else _build_resource_requests_for_k8s(
+                translated_limits,
+                default_resource_requests,
+            )
         )
         resources = V1ResourceRequirements(
             limits=translated_limits,
@@ -194,20 +221,40 @@ def _build_main_container(
     volume_mounts = [
         V1VolumeMount(
             name="opensandbox-bin",
-            mount_path="/opt/opensandbox/bin",
+            mount_path="/opt/opensandbox",
         )
     ]
 
     security_context = None
     if has_network_policy:
-        security_context_dict = build_security_context_for_sandbox_container(True)
+        security_context_dict = build_security_context_for_sandbox_container(
+            True, drop_net_raw=drop_net_raw
+        )
         security_context = build_security_context_from_dict(security_context_dict)
+
+    if isolation_enabled:
+        security_context = security_context or V1SecurityContext()
+        caps = ["SYS_ADMIN"]
+        if security_context.capabilities:
+            existing = security_context.capabilities.add or []
+            caps = sorted(set(existing + caps))
+            security_context.capabilities.add = caps
+        else:
+            security_context.capabilities = V1Capabilities(add=caps)
+        security_context.seccomp_profile = V1SeccompProfile(type="Unconfined")
+        security_context.app_armor_profile = V1AppArmorProfile(type="Unconfined")
+        volume_mounts.append(
+            V1VolumeMount(
+                name="isolation-upper",
+                mount_path=ISOLATION_UPPER_MOUNT_PATH,
+            )
+        )
 
     return V1Container(
         name="sandbox",
         image=image_spec.uri,
         image_pull_policy=image_pull_policy,
-        command=["/opt/opensandbox/bin/bootstrap.sh"] + entrypoint,
+        command=["/opt/opensandbox/bootstrap.sh"] + entrypoint,
         env=env_vars if env_vars else None,
         resources=resources,
         volume_mounts=volume_mounts,
@@ -303,11 +350,15 @@ def _workload_platform_constraint_scope(
     pod_template_key: str,
     analyzer: Callable[[Any], tuple[bool, bool]],
 ) -> tuple[bool, bool]:
-    pod_spec = (
-        workload.get("spec", {})
-        .get(pod_template_key, {})
-        .get("spec", {})
-    )
+    # Use `or {}` instead of `.get(key, {})`: when a CRD field is declared
+    # without `omitempty`, Kubernetes serialises an absent value as explicit
+    # null rather than omitting the key.  `.get(key, {})` only substitutes
+    # the default when the key is absent — not when its value is None — so
+    # chaining `.get()` on the result raises AttributeError.  `or {}` treats
+    # both absent keys and explicit None as empty dicts.
+    spec = workload.get("spec") or {}
+    template = spec.get(pod_template_key) or {}
+    pod_spec = template.get("spec") or {}
     return analyzer(pod_spec)
 
 

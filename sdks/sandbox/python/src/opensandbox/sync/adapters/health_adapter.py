@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,8 +21,14 @@ import logging
 
 import httpx
 
+from opensandbox._httpx import build_redirect_client_options
 from opensandbox.adapters.converter.response_handler import handle_api_error
 from opensandbox.config.connection_sync import ConnectionConfigSync
+from opensandbox.internal.readiness import (
+    HEALTH_PING_TIMEOUT,
+    constrain_readiness_request,
+    is_readiness_auth_error,
+)
 from opensandbox.models.sandboxes import SandboxEndpoint
 from opensandbox.sync.services.health import HealthSync
 
@@ -30,25 +36,36 @@ logger = logging.getLogger(__name__)
 
 
 class HealthAdapterSync(HealthSync):
-    def __init__(self, connection_config: ConnectionConfigSync, execd_endpoint: SandboxEndpoint) -> None:
+    def __init__(
+        self, connection_config: ConnectionConfigSync, execd_endpoint: SandboxEndpoint
+    ) -> None:
         self.connection_config = connection_config
         self.execd_endpoint = execd_endpoint
         from opensandbox.api.execd import Client
 
         base_url = f"{self.connection_config.protocol}://{self.execd_endpoint.endpoint}"
-        timeout = httpx.Timeout(self.connection_config.request_timeout.total_seconds())
-        headers = {
-            "User-Agent": self.connection_config.user_agent,
-            **self.connection_config.headers,
-            **self.execd_endpoint.headers,
-        }
+        timeout_seconds = min(
+            self.connection_config.request_timeout.total_seconds(),
+            HEALTH_PING_TIMEOUT.total_seconds(),
+        )
+        timeout = httpx.Timeout(timeout_seconds)
+        headers = self.execd_endpoint.build_request_headers(self.connection_config)
 
-        self._client = Client(base_url=base_url, timeout=timeout)
+        self._client = Client(
+            base_url=base_url,
+            timeout=timeout,
+            follow_redirects=self.connection_config.follow_redirects,
+        )
         self._httpx_client = httpx.Client(
             base_url=base_url,
             headers=headers,
             timeout=timeout,
             transport=self.connection_config.transport,
+            **build_redirect_client_options(
+                self.connection_config,
+                base_url,
+                additional_request_hooks=(constrain_readiness_request,),
+            ),
         )
         self._client.set_httpx_client(self._httpx_client)
 
@@ -60,5 +77,7 @@ class HealthAdapterSync(HealthSync):
             handle_api_error(response_obj, "Ping")
             return True
         except Exception as e:
-            logger.debug("Health check failed for sandbox %s: %s", sandbox_id, e)
+            if is_readiness_auth_error(e):
+                raise
+            logger.debug(f"Health check failed for sandbox {sandbox_id}: {e}")
             return False

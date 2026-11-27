@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Tests for OSEP-0011 signing module."""
 
 from __future__ import annotations
 
@@ -30,10 +28,6 @@ from opensandbox_server.services.signing import (
     decode_expires_b36,
     encode_expires_b36,
 )
-
-# ============================================================
-# encode_expires_b36
-# ============================================================
 
 
 class TestEncodeExpiresB36:
@@ -60,7 +54,7 @@ class TestEncodeExpiresB36:
     def test_no_leading_zeros(self) -> None:
         for n in [0, 1, 36, 1000, 2**63]:
             s = encode_expires_b36(n)
-            assert s == s.lstrip("0") or "0"
+            assert s == (s.lstrip("0") or "0")
 
     def test_negative_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="non-negative"):
@@ -69,11 +63,6 @@ class TestEncodeExpiresB36:
     def test_overflow_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="exceeds uint64"):
             encode_expires_b36(MAX_UINT64 + 1)
-
-
-# ============================================================
-# decode_expires_b36
-# ============================================================
 
 
 class TestDecodeExpiresB36:
@@ -124,11 +113,6 @@ class TestDecodeExpiresB36:
             decode_expires_b36("3w5e11264sgsg")  # MAX_UINT64 + 1 in base36
 
 
-# ============================================================
-# build_canonical_bytes
-# ============================================================
-
-
 class TestBuildCanonicalBytes:
     def test_basic_format(self) -> None:
         result = build_canonical_bytes("my-sandbox", 8080, "x2qxvk")
@@ -159,11 +143,6 @@ class TestBuildCanonicalBytes:
         (validation is the caller's responsibility via decode_expires_b36)."""
         result = build_canonical_bytes("s", 80, "")
         assert result == b"v1\nshort\ns\n80\n\n"
-
-
-# ============================================================
-# compute_hex8 / compute_signature
-# ============================================================
 
 
 class TestComputeHex8:
@@ -198,7 +177,6 @@ class TestComputeHex8:
         assert compute_hex8(secret, canonical) == expected_digest
 
     def test_empty_secret(self) -> None:
-        """Empty secret should still produce a valid hex8."""
         result = compute_hex8(b"", b"canonical")
         assert len(result) == 8
         assert all(c in "0123456789abcdef" for c in result)
@@ -218,7 +196,6 @@ class TestComputeSignature:
         assert sig[-1] == "k"
 
     def test_hex8_is_first_eight_of_digest(self) -> None:
-        """verify signature[:8] == compute_hex8(secret, canonical)."""
         secret, canonical = b"my-secret", b"v1\nshort\ns\n80\nabc\n"
         hex8 = compute_hex8(secret, canonical)
         sig = compute_signature(secret, "f", canonical)
@@ -230,15 +207,8 @@ class TestComputeSignature:
         assert sig == compute_hex8(b"secret", b"canonical") + key_id
 
 
-
-# ============================================================
-# Integration: end-to-end signing flow
-# ============================================================
-
-
 class TestEndToEndSigning:
     def test_sign_and_verify_flow(self) -> None:
-        """Verify the full signing pipeline: expires_b36 -> canonical -> signature."""
         sandbox_id = "my-sandbox"
         port = 8080
         expires_sec = 2000000000

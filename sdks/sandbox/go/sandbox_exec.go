@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,15 +16,22 @@ package opensandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
-// RunCommand executes a shell command and returns the structured result.
+// ErrIncompleteCommand indicates that a foreground command stream ended
+// without a completion or execution error event.
+var ErrIncompleteCommand = errors.New("opensandbox: foreground command stream ended without a terminal event")
+
+// RunCommand executes a foreground shell command using [Sandbox.RunCommandWithOpts].
 func (s *Sandbox) RunCommand(ctx context.Context, command string, handlers *ExecutionHandlers) (*Execution, error) {
 	return s.RunCommandWithOpts(ctx, RunCommandRequest{Command: command}, handlers)
 }
 
 // RunCommandWithOpts executes a command with full options.
+// If a foreground stream ends normally without a completion or execution error
+// event, it returns the result collected so far and [ErrIncompleteCommand].
 func (s *Sandbox) RunCommandWithOpts(ctx context.Context, req RunCommandRequest, handlers *ExecutionHandlers) (*Execution, error) {
 	if s.execd == nil {
 		return nil, fmt.Errorf("opensandbox: execd client not initialized")
@@ -34,10 +41,13 @@ func (s *Sandbox) RunCommandWithOpts(ctx context.Context, req RunCommandRequest,
 	err := s.execd.RunCommand(ctx, req, func(event StreamEvent) error {
 		return processStreamEvent(exec, event, handlers)
 	})
-	if err != nil {
-		return exec, err
+	if req.Background {
+		// Completion acknowledges startup, not the background process exit.
+		exec.ExitCode = nil
+	} else if err == nil && exec.Complete == nil && exec.Error == nil {
+		err = ErrIncompleteCommand
 	}
-	return exec, nil
+	return exec, err
 }
 
 // ExecuteCode executes code in a context and streams output via SSE.
@@ -46,6 +56,15 @@ func (s *Sandbox) ExecuteCode(ctx context.Context, req RunCodeRequest, handlers 
 		return nil, fmt.Errorf("opensandbox: execd client not initialized")
 	}
 	exec := &Execution{}
+	if req.Context != nil {
+		// An omitted language selects shell execution in execd, as do the
+		// explicit command modes. Keep their legacy line separators.
+		switch req.Context.Language {
+		case "", "command", "background-command":
+		default:
+			exec.codeExecution = true
+		}
+	}
 	err := s.execd.ExecuteCode(ctx, req, func(event StreamEvent) error {
 		return processStreamEvent(exec, event, handlers)
 	})

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,12 @@
 package pathutil
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -32,10 +34,10 @@ func envMapFromProcessAndOverrides(envOverrides map[string]string) map[string]st
 		if len(parts) != 2 {
 			continue
 		}
-		out[parts[0]] = parts[1]
+		out[EnvKey(parts[0])] = parts[1]
 	}
 	for k, v := range envOverrides {
-		out[k] = v
+		out[EnvKey(k)] = v
 	}
 	return out
 }
@@ -52,7 +54,7 @@ func validateEnvVars(path string, env map[string]string) error {
 		if name == "" {
 			name = m[2]
 		}
-		if _, ok := env[name]; !ok {
+		if _, ok := env[EnvKey(name)]; !ok {
 			missingSet[name] = struct{}{}
 		}
 	}
@@ -79,8 +81,16 @@ func ExpandPathWithEnv(path string, envOverrides map[string]string) (string, err
 		return "", err
 	}
 
-	expanded := os.Expand(path, func(key string) string {
-		return env[key]
+	// Substitute only the names validateEnvVars checked. os.Expand would also
+	// treat "$1", "$$", "$@" and "${}" as variables and drop them, so a path
+	// such as "Outer$1.class" would silently resolve to "Outer.class".
+	expanded := envVarPattern.ReplaceAllStringFunc(path, func(ref string) string {
+		m := envVarPattern.FindStringSubmatch(ref)
+		name := m[1]
+		if name == "" {
+			name = m[2]
+		}
+		return env[EnvKey(name)]
 	})
 	if expanded == "~" || strings.HasPrefix(expanded, "~/") || strings.HasPrefix(expanded, `~\`) {
 		home, err := os.UserHomeDir()
@@ -107,5 +117,18 @@ func ExpandAbsPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// filepath.Abs("") is the working directory, which no caller asked for.
+	if expanded == "" {
+		return "", errors.New("path is empty")
+	}
 	return filepath.Abs(expanded)
+}
+
+// EnvKey normalizes environment variable names for the current platform.
+// Windows names are case-insensitive; Unix names are preserved.
+func EnvKey(key string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToUpper(key)
+	}
+	return key
 }

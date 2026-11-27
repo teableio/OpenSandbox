@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,10 @@
 package com.alibaba.opensandbox.sandbox.domain.services
 
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.ContentReplaceEntry
+import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.ContentReplaceResult
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.EntryInfo
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.MoveEntry
+import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.ReadBytesResponse
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.SearchEntry
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.SetPermissionEntry
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.WriteEntry
@@ -38,7 +40,9 @@ interface Filesystem {
      *
      * @param path The absolute or relative path to the file to read
      * @param encoding Character encoding for the file content (default: UTF-8)
-     * @param range HTTP byte range to read (e.g., "bytes=0-1023").
+     * @param range HTTP byte range to read (e.g., "bytes=0-1023"). Mutually exclusive with offset/limit.
+     * @param offset Starting line number (1-based) for line-based reading. Mutually exclusive with range.
+     * @param limit Number of lines to return for line-based reading. Mutually exclusive with range.
      * @return The file content as a string
      * @throws SandboxException if the operation fails
      */
@@ -46,7 +50,20 @@ interface Filesystem {
         path: String,
         encoding: String = "UTF-8",
         range: String? = null,
+        offset: Int? = null,
+        limit: Int? = null,
     ): String
+
+    /**
+     * Backward-compatible overload for Java callers using positional args.
+     */
+    fun readFile(
+        path: String,
+        encoding: String,
+        range: String?,
+    ): String {
+        return readFile(path, encoding, range, null, null)
+    }
 
     /**
      * Convenience overload for reading a file as a string using UTF-8.
@@ -64,14 +81,28 @@ interface Filesystem {
      * Reads the content of a file as a byte array.
      *
      * @param path The absolute or relative path to the file to read
-     * @param range HTTP byte range to read (e.g., "bytes=0-1023").
+     * @param range HTTP byte range to read (e.g., "bytes=0-1023"). Mutually exclusive with offset/limit.
+     * @param offset Starting line number (1-based) for line-based reading. Mutually exclusive with range.
+     * @param limit Number of lines to return for line-based reading. Mutually exclusive with range.
      * @return The file content as a byte array
      * @throws SandboxException if the operation fails
      */
     fun readByteArray(
         path: String,
         range: String? = null,
+        offset: Int? = null,
+        limit: Int? = null,
     ): ByteArray
+
+    /**
+     * Backward-compatible overload for Java callers using positional args.
+     */
+    fun readByteArray(
+        path: String,
+        range: String?,
+    ): ByteArray {
+        return readByteArray(path, range, null, null)
+    }
 
     /**
      * Convenience overload for reading a file as a byte array.
@@ -86,17 +117,43 @@ interface Filesystem {
     }
 
     /**
+     * Reads a file as a byte array together with HTTP response metadata.
+     */
+    fun readByteArrayDetailed(
+        path: String,
+        range: String? = null,
+        offset: Int? = null,
+        limit: Int? = null,
+    ): ReadBytesResponse<ByteArray> {
+        throw UnsupportedOperationException("The filesystem adapter does not support download metadata")
+    }
+
+    /**
      * Opens a file for reading as an InputStream.
      *
      * @param path The absolute or relative path to the file to read
-     * @param range HTTP byte range to read (e.g., "bytes=0-1023").
+     * @param range HTTP byte range to read (e.g., "bytes=0-1023"). Mutually exclusive with offset/limit.
+     * @param offset Starting line number (1-based) for line-based reading. Mutually exclusive with range.
+     * @param limit Number of lines to return for line-based reading. Mutually exclusive with range.
      * @return An InputStream for reading the file content
      * @throws SandboxException if the operation fails
      */
     fun readStream(
         path: String,
         range: String? = null,
+        offset: Int? = null,
+        limit: Int? = null,
     ): InputStream
+
+    /**
+     * Backward-compatible overload for Java callers using positional args.
+     */
+    fun readStream(
+        path: String,
+        range: String?,
+    ): InputStream {
+        return readStream(path, range, null, null)
+    }
 
     /**
      * Convenience overload for opening a file stream.
@@ -108,6 +165,18 @@ interface Filesystem {
      */
     fun readStream(path: String): InputStream {
         return readStream(path, null)
+    }
+
+    /**
+     * Opens a file stream together with HTTP response metadata.
+     */
+    fun readStreamDetailed(
+        path: String,
+        range: String? = null,
+        offset: Int? = null,
+        limit: Int? = null,
+    ): ReadBytesResponse<InputStream> {
+        throw UnsupportedOperationException("The filesystem adapter does not support download metadata")
     }
 
     /**
@@ -166,6 +235,28 @@ interface Filesystem {
     fun deleteDirectories(paths: List<String>)
 
     /**
+     * Lists directory contents with optional depth control.
+     *
+     * @param path Directory path to list
+     * @param depth Optional maximum child depth to include. `null` lets the
+     *   server apply its default (currently 1 — immediate children only).
+     *   `0` returns an empty list. Larger values include descendants up to
+     *   that many levels below `path`.
+     * @return List of EntryInfo objects containing metadata for directory entries
+     * @throws SandboxException if the operation fails
+     */
+    fun listDirectory(
+        path: String,
+        depth: Int?,
+    ): List<EntryInfo>
+
+    /**
+     * Java-friendly overload of [listDirectory] that uses the server-side
+     * default depth (currently 1). Equivalent to `listDirectory(path, null)`.
+     */
+    fun listDirectory(path: String): List<EntryInfo> = listDirectory(path, null)
+
+    /**
      * Moves files from source to destination paths.
      *
      * @param entries List of MoveEntry objects specifying source and destination paths
@@ -190,6 +281,15 @@ interface Filesystem {
     fun replaceContents(entries: List<ContentReplaceEntry>)
 
     /**
+     * Replaces content in files and returns per-file replacement counts.
+     *
+     * @param entries List of ContentReplaceEntry objects specifying replacement operations
+     * @return List of ContentReplaceResult with replacement counts per file
+     * @throws SandboxException if the operation fails
+     */
+    fun replaceContentsDetailed(entries: List<ContentReplaceEntry>): List<ContentReplaceResult>
+
+    /**
      * Searches for files and directories based on the specified criteria.
      *
      * @param entry SearchEntry object containing search parameters and criteria
@@ -206,4 +306,25 @@ interface Filesystem {
      * @throws SandboxException if the operation fails
      */
     fun readFileInfo(paths: List<String>): Map<String, EntryInfo>
+}
+
+/** Filesystem capability for requests scoped to an explicit Linux identity. */
+interface IdentityFilesystem : Filesystem {
+    companion object {
+        const val MAX_IDENTITY_ID: Long = 4294967294L
+    }
+
+    /**
+     * Returns an independent filesystem client bound to explicit Linux credentials.
+     * Implementations must validate both IDs before issuing requests and must never
+     * fall back to the default identity when an identity operation is unsupported.
+     *
+     * @param uid User ID in 0..[MAX_IDENTITY_ID], inclusive
+     * @param gid Group ID in 0..[MAX_IDENTITY_ID], inclusive
+     * @throws IllegalArgumentException if either ID is outside the valid range
+     */
+    fun withIdentity(
+        uid: Long,
+        gid: Long,
+    ): Filesystem
 }

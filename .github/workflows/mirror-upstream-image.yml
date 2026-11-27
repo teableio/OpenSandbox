@@ -1,0 +1,156 @@
+name: Mirror upstream image
+
+# Copies an unmodified upstream OpenSandbox component image into the registries our
+# clusters pull from. Use it for components this fork does not change and therefore
+# does not build (the controller, image-committer, task-executor, egress), pinning
+# the source by the digest in the upstream release BOM (docs/releases/<version>.yaml).
+#
+#   GHCR  ghcr.io/teableio/opensandbox-<component>:<tag>
+#         skopeo copy --all: the multi-arch index keeps its upstream digest,
+#         attestation manifests included.
+#   ACR   registry.cn-shenzhen.aliyuncs.com/teable/opensandbox-<component>
+#         The Shenzhen ACR rejects attestation manifests, so each platform image is
+#         copied by digest to <tag>-<arch> and an amd64 + arm64 index is assembled at
+#         <tag>. This matches how the existing tags there (e.g. controller v0.2.0) look.
+#
+# Existing destination tags are never overwritten: pick a new tag instead.
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "Upstream component (docker.io/opensandbox/<component>)"
+        required: true
+        type: choice
+        options:
+          - controller
+          - image-committer
+          - task-executor
+          - egress
+      digest:
+        description: "Upstream index digest from the release BOM (sha256:...)"
+        required: true
+        type: string
+      tag:
+        description: "Destination tag (e.g. v1.3.0-rc.3)"
+        required: true
+        type: string
+      push_ghcr:
+        description: "Also push to GHCR (needs the package's Actions access to include this repo)"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      COMPONENT: ${{ inputs.component }}
+      DIGEST: ${{ inputs.digest }}
+      TAG: ${{ inputs.tag }}
+      PUSH_GHCR: ${{ inputs.push_ghcr }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::digest must be sha256:<64 hex>"; exit 1; }
+          [[ "${TAG}" =~ ^v[0-9A-Za-z][0-9A-Za-z.+-]*$ ]] || { echo "::error::tag must look like v1.3.0-rc.3"; exit 1; }
+          {
+            echo "SRC_REPO=docker.io/opensandbox/${COMPONENT}"
+            echo "GHCR_REPO=ghcr.io/teableio/opensandbox-${COMPONENT}"
+            echo "ACR_REPO=registry.cn-shenzhen.aliyuncs.com/teable/opensandbox-${COMPONENT}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        if: inputs.push_ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login Shenzhen ACR
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cn-shenzhen.aliyuncs.com
+          username: ${{ secrets.ALI_DOCKER_USERNAME }}
+          password: ${{ secrets.ALI_DOCKER_PASSWORD }}
+
+      - name: Resolve platform digests
+        run: |
+          set -euo pipefail
+          raw="$(skopeo inspect --raw "docker://${SRC_REPO}@${DIGEST}")"
+          for arch in amd64 arm64; do
+            d="$(jq -r --arg a "${arch}" '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == $a)][0].digest // empty' <<<"${raw}")"
+            [ -n "${d}" ] || { echo "::error::${SRC_REPO}@${DIGEST} has no linux/${arch} image"; exit 1; }
+            echo "DIGEST_${arch^^}=${d}" >> "${GITHUB_ENV}"
+            echo "linux/${arch}: ${d}"
+          done
+
+      - name: Refuse to overwrite existing tags
+        run: |
+          set -euo pipefail
+          targets=("${ACR_REPO}:${TAG}" "${ACR_REPO}:${TAG}-amd64" "${ACR_REPO}:${TAG}-arm64")
+          if [ "${PUSH_GHCR}" = "true" ]; then targets+=("${GHCR_REPO}:${TAG}"); fi
+          for ref in "${targets[@]}"; do
+            if skopeo inspect --raw "docker://${ref}" >/dev/null 2>&1; then
+              echo "::error::${ref} already exists; choose a new tag"
+              exit 1
+            fi
+          done
+
+      - name: Copy to GHCR (full index, upstream digest)
+        if: inputs.push_ghcr
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            skopeo copy --all --preserve-digests --retry-times 3 \
+              "docker://${SRC_REPO}@${DIGEST}" "docker://${GHCR_REPO}:${TAG}" && break
+            [ "$i" = 3 ] && exit 1
+            sleep 20
+          done
+
+      - name: Copy to Shenzhen ACR (per-platform images, then an amd64 + arm64 index)
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            var="DIGEST_${arch^^}"
+            for i in 1 2 3 4 5; do
+              skopeo copy --preserve-digests --retry-times 3 \
+                "docker://${SRC_REPO}@${!var}" "docker://${ACR_REPO}:${TAG}-${arch}" && break
+              [ "$i" = 5 ] && exit 1
+              sleep 30
+            done
+          done
+          docker buildx imagetools create -t "${ACR_REPO}:${TAG}" \
+            "${ACR_REPO}:${TAG}-amd64" "${ACR_REPO}:${TAG}-arm64"
+
+      - name: Verify platform digests
+        run: |
+          set -euo pipefail
+          refs=("${ACR_REPO}:${TAG}")
+          if [ "${PUSH_GHCR}" = "true" ]; then refs+=("${GHCR_REPO}:${TAG}"); fi
+          for ref in "${refs[@]}"; do
+            raw="$(skopeo inspect --raw "docker://${ref}")"
+            for arch in amd64 arm64; do
+              var="DIGEST_${arch^^}"
+              got="$(jq -r --arg a "${arch}" '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == $a)][0].digest // empty' <<<"${raw}")"
+              [ "${got}" = "${!var}" ] || { echo "::error::${ref} linux/${arch} is ${got:-missing}, expected ${!var}"; exit 1; }
+            done
+            echo "${ref}: linux/amd64 and linux/arm64 match upstream"
+          done
+          if [ "${PUSH_GHCR}" = "true" ]; then
+            # printf '%s' "$(...)" drops a trailing newline the CLI may print after the raw bytes.
+            index="$(printf '%s' "$(skopeo inspect --raw "docker://${GHCR_REPO}:${TAG}")" | sha256sum | awk '{print "sha256:"$1}')"
+            [ "${index}" = "${DIGEST}" ] || { echo "::error::GHCR index digest ${index} differs from upstream ${DIGEST}"; exit 1; }
+            echo "${GHCR_REPO}:${TAG}: index digest matches upstream ${DIGEST}"
+          fi

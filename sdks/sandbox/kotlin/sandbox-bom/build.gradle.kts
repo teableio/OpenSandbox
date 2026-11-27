@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,11 +23,12 @@ dependencies {
         api(project(":sandbox"))
         api(project(":sandbox-api"))
         api(project(":sandbox-pool-redis"))
+        api(project(":code-interpreter"))
 
         api(libs.kotlin.stdlib)
         api(libs.okhttp)
         api(libs.okhttp.logging)
-        api(libs.kotlinx.serialization.json)
         api(libs.slf4j.api)
+        api(libs.opentelemetry.api)
     }
 }

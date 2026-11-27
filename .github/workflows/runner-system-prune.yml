@@ -5,6 +5,9 @@ permissions:
 
 on:
   workflow_dispatch:
+  schedule:
+    # Every Monday 01:00 (UTC+8) = Sunday 17:00 UTC
+    - cron: '0 17 * * 0'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,6 +16,9 @@ concurrency:
 jobs:
   system-prune:
     name: Runner system prune
+    # Upstream's runner fleet only: forks run schedules on their default
+    # branch, and this must not prune Docker on anyone else's runners.
+    if: github.repository == 'opensandbox-group/OpenSandbox'
     runs-on: self-hosted
     strategy:
       fail-fast: false

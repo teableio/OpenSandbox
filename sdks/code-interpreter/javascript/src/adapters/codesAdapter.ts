@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import type { ExecdClient, ExecdPaths } from "@alibaba-group/opensandbox/internal";
+import { inferExecutionExitCode } from "@alibaba-group/opensandbox/internal";
 import type { ServerStreamEvent } from "@alibaba-group/opensandbox";
 import type { Execution, ExecutionHandlers } from "@alibaba-group/opensandbox";
 import {
@@ -123,11 +124,26 @@ export class CodesAdapter implements Codes {
     throwOnOpenApiFetchError({ error, response }, "Delete code contexts failed");
   }
 
-  async interrupt(contextId: string): Promise<void> {
+  async interrupt(executionId: string): Promise<void> {
+    // The query id targets an *execution* session id (mirrors the Python
+    // SDK's interrupt(execution_id)); passing a context id yields a 500
+    // "no such session" error from execd.
+    if (!executionId?.trim()) {
+      throw new InvalidArgumentException({ message: "executionId cannot be empty" });
+    }
     const { error, response } = await this.client.DELETE("/code", {
-      params: { query: { id: contextId } },
+      params: { query: { id: executionId } },
     });
     throwOnOpenApiFetchError({ error, response }, "Interrupt code failed");
+  }
+
+  async ping(signal?: AbortSignal): Promise<boolean> {
+    const { error, response } = await this.client.GET("/ping", {
+      parseAs: "text",
+      signal,
+    });
+    throwOnOpenApiFetchError({ error, response }, "Execd ping failed");
+    return true;
   }
 
   async *runStream(req: ApiRunCodeRequest, signal?: AbortSignal): AsyncIterable<ServerStreamEvent> {
@@ -157,8 +173,12 @@ export class CodesAdapter implements Codes {
       throw new InvalidArgumentException({ message: "Code cannot be empty" });
     }
 
-    if (opts.context && opts.language) {
-      throw new InvalidArgumentException({ message: "Provide either opts.context or opts.language, not both" });
+    // Only a *mismatch* is an error (aligned with the Python SDK); a matching
+    // pair is accepted and the context wins.
+    if (opts.context && opts.language && opts.context.language !== opts.language) {
+      throw new InvalidArgumentException({
+        message: `language '${opts.language}' must match context.language '${opts.context.language}'`,
+      });
     }
 
     const context: CodeContext =
@@ -182,6 +202,7 @@ export class CodesAdapter implements Codes {
     for await (const ev of this.runStream(req, opts.signal)) {
       await dispatcher.dispatch(ev as any);
     }
+    execution.exitCode = inferExecutionExitCode(execution);
 
     return execution;
   }

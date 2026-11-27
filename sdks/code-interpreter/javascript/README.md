@@ -1,6 +1,5 @@
 # Alibaba Code Interpreter SDK for JavaScript/TypeScript
 
-English | [中文](README_zh.md)
 
 A TypeScript/JavaScript SDK for executing code in secure, isolated sandboxes. It provides a high-level API for running Python, Java, Go, TypeScript, and other languages safely, with support for code execution contexts.
 
@@ -8,7 +7,7 @@ A TypeScript/JavaScript SDK for executing code in secure, isolated sandboxes. It
 
 This SDK requires a Docker image containing the Code Interpreter runtime environment. You must use the `opensandbox/code-interpreter` image (or a derivative) which includes pre-installed runtimes for Python, Java, Go, Node.js, etc.
 
-For detailed information about supported languages and versions, please refer to the [Environment Documentation](../../../sandboxes/code-interpreter/README.md).
+For detailed information about supported languages and versions, please refer to the [Environment Documentation](https://github.com/opensandbox-group/sandbox-images).
 
 ## Installation
 
@@ -49,8 +48,8 @@ const config = new ConnectionConfig({
 // 2. Create a Sandbox with the code-interpreter image + runtime versions
 const sandbox = await Sandbox.create({
   connectionConfig: config,
-  image: "opensandbox/code-interpreter:v1.0.2",
-  entrypoint: ["/opt/opensandbox/code-interpreter.sh"],
+  image: "opensandbox/code-interpreter:v1.1.0",
+  entrypoint: ["/opt/code-interpreter/code-interpreter.sh"],
   env: {
     PYTHON_VERSION: "3.11",
     JAVA_VERSION: "17",
@@ -99,8 +98,8 @@ You can specify the desired version of a programming language by setting the cor
 ```ts
 const sandbox = await Sandbox.create({
   connectionConfig: config,
-  image: "opensandbox/code-interpreter:v1.0.2",
-  entrypoint: ["/opt/opensandbox/code-interpreter.sh"],
+  image: "opensandbox/code-interpreter:v1.1.0",
+  entrypoint: ["/opt/code-interpreter/code-interpreter.sh"],
   env: {
     JAVA_VERSION: "17",
     GO_VERSION: "1.24",
@@ -112,8 +111,7 @@ const sandbox = await Sandbox.create({
 
 ### 0. Run with `language` (default language context)
 
-If you don't need to manage explicit context IDs, you can run code by specifying only `language`.
-When `context.id` is omitted, execd can create/reuse a default session for that language, so state can persist across runs.
+If you don't need to manage explicit context IDs, you can run code by specifying only `language`. When `context.id` is omitted, execd can create/reuse a default session for that language, so state can persist across runs.
 
 ```ts
 import { SupportedLanguages } from "@alibaba-group/opensandbox-code-interpreter";

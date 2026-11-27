@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using System.Linq;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace OpenSandbox.Models;
@@ -107,10 +109,25 @@ public class NetworkRule
     public required NetworkRuleAction Action { get; set; }
 
     /// <summary>
-    /// Gets or sets the FQDN or wildcard domain (e.g., "example.com", "*.example.com").
+    /// Gets or sets the FQDN, wildcard domain (e.g., "example.com", "*.example.com"), IP,
+    /// or CIDR. May be null when <see cref="Ports"/> is set; otherwise required. A domain
+    /// target combined with ports is rejected by the server/sidecar (domain rules are
+    /// evaluated at the DNS layer, which has no port dimension). The API codec serializes a
+    /// blank target as omitted (the rule degrades to port-only, matching server
+    /// normalization) — the model itself stores the value as given.
     /// </summary>
     [JsonPropertyName("target")]
-    public required string Target { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Target { get; set; }
+
+    /// <summary>
+    /// Gets or sets the TCP destination ports (1-65535, at most 256 per rule, no duplicates —
+    /// enforced server-side) this rule is restricted to. When <see cref="Target"/> is null,
+    /// the rule applies to these ports across all IPv4/IPv6 destinations.
+    /// </summary>
+    [JsonPropertyName("ports")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<int>? Ports { get; set; }
 }
 
 /// <summary>
@@ -129,6 +146,532 @@ public class NetworkPolicy
     /// </summary>
     [JsonPropertyName("egress")]
     public List<NetworkRule>? Egress { get; set; }
+}
+
+/// <summary>
+/// Credential Vault proxy startup settings.
+/// </summary>
+public class CredentialProxyConfig
+{
+    /// <summary>
+    /// Gets or sets whether transparent MITM support for Credential Vault injection is enabled.
+    /// </summary>
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; }
+}
+
+/// <summary>
+/// Write-only Credential Vault credential source. Exactly one variant is set,
+/// selected by <see cref="Type"/>: inline material via <see cref="Value"/>, or
+/// a header-resolver endpoint via <see cref="Endpoint"/> (OSEP-0025 exchange).
+/// The egress rejects sources that mix or omit both.
+/// </summary>
+public class CredentialSource
+{
+    /// <summary>
+    /// Gets or sets the credential source type: "inline" or "exchange". Defaults to "inline".
+    /// </summary>
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "inline";
+
+    /// <summary>
+    /// Gets or sets the inline credential value. Required when <see cref="Type"/> is "inline";
+    /// must be absent otherwise. Write-only: never present in vault read responses.
+    /// </summary>
+    [JsonPropertyName("value")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Value { get; set; }
+
+    /// <summary>
+    /// Gets or sets the header-resolver endpoint (unix:///path or https://host[:port]).
+    /// Required when <see cref="Type"/> is "exchange"; must be absent otherwise.
+    /// Endpoint is configuration, not secret material.
+    /// </summary>
+    [JsonPropertyName("endpoint")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Endpoint { get; set; }
+
+    /// <summary>
+    /// Creates an inline credential source carrying write-only secret material.
+    /// </summary>
+    public static CredentialSource Inline(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new ArgumentException("Credential source value cannot be blank.", nameof(value));
+        }
+
+        return new CredentialSource { Type = "inline", Value = value };
+    }
+
+    /// <summary>
+    /// Creates an exchange credential source (OSEP-0025) resolved per request
+    /// from the header-resolver endpoint.
+    /// </summary>
+    public static CredentialSource Exchange(string endpoint)
+    {
+        if (string.IsNullOrWhiteSpace(endpoint))
+        {
+            throw new ArgumentException("Credential source endpoint cannot be blank.", nameof(endpoint));
+        }
+
+        return new CredentialSource { Type = "exchange", Endpoint = endpoint };
+    }
+}
+
+/// <summary>
+/// Write-only inline credential material for Credential Vault; the flat
+/// <see cref="CredentialSource"/> model with the "inline" default.
+/// </summary>
+public class InlineCredentialSource : CredentialSource
+{
+}
+
+/// <summary>
+/// Exchange credential source (OSEP-0025): no local material. The egress
+/// resolves header sets per request from the header-resolver endpoint;
+/// the endpoint is configuration, not secret material.
+/// </summary>
+public class ExchangeCredentialSource : CredentialSource
+{
+    /// <summary>
+    /// Initializes an exchange source; <see cref="CredentialSource.Type"/> defaults to "exchange".
+    /// </summary>
+    public ExchangeCredentialSource()
+    {
+        Type = "exchange";
+    }
+
+    /// <summary>
+    /// Initializes an exchange source with the given header-resolver endpoint.
+    /// </summary>
+    public ExchangeCredentialSource(string endpoint)
+    {
+        if (string.IsNullOrWhiteSpace(endpoint))
+        {
+            throw new ArgumentException("Credential source endpoint cannot be blank.", nameof(endpoint));
+        }
+
+        Type = "exchange";
+        Endpoint = endpoint;
+    }
+}
+
+/// <summary>
+/// Sandbox-local Credential Vault credential.
+/// </summary>
+public class Credential
+{
+    /// <summary>
+    /// Gets or sets the sandbox-local credential name.
+    /// </summary>
+    [JsonPropertyName("name")]
+    public required string Name { get; set; }
+
+    /// <summary>
+    /// Gets or sets the write-only credential source (inline material or exchange endpoint).
+    /// </summary>
+    [JsonPropertyName("source")]
+    public required CredentialSource Source { get; set; }
+}
+
+/// <summary>
+/// Request match for a Credential Vault binding.
+/// </summary>
+public class CredentialMatch
+{
+    /// <summary>
+    /// Gets or sets the request schemes to match.
+    /// </summary>
+    [JsonPropertyName("schemes")]
+    public IReadOnlyList<string>? Schemes { get; set; }
+
+    /// <summary>
+    /// Deprecated: ignored, port is derived from scheme.
+    /// </summary>
+    [JsonPropertyName("ports")]
+    [Obsolete("Ports is ignored; port is derived from Schemes (https→443, http→80).")]
+    public IReadOnlyList<int>? Ports { get; set; }
+
+    /// <summary>
+    /// Gets or sets exact FQDNs or leftmost-label wildcards.
+    /// </summary>
+    [JsonPropertyName("hosts")]
+    public required IReadOnlyList<string> Hosts { get; set; }
+
+    /// <summary>
+    /// Gets or sets the HTTP methods to match.
+    /// </summary>
+    [JsonPropertyName("methods")]
+    public IReadOnlyList<string>? Methods { get; set; }
+
+    /// <summary>
+    /// Gets or sets the request paths to match.
+    /// </summary>
+    [JsonPropertyName("paths")]
+    public IReadOnlyList<string>? Paths { get; set; }
+}
+
+/// <summary>
+/// Custom header injection entry.
+/// </summary>
+public class CustomHeaderEntry
+{
+    /// <summary>
+    /// Gets or sets the header name.
+    /// </summary>
+    [JsonPropertyName("name")]
+    public required string Name { get; set; }
+
+    /// <summary>
+    /// Gets or sets the credential name used as the header value.
+    /// </summary>
+    [JsonPropertyName("credential")]
+    public required string Credential { get; set; }
+}
+
+/// <summary>
+/// Scoped placeholder substitution entry.
+/// </summary>
+public class CredentialSubstitution
+{
+    /// <summary>
+    /// Gets or sets the credential name used as the replacement value.
+    /// </summary>
+    [JsonPropertyName("credential")]
+    public required string Credential { get; set; }
+
+    /// <summary>
+    /// Gets or sets the literal placeholder to replace.
+    /// </summary>
+    [JsonPropertyName("placeholder")]
+    public required string Placeholder { get; set; }
+
+    /// <summary>
+    /// Gets or sets the request surfaces where replacement may occur.
+    /// </summary>
+    [JsonPropertyName("in")]
+    public required IReadOnlyList<string> In { get; set; }
+}
+
+/// <summary>
+/// Credential Vault auth rule. <see cref="Type"/> selects one of the five
+/// static kinds (bearer, basic, apiKey, customHeaders, passthrough); leaving
+/// it null selects the typeless exchange form (OSEP-0025), which carries only
+/// a credential reference to an exchange-sourced credential. The egress
+/// rejects shapes mixing the two.
+/// </summary>
+public class CredentialAuth
+{
+    /// <summary>
+    /// Gets or sets the auth rule type: bearer, basic, apiKey, customHeaders, or passthrough.
+    /// Leave unset for the typeless exchange form; a null type is never serialized.
+    /// </summary>
+    [JsonPropertyName("type")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Type { get; set; }
+
+    /// <summary>
+    /// Gets or sets the referenced credential name for bearer, basic, apiKey,
+    /// or the typeless exchange form.
+    /// </summary>
+    [JsonPropertyName("credential")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Credential { get; set; }
+
+    /// <summary>
+    /// Gets or sets the API key header or query parameter name.
+    /// </summary>
+    [JsonPropertyName("name")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Name { get; set; }
+
+    /// <summary>
+    /// Gets or sets custom header injection entries.
+    /// </summary>
+    [JsonPropertyName("headers")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<CustomHeaderEntry>? Headers { get; set; }
+
+    /// <summary>
+    /// Gets or sets scoped placeholder substitutions for matching requests.
+    /// </summary>
+    [JsonPropertyName("substitutions")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<CredentialSubstitution>? Substitutions { get; set; }
+
+    /// <summary>
+    /// Creates the typeless exchange auth form (OSEP-0025): only a credential
+    /// reference to an exchange-sourced credential.
+    /// </summary>
+    public static CredentialAuth Exchange(string credential)
+    {
+        if (string.IsNullOrWhiteSpace(credential))
+        {
+            throw new ArgumentException("The typeless exchange auth form requires a credential reference.", nameof(credential));
+        }
+
+        return new CredentialAuth { Credential = credential };
+    }
+}
+
+/// <summary>
+/// Sandbox-local Credential Vault binding.
+/// </summary>
+public class CredentialBinding
+{
+    /// <summary>
+    /// Gets or sets the sandbox-local binding name.
+    /// </summary>
+    [JsonPropertyName("name")]
+    public required string Name { get; set; }
+
+    /// <summary>
+    /// Gets or sets the request match.
+    /// </summary>
+    [JsonPropertyName("match")]
+    public required CredentialMatch Match { get; set; }
+
+    /// <summary>
+    /// Gets or sets the auth injection rule.
+    /// </summary>
+    [JsonPropertyName("auth")]
+    public required CredentialAuth Auth { get; set; }
+}
+
+/// <summary>
+/// Sanitized credential metadata returned by Credential Vault.
+/// </summary>
+public class CredentialMetadata
+{
+    /// <summary>
+    /// Gets or sets the credential name.
+    /// </summary>
+    [JsonPropertyName("name")]
+    public required string Name { get; set; }
+
+    /// <summary>
+    /// Gets or sets the credential source kind ("inline" or "exchange");
+    /// source material never rides this model.
+    /// </summary>
+    [JsonPropertyName("sourceType")]
+    public required string SourceType { get; set; }
+
+    /// <summary>
+    /// Gets or sets the credential revision.
+    /// </summary>
+    [JsonPropertyName("revision")]
+    public int Revision { get; set; }
+}
+
+/// <summary>
+/// Sanitized auth metadata returned for a Credential Vault binding. Static
+/// kinds carry <see cref="Type"/> (plus <see cref="Name"/> for apiKey); the
+/// typeless exchange form carries only <see cref="Credential"/>, a credential
+/// reference (never material). A null type is never serialized.
+/// </summary>
+public class CredentialAuthMetadata
+{
+    /// <summary>
+    /// Gets or sets the auth rule type; null for the typeless exchange form.
+    /// </summary>
+    [JsonPropertyName("type")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Type { get; set; }
+
+    /// <summary>
+    /// Gets or sets the API key header or query parameter name when applicable.
+    /// </summary>
+    [JsonPropertyName("name")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Name { get; set; }
+
+    /// <summary>
+    /// Gets or sets the exchange-sourced credential reference, typeless form only.
+    /// </summary>
+    [JsonPropertyName("credential")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Credential { get; set; }
+}
+
+/// <summary>
+/// Sanitized binding metadata returned by Credential Vault.
+/// </summary>
+public class CredentialBindingMetadata
+{
+    /// <summary>
+    /// Gets or sets the binding name.
+    /// </summary>
+    [JsonPropertyName("name")]
+    public required string Name { get; set; }
+
+    /// <summary>
+    /// Gets or sets the binding revision.
+    /// </summary>
+    [JsonPropertyName("revision")]
+    public int Revision { get; set; }
+
+    /// <summary>
+    /// Gets or sets the sanitized request match.
+    /// </summary>
+    [JsonPropertyName("match")]
+    public CredentialMatch? Match { get; set; }
+
+    /// <summary>
+    /// Gets or sets the sanitized auth metadata.
+    /// </summary>
+    [JsonPropertyName("auth")]
+    public CredentialAuthMetadata? Auth { get; set; }
+}
+
+/// <summary>
+/// Sanitized Credential Vault state.
+/// </summary>
+public class CredentialVaultState
+{
+    /// <summary>
+    /// Gets or sets the vault revision.
+    /// </summary>
+    [JsonPropertyName("revision")]
+    public int Revision { get; set; }
+
+    /// <summary>
+    /// Gets or sets sanitized credential metadata.
+    /// </summary>
+    [JsonPropertyName("credentials")]
+    public required IReadOnlyList<CredentialMetadata> Credentials { get; set; }
+
+    /// <summary>
+    /// Gets or sets sanitized binding metadata.
+    /// </summary>
+    [JsonPropertyName("bindings")]
+    public required IReadOnlyList<CredentialBindingMetadata> Bindings { get; set; }
+}
+
+/// <summary>
+/// Sanitized Credential Vault credential list response.
+/// </summary>
+public class CredentialListResponse
+{
+    /// <summary>
+    /// Gets or sets the vault revision.
+    /// </summary>
+    [JsonPropertyName("revision")]
+    public int Revision { get; set; }
+
+    /// <summary>
+    /// Gets or sets sanitized credential metadata.
+    /// </summary>
+    [JsonPropertyName("credentials")]
+    public required IReadOnlyList<CredentialMetadata> Credentials { get; set; }
+}
+
+/// <summary>
+/// Sanitized Credential Vault binding list response.
+/// </summary>
+public class CredentialBindingListResponse
+{
+    /// <summary>
+    /// Gets or sets the vault revision.
+    /// </summary>
+    [JsonPropertyName("revision")]
+    public int Revision { get; set; }
+
+    /// <summary>
+    /// Gets or sets sanitized binding metadata.
+    /// </summary>
+    [JsonPropertyName("bindings")]
+    public required IReadOnlyList<CredentialBindingMetadata> Bindings { get; set; }
+}
+
+/// <summary>
+/// Initial Credential Vault creation request.
+/// </summary>
+public class CredentialVaultCreateRequest
+{
+    /// <summary>
+    /// Gets or sets credentials to create.
+    /// </summary>
+    [JsonPropertyName("credentials")]
+    public required IReadOnlyList<Credential> Credentials { get; set; }
+
+    /// <summary>
+    /// Gets or sets bindings to create.
+    /// </summary>
+    [JsonPropertyName("bindings")]
+    public required IReadOnlyList<CredentialBinding> Bindings { get; set; }
+}
+
+/// <summary>
+/// Atomic credential mutation set for Credential Vault patch.
+/// </summary>
+public class CredentialMutationSet
+{
+    /// <summary>
+    /// Gets or sets credentials to add.
+    /// </summary>
+    [JsonPropertyName("add")]
+    public IReadOnlyList<Credential>? Add { get; set; }
+
+    /// <summary>
+    /// Gets or sets credentials to replace.
+    /// </summary>
+    [JsonPropertyName("replace")]
+    public IReadOnlyList<Credential>? Replace { get; set; }
+
+    /// <summary>
+    /// Gets or sets credential names to delete.
+    /// </summary>
+    [JsonPropertyName("delete")]
+    public IReadOnlyList<string>? Delete { get; set; }
+}
+
+/// <summary>
+/// Atomic binding mutation set for Credential Vault patch.
+/// </summary>
+public class CredentialBindingMutationSet
+{
+    /// <summary>
+    /// Gets or sets bindings to add.
+    /// </summary>
+    [JsonPropertyName("add")]
+    public IReadOnlyList<CredentialBinding>? Add { get; set; }
+
+    /// <summary>
+    /// Gets or sets bindings to replace.
+    /// </summary>
+    [JsonPropertyName("replace")]
+    public IReadOnlyList<CredentialBinding>? Replace { get; set; }
+
+    /// <summary>
+    /// Gets or sets binding names to delete.
+    /// </summary>
+    [JsonPropertyName("delete")]
+    public IReadOnlyList<string>? Delete { get; set; }
+}
+
+/// <summary>
+/// Credential Vault patch request.
+/// </summary>
+public class CredentialVaultPatchRequest
+{
+    /// <summary>
+    /// Gets or sets the optional optimistic concurrency guard.
+    /// </summary>
+    [JsonPropertyName("expectedRevision")]
+    public int? ExpectedRevision { get; set; }
+
+    /// <summary>
+    /// Gets or sets credential mutations.
+    /// </summary>
+    [JsonPropertyName("credentials")]
+    public CredentialMutationSet? Credentials { get; set; }
+
+    /// <summary>
+    /// Gets or sets binding mutations.
+    /// </summary>
+    [JsonPropertyName("bindings")]
+    public CredentialBindingMutationSet? Bindings { get; set; }
 }
 
 /// <summary>
@@ -163,7 +706,8 @@ public class PVC
     public bool? CreateIfNotExists { get; set; }
 
     /// <summary>
-    /// Gets or sets whether auto-created Docker volumes should be removed on sandbox deletion.
+    /// Gets or sets whether the auto-created volume (Docker named volume or Kubernetes PVC)
+    /// should be removed on sandbox deletion. Pre-existing volumes are never removed.
     /// </summary>
     [JsonPropertyName("deleteOnSandboxTermination")]
     public bool? DeleteOnSandboxTermination { get; set; }
@@ -303,6 +847,30 @@ public class SandboxStatus
 }
 
 /// <summary>
+/// Runtime-confirmed Pool allocation for a sandbox.
+/// </summary>
+public class AllocationSummary
+{
+    /// <summary>
+    /// Gets or sets the confirmed allocation mode. Currently, this is "pool".
+    /// </summary>
+    [JsonPropertyName("mode")]
+    public required string Mode { get; set; }
+
+    /// <summary>
+    /// Gets or sets the concrete Pool reference allocated to the sandbox.
+    /// </summary>
+    [JsonPropertyName("poolRef")]
+    public required string PoolRef { get; set; }
+
+    /// <summary>
+    /// Gets or sets the confirmed allocation state. Currently, this is "allocated".
+    /// </summary>
+    [JsonPropertyName("state")]
+    public required string State { get; set; }
+}
+
+/// <summary>
 /// Information about a sandbox.
 /// </summary>
 public class SandboxInfo
@@ -338,6 +906,12 @@ public class SandboxInfo
     public IReadOnlyDictionary<string, string>? Metadata { get; set; }
 
     /// <summary>
+    /// Gets or sets opaque extension data returned by the server.
+    /// </summary>
+    [JsonPropertyName("extensions")]
+    public IReadOnlyDictionary<string, string>? Extensions { get; set; }
+
+    /// <summary>
     /// Gets or sets the sandbox status.
     /// </summary>
     [JsonPropertyName("status")]
@@ -348,6 +922,12 @@ public class SandboxInfo
     /// </summary>
     [JsonPropertyName("platform")]
     public PlatformSpec? Platform { get; set; }
+
+    /// <summary>
+    /// Gets or sets the current runtime-confirmed Pool allocation, when available.
+    /// </summary>
+    [JsonPropertyName("allocation")]
+    public AllocationSummary? Allocation { get; set; }
 
     /// <summary>
     /// Gets or sets the sandbox creation time.
@@ -394,6 +974,15 @@ public class CreateSandboxRequest
     public string? SnapshotId { get; set; }
 
     /// <summary>
+    /// Gets or sets the fsb (fast-sandbox) template to create the sandbox from.
+    /// Mutually exclusive with <see cref="Image"/> and <see cref="SnapshotId"/>; in template
+    /// mode the workload shape is fixed by the template's golden image, so workload-shaping
+    /// fields are rejected (400), and <see cref="Timeout"/> is required.
+    /// </summary>
+    [JsonPropertyName("templateId")]
+    public string? TemplateId { get; set; }
+
+    /// <summary>
     /// Gets or sets the entrypoint command.
     /// </summary>
     [JsonPropertyName("entrypoint")]
@@ -407,9 +996,17 @@ public class CreateSandboxRequest
 
     /// <summary>
     /// Gets or sets the resource limits.
+    /// Must be omitted in template mode (the template's golden image fixes the workload shape).
     /// </summary>
     [JsonPropertyName("resourceLimits")]
-    public required IReadOnlyDictionary<string, string> ResourceLimits { get; set; }
+    public IReadOnlyDictionary<string, string>? ResourceLimits { get; set; }
+
+    /// <summary>
+    /// Gets or sets the resource requests (guaranteed minimums).
+    /// When set, enables Kubernetes Burstable QoS (requests &lt; limits).
+    /// </summary>
+    [JsonPropertyName("resourceRequests")]
+    public IReadOnlyDictionary<string, string>? ResourceRequests { get; set; }
 
     /// <summary>
     /// Gets or sets the environment variables.
@@ -430,10 +1027,22 @@ public class CreateSandboxRequest
     public IReadOnlyDictionary<string, string>? Metadata { get; set; }
 
     /// <summary>
+    /// Gets or sets optional lifecycle hooks applied during sandbox creation.
+    /// </summary>
+    [JsonPropertyName("lifecycle")]
+    public SandboxLifecycle? Lifecycle { get; set; }
+
+    /// <summary>
     /// Gets or sets the network policy.
     /// </summary>
     [JsonPropertyName("networkPolicy")]
     public NetworkPolicy? NetworkPolicy { get; set; }
+
+    /// <summary>
+    /// Gets or sets optional Credential Vault proxy startup settings.
+    /// </summary>
+    [JsonPropertyName("credentialProxy")]
+    public CredentialProxyConfig? CredentialProxy { get; set; }
 
     /// <summary>
     /// Gets or sets an optional platform constraint for sandbox provisioning.
@@ -452,6 +1061,322 @@ public class CreateSandboxRequest
     /// </summary>
     [JsonPropertyName("extensions")]
     public IReadOnlyDictionary<string, object>? Extensions { get; set; }
+}
+
+/// <summary>
+/// Command executed before the sandbox entrypoint starts.
+/// </summary>
+public class LifecycleHook
+{
+    /// <summary>
+    /// Gets or sets the command and arguments to execute.
+    /// </summary>
+    [JsonPropertyName("command")]
+    public required IReadOnlyList<string> Command { get; set; }
+
+    /// <summary>
+    /// Gets or sets the execution timeout in seconds. The maximum is 3 hours (10800 seconds).
+    /// </summary>
+    [JsonPropertyName("timeoutSeconds")]
+    public int? TimeoutSeconds { get; set; }
+}
+
+/// <summary>
+/// Named command scheduled while the sandbox is running.
+/// </summary>
+public class PeriodicLifecycleHook
+{
+    /// <summary>
+    /// Gets or sets the name unique among periodic hooks in this sandbox.
+    /// </summary>
+    [JsonPropertyName("name")]
+    public required string Name { get; set; }
+
+    /// <summary>
+    /// Gets or sets the cron expression or descriptor.
+    /// </summary>
+    [JsonPropertyName("schedule")]
+    public required string Schedule { get; set; }
+
+    /// <summary>
+    /// Gets or sets the command and arguments to execute.
+    /// </summary>
+    [JsonPropertyName("command")]
+    public required IReadOnlyList<string> Command { get; set; }
+
+    /// <summary>
+    /// Gets or sets the execution timeout in seconds. The maximum is 300 seconds.
+    /// </summary>
+    [JsonPropertyName("timeoutSeconds")]
+    public int? TimeoutSeconds { get; set; }
+}
+
+/// <summary>
+/// Action taken at the idle threshold. Only <see cref="OnIdleAction.Pause"/>
+/// exists today; the enum keeps future actions additive.
+/// </summary>
+[JsonConverter(typeof(OnIdleActionJsonConverter))]
+public enum OnIdleAction
+{
+    /// <summary>Auto-pause the sandbox when the idle threshold is reached.</summary>
+    Pause
+}
+
+/// <summary>
+/// Serializes <see cref="OnIdleAction"/> as the wire-format string ("pause").
+/// <see cref="JsonStringEnumConverter"/> cannot express per-member wire names
+/// through attributes, so the mapping is explicit; extend this converter when
+/// a new idle action ships.
+/// </summary>
+public sealed class OnIdleActionJsonConverter : JsonConverter<OnIdleAction>
+{
+    /// <inheritdoc />
+    public override OnIdleAction Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var text = reader.GetString();
+        return text switch
+        {
+            "pause" => OnIdleAction.Pause,
+            _ => throw new JsonException($"Unknown idle action: {text}")
+        };
+    }
+
+    /// <inheritdoc />
+    public override void Write(Utf8JsonWriter writer, OnIdleAction value, JsonSerializerOptions options)
+    {
+        writer.WriteStringValue(value switch
+        {
+            OnIdleAction.Pause => "pause",
+            _ => throw new JsonException($"Unknown idle action: {value}")
+        });
+    }
+}
+
+/// <summary>
+/// Application-declared activity probe (OSEP-0024).
+/// <para>
+/// Endpoint inside the sandbox that answers <c>{"active": bool, "message"?: string}</c>
+/// with 200 while work is in progress. When the sandbox is otherwise idle, the
+/// server issues <c>GET Path</c> on <c>Port</c>; a busy answer counts as activity
+/// and resets the idle clock, while an explicit "not active", any failure, or a
+/// timeout records nothing.
+/// </para>
+/// </summary>
+public class ActivityProbe
+{
+    private int? _timeoutSeconds;
+
+    /// <summary>
+    /// Gets or sets the sandbox port serving the probe endpoint (1-65535).
+    /// </summary>
+    [JsonPropertyName("port")]
+    public required int Port { get; set; }
+
+    /// <summary>
+    /// Gets or sets the absolute HTTP path of the probe endpoint. Must start
+    /// with "/" and must not contain whitespace or control characters.
+    /// </summary>
+    [JsonPropertyName("path")]
+    public required string Path { get; set; }
+
+    /// <summary>
+    /// Gets or sets the probe request budget in seconds (1-10). The server
+    /// defaults to 2 when omitted.
+    /// </summary>
+    [JsonPropertyName("timeoutSeconds")]
+    public int? TimeoutSeconds
+    {
+        get => _timeoutSeconds;
+        set
+        {
+            if (value is < 1 or > 10)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(value),
+                    value,
+                    "Activity probe TimeoutSeconds must be between 1 and 10.");
+            }
+            _timeoutSeconds = value;
+        }
+    }
+}
+
+/// <summary>
+/// Idle behavior declared by the sandbox (OSEP-0024, fast-sandbox only).
+/// <para>
+/// With <see cref="IdleTimeoutSeconds"/>, the sandbox is auto-paused after that
+/// many seconds without ingress-observed activity. Without it, the policy is
+/// wake-only: the sandbox is never auto-paused, but a (manually) paused sandbox
+/// wakes on access. Omitting the whole policy preserves non-automated behavior
+/// exactly.
+/// </para>
+/// </summary>
+public class IdlePolicy
+{
+    /// <summary>
+    /// Gets or sets the idle threshold X in seconds (30-86400): the sandbox is
+    /// auto-paused after X continuously idle seconds. Required together with
+    /// <see cref="OnIdle"/>; absent together with it means a wake-only policy.
+    /// </summary>
+    [JsonPropertyName("idleTimeoutSeconds")]
+    public int? IdleTimeoutSeconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets the action taken at the idle threshold. Only
+    /// <see cref="OnIdleAction.Pause"/> exists today. Required with, and only
+    /// valid with, <see cref="IdleTimeoutSeconds"/>.
+    /// </summary>
+    [JsonPropertyName("onIdle")]
+    public OnIdleAction? OnIdle { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether incoming traffic may wake the
+    /// sandbox from Paused. Defaults to true when omitted.
+    /// </summary>
+    [JsonPropertyName("wakeOnAccess")]
+    public bool? WakeOnAccess { get; set; }
+
+    /// <summary>
+    /// Gets or sets the application-declared activity probe (relevant only
+    /// with auto-pause). Requires <see cref="IdleTimeoutSeconds"/>.
+    /// </summary>
+    [JsonPropertyName("activeProbe")]
+    public ActivityProbe? ActiveProbe { get; set; }
+
+    /// <summary>
+    /// Validates the policy against the server's create-time rules so invalid
+    /// policies fail fast client-side.
+    /// </summary>
+    public void Validate()
+    {
+        var hasTimeout = IdleTimeoutSeconds.HasValue;
+        if (IdleTimeoutSeconds is < 30 or > 86400)
+        {
+            throw new ArgumentException(
+                "IdlePolicy.IdleTimeoutSeconds must be between 30 and 86400.",
+                nameof(IdleTimeoutSeconds));
+        }
+        if (OnIdle.HasValue && !hasTimeout)
+        {
+            throw new InvalidOperationException(
+                "IdlePolicy.OnIdle must be omitted when IdleTimeoutSeconds is omitted " +
+                "(a policy without a timeout is wake-only).");
+        }
+        if (!OnIdle.HasValue && hasTimeout)
+        {
+            throw new InvalidOperationException(
+                "IdlePolicy.OnIdle is required when IdleTimeoutSeconds is set.");
+        }
+        if (ActiveProbe != null && !hasTimeout)
+        {
+            throw new InvalidOperationException(
+                "IdlePolicy.ActiveProbe requires IdleTimeoutSeconds; the probe is relevant only with auto-pause.");
+        }
+        if (ActiveProbe != null)
+        {
+            var probe = ActiveProbe;
+            if (probe.Port < 1 || probe.Port > 65535)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(ActiveProbe),
+                    probe.Port,
+                    "ActivityProbe.Port must be between 1 and 65535.");
+            }
+            if (string.IsNullOrEmpty(probe.Path))
+            {
+                throw new ArgumentException(
+                    "ActivityProbe.Path must be a non-empty absolute HTTP path.",
+                    nameof(ActiveProbe));
+            }
+            if (probe.Path.Length > 512)
+            {
+                throw new ArgumentException(
+                    "ActivityProbe.Path must not exceed 512 characters.",
+                    nameof(ActiveProbe));
+            }
+            if (!probe.Path.StartsWith("/", StringComparison.Ordinal))
+            {
+                throw new ArgumentException(
+                    "ActivityProbe.Path must be an absolute HTTP path starting with '/'.",
+                    nameof(ActiveProbe));
+            }
+            if (probe.Path.Any(c => char.IsWhiteSpace(c) || c < 0x20 || c == 0x7f))
+            {
+                throw new ArgumentException(
+                    "ActivityProbe.Path must not contain whitespace or control characters.",
+                    nameof(ActiveProbe));
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Renew-on-access behavior (OSEP-0009): observed access moves the expiration
+/// to <c>max(now + ExtendSeconds, current)</c>. Control-plane policy;
+/// supersedes the deprecated <c>extensions["access.renew.extend.seconds"]</c> key.
+/// <para>
+/// Honored by the docker and Kubernetes (pod) backends; the fast-sandbox
+/// backend rejects it with HTTP 400. Fires only when the server enables
+/// <c>[renew_intent]</c>.
+/// </para>
+/// </summary>
+public class RenewalPolicy
+{
+    /// <summary>
+    /// Gets or sets the extension window X in seconds (300-86400) for each
+    /// access-driven renewal.
+    /// </summary>
+    [JsonPropertyName("extendSeconds")]
+    public int ExtendSeconds { get; set; }
+
+    /// <summary>
+    /// Validates the policy against the server's create-time rules so invalid
+    /// policies fail fast client-side.
+    /// </summary>
+    public void Validate()
+    {
+        if (ExtendSeconds is < 300 or > 86400)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ExtendSeconds),
+                ExtendSeconds,
+                "RenewalPolicy.ExtendSeconds must be between 300 and 86400.");
+        }
+    }
+}
+
+/// <summary>
+/// Optional lifecycle configuration applied during sandbox creation.
+/// </summary>
+public class SandboxLifecycle
+{
+    /// <summary>
+    /// Gets or sets the hook executed before the sandbox entrypoint starts.
+    /// </summary>
+    [JsonPropertyName("preStart")]
+    public LifecycleHook? PreStart { get; set; }
+
+    /// <summary>
+    /// Gets or sets hooks scheduled while the sandbox is running.
+    /// </summary>
+    [JsonPropertyName("periodic")]
+    public IReadOnlyList<PeriodicLifecycleHook>? Periodic { get; set; }
+
+    /// <summary>
+    /// Gets or sets the auto-pause and wake-on-access behavior (OSEP-0024).
+    /// Supported only by the fast-sandbox backend; other backends reject the
+    /// field. Control-plane policy: it never reaches the guest.
+    /// </summary>
+    [JsonPropertyName("idlePolicy")]
+    public IdlePolicy? IdlePolicy { get; set; }
+
+    /// <summary>
+    /// Gets or sets the renew-on-access behavior (OSEP-0009). Control-plane
+    /// policy; supersedes the deprecated
+    /// <c>extensions["access.renew.extend.seconds"]</c> key.
+    /// </summary>
+    [JsonPropertyName("renewalPolicy")]
+    public RenewalPolicy? RenewalPolicy { get; set; }
 }
 
 /// <summary>
@@ -482,6 +1407,12 @@ public class CreateSandboxResponse
     /// </summary>
     [JsonPropertyName("metadata")]
     public IReadOnlyDictionary<string, string>? Metadata { get; set; }
+
+    /// <summary>
+    /// Gets or sets opaque extension data returned by the server.
+    /// </summary>
+    [JsonPropertyName("extensions")]
+    public IReadOnlyDictionary<string, string>? Extensions { get; set; }
 
     /// <summary>
     /// Gets or sets the sandbox expiration time.
@@ -521,6 +1452,27 @@ public class SnapshotStatus
 }
 
 /// <summary>
+/// Known snapshot modes: what a snapshot persists.
+/// </summary>
+public static class SnapshotModes
+{
+    /// <summary>
+    /// The most complete capture the runtime supports: memory and process state on the fast-sandbox
+    /// backend (restoring resumes in place); filesystem-only on Docker and Kubernetes (processes are
+    /// not restored there). This is the server default and what snapshots created before the mode
+    /// field existed report.
+    /// </summary>
+    public const string Full = "full";
+
+    /// <summary>
+    /// Only the writable filesystem. Restoring boots a fresh sandbox from the disk — the entrypoint
+    /// re-runs, and resume moves from milliseconds to seconds. Requires the fast-sandbox backend;
+    /// other backends reject the mode before any capture starts.
+    /// </summary>
+    public const string RootfsOnly = "rootfsOnly";
+}
+
+/// <summary>
 /// Information about a snapshot.
 /// </summary>
 public class SnapshotInfo
@@ -533,6 +1485,12 @@ public class SnapshotInfo
 
     [JsonPropertyName("name")]
     public string? Name { get; set; }
+
+    /// <summary>
+    /// Artifact class of the snapshot. Snapshots created before this field existed report "full".
+    /// </summary>
+    [JsonPropertyName("mode")]
+    public string Mode { get; set; } = SnapshotModes.Full;
 
     [JsonPropertyName("status")]
     public required SnapshotStatus Status { get; set; }
@@ -548,6 +1506,13 @@ public class CreateSnapshotRequest
 {
     [JsonPropertyName("name")]
     public string? Name { get; set; }
+
+    /// <summary>
+    /// What the snapshot persists: see <see cref="SnapshotModes"/>. Leave null to let the server
+    /// apply its default ("full") — the field stays off the wire for servers that predate it.
+    /// </summary>
+    [JsonPropertyName("mode")]
+    public string? Mode { get; set; }
 }
 
 /// <summary>
@@ -648,6 +1613,7 @@ public class ListSnapshotsResponse
 public class ListSnapshotsParams
 {
     public string? SandboxId { get; set; }
+    public string? Name { get; set; }
     public IReadOnlyList<string>? States { get; set; }
     public int? Page { get; set; }
     public int? PageSize { get; set; }
@@ -693,6 +1659,14 @@ public class Endpoint
     /// </summary>
     [JsonPropertyName("headers")]
     public IReadOnlyDictionary<string, string> Headers { get; set; } = new Dictionary<string, string>();
+
+    /// <summary>
+    /// Gets or sets the origin of the sandbox taken from the server's
+    /// OPEN-SANDBOX-ORIGIN response header (see <see cref="SandboxOrigin"/>).
+    /// Null when the server does not send it.
+    /// </summary>
+    [JsonIgnore]
+    public string? Origin { get; set; }
 }
 
 /// <summary>
@@ -739,4 +1713,34 @@ public static class SandboxStates
     /// Sandbox is in an error state.
     /// </summary>
     public const string Error = "Error";
+}
+
+/// <summary>
+/// Origin backing a sandbox.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The protocol defines a single origin value: <see cref="Template"/> (reported by
+/// the server via the OPEN-SANDBOX-ORIGIN response header, and set locally when the
+/// sandbox was explicitly created from a template). Anything else - including
+/// sandboxes created from an image or a snapshot - carries no origin value.
+/// </para>
+/// <para>
+/// The server may introduce new values in future versions; clients should handle
+/// unknown string values gracefully.
+/// </para>
+/// </remarks>
+public static class SandboxOrigin
+{
+    /// <summary>
+    /// Runs on a fsb golden-image template (no sandbox-side egress sidecar;
+    /// egress policy goes through the lifecycle control plane).
+    /// </summary>
+    public const string Template = "template";
+
+    /// <summary>
+    /// The origin could not be determined (create from an image or snapshot,
+    /// or an older server that does not send the header).
+    /// </summary>
+    public const string Unknown = "unknown";
 }

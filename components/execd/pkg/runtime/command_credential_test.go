@@ -1,4 +1,7 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+//go:build !windows
+// +build !windows
+
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +15,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !windows
-// +build !windows
-
 package runtime
 
 import (
+	"errors"
 	"os"
-	"os/user"
-	"strconv"
 	"syscall"
 	"testing"
 
@@ -28,118 +27,86 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func u32(v int) *uint32 {
-	x := uint32(v)
-	return &x
-}
-
-func TestBuildCredential_NilWhenUnset(t *testing.T) {
+func TestBuildCredential_NilIdentityReturnsNil(t *testing.T) {
 	cred, err := buildCredential(nil, nil)
-
 	require.NoError(t, err)
 	assert.Nil(t, cred)
 }
 
-func TestBuildCredential_NilWhenRequestingCurrentIdentity(t *testing.T) {
-	// Asking to run as the user we already are is a no-op switch. Returning a
-	// Credential here would make the child call setgroups(2), which needs
-	// CAP_SETGID — unavailable to an unprivileged sandbox container.
-	//
-	// The expectation follows the actual group relationship rather than
-	// assuming it: on a host where this user's NSS groups are not all held by
-	// the test process, the explicit path is the correct answer.
-	uid, gid := os.Getuid(), os.Getgid()
-	current, err := os.Getgroups()
-	require.NoError(t, err)
-	nssGroups := nssGroupsFor(t, uid)
+// Explicit ids matching the identity execd already runs as must stay on the
+// plain exec path: a non-nil Credential makes the child call setgroups even
+// when every id matches, and setgroups requires CAP_SETGID regardless of the
+// requested values (#1802).
+func TestBuildCredential_SameIdentityReturnsNil(t *testing.T) {
+	uid := uint32(os.Getuid())
+	gid := uint32(os.Getgid())
 
-	cred, err := buildCredential(u32(uid), u32(gid))
+	cred, err := buildCredential(&uid, &gid)
 	require.NoError(t, err)
+	assert.Nil(t, cred, "explicit current uid+gid must not produce a credential")
 
-	if groupsAreSubset(nssGroups, current, uint32(gid)) {
-		assert.Nil(t, cred, "identity is fully covered by ours; the child should inherit it")
+	cred, err = buildCredential(nil, &gid)
+	require.NoError(t, err)
+	assert.Nil(t, cred, "explicit current gid must not produce a credential")
+
+	// uid-only: the switch is skipped only when the user entry resolves to
+	// the daemon's own groups; otherwise the credential machinery still runs
+	// (the request asks for that user's primary GID and supplemental groups).
+	cred, err = buildCredential(&uid, nil)
+	require.NoError(t, err)
+	if sameProcessGroups(uid) {
+		assert.Nil(t, cred, "uid-only current identity with matching groups must not produce a credential")
 	} else {
-		assert.NotNil(t, cred, "a group we do not hold must not be silently dropped")
+		require.NotNil(t, cred)
+		assert.Equal(t, uid, cred.Uid)
 	}
 }
 
-func nssGroupsFor(t *testing.T, uid int) []uint32 {
-	t.Helper()
-	u, err := user.LookupId(strconv.Itoa(uid))
-	if err != nil {
-		return nil
-	}
-	ids, err := u.GroupIds()
-	if err != nil {
-		return nil
-	}
-	groups := make([]uint32, 0, len(ids))
-	for _, id := range ids {
-		g, err := strconv.ParseUint(id, 10, 32)
-		require.NoError(t, err)
-		groups = append(groups, uint32(g))
-	}
-	return groups
+func TestSameProcessGroupsCurrentUID(t *testing.T) {
+	// The daemon's own uid must resolve to its own primary GID in any sane
+	// environment (root container: root/0/0; dev laptop: the logged-in user).
+	assert.True(t, sameProcessGroups(uint32(os.Getuid())))
+
+	// An unknown uid never matches.
+	assert.False(t, sameProcessGroups(4294967294))
 }
 
-func TestBuildCredential_SetWhenRequestingDifferentIdentity(t *testing.T) {
-	otherUID := os.Getuid() + 1
+func TestBuildCredential_IdentitySwitchBuildsCredential(t *testing.T) {
+	otherUID := uint32(4294967294) // max-1; not a real login uid in practice
+	if otherUID == uint32(os.Getuid()) {
+		otherUID-- // paranoia: never collide with the real current uid
+	}
+	otherGID := otherUID - 1
 
-	cred, err := buildCredential(u32(otherUID), u32(os.Getgid()))
-
+	cred, err := buildCredential(&otherUID, &otherGID)
 	require.NoError(t, err)
-	require.NotNil(t, cred, "a real identity change must still switch credentials")
-	assert.Equal(t, uint32(otherUID), cred.Uid)
-}
+	require.NotNil(t, cred)
+	assert.Equal(t, otherUID, cred.Uid)
+	assert.Equal(t, otherGID, cred.Gid)
 
-func TestBuildCredential_SetWhenOnlyGidDiffers(t *testing.T) {
-	otherGID := os.Getgid() + 1
-
-	cred, err := buildCredential(u32(os.Getuid()), u32(otherGID))
-
+	// uid only: credential is built even if the user entry is unknown
+	cred, err = buildCredential(&otherUID, nil)
 	require.NoError(t, err)
-	require.NotNil(t, cred, "a group-only change must still switch credentials")
-	assert.Equal(t, uint32(otherGID), cred.Gid)
+	require.NotNil(t, cred)
+	assert.Equal(t, otherUID, cred.Uid)
 }
 
-func TestCredentialIsCurrentProcess(t *testing.T) {
-	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+func TestCredentialStartHint(t *testing.T) {
+	cred := &syscall.Credential{Uid: 1000, Gid: 1000}
+	permErr := &os.PathError{Op: "fork/exec", Path: "/usr/bin/bash", Err: syscall.EPERM}
 
-	assert.True(t, credentialIsCurrentProcess(&syscall.Credential{Uid: uid, Gid: gid}))
-	assert.False(t, credentialIsCurrentProcess(&syscall.Credential{Uid: uid + 1, Gid: gid}))
-	assert.False(t, credentialIsCurrentProcess(&syscall.Credential{Uid: uid, Gid: gid + 1}))
-}
+	hinted := credentialStartHint(permErr, cred)
+	require.ErrorIs(t, hinted, os.ErrPermission)
+	assert.Contains(t, hinted.Error(), "CAP_SETUID")
+	assert.Contains(t, hinted.Error(), "drop_capabilities")
+	assert.Contains(t, hinted.Error(), "uid=1000")
 
-func TestCredentialIsCurrentProcess_GroupsWeDoNotHold(t *testing.T) {
-	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
-	current, err := os.Getgroups()
-	require.NoError(t, err)
+	same := credentialStartHint(permErr, nil)
+	assert.Equal(t, permErr, same)
 
-	unheld := uint32(gid + 4242)
-	for _, g := range current {
-		if uint32(g) == unheld {
-			t.Skip("picked group is actually held; skipping to stay deterministic")
-		}
-	}
+	otherErr := &os.PathError{Op: "fork/exec", Path: "/usr/bin/bash", Err: syscall.ENOENT}
+	assert.Equal(t, otherErr, credentialStartHint(otherErr, cred))
 
-	// Inheriting would silently drop a group the caller asked for.
-	assert.False(t, credentialIsCurrentProcess(
-		&syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{unheld}}))
-}
-
-func TestGroupsAreSubset(t *testing.T) {
-	const primary = uint32(1000)
-
-	// Equal sets — the production case (image NSS groups match the runtime's).
-	assert.True(t, groupsAreSubset([]uint32{1000}, []int{1000}, primary))
-	// Primary gid counts as held even when getgroups(2) omits it, and as
-	// requested even when the caller omits it.
-	assert.True(t, groupsAreSubset([]uint32{1000}, []int{}, primary))
-	assert.True(t, groupsAreSubset(nil, []int{1000}, primary))
-	// Extra groups we hold (e.g. pod-level supplementalGroups) are fine.
-	assert.True(t, groupsAreSubset([]uint32{1000}, []int{1000, 2000}, primary))
-	// A requested group we do not hold must not be inherited away.
-	assert.False(t, groupsAreSubset([]uint32{1000, 3000}, []int{1000}, primary))
-	// Defensive: a negative gid from the platform is never treated as held.
-	assert.False(t, groupsAreSubset([]uint32{7}, []int{-1}, primary))
+	assert.NoError(t, credentialStartHint(nil, cred))
+	assert.True(t, errors.Is(hinted, syscall.EPERM))
 }

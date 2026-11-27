@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
 package scheduler
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -40,6 +42,78 @@ func (m mockLogger) WithValues(keysAndValues ...interface{}) logr.LogSink      {
 func (m mockLogger) WithName(name string) logr.LogSink                         { return m }
 
 var testLogger = logr.New(mockLogger{})
+
+type deadlineRecordingTaskClient struct {
+	hasDeadline bool
+	deadline    time.Time
+}
+
+func (c *deadlineRecordingTaskClient) Set(ctx context.Context, task *api.Task) (*api.Task, error) {
+	c.deadline, c.hasDeadline = ctx.Deadline()
+	return task, nil
+}
+
+func (c *deadlineRecordingTaskClient) Get(context.Context) (*api.Task, error) {
+	return nil, nil
+}
+
+func TestSetTaskUsesPreStartHookTimeoutForDeadline(t *testing.T) {
+	timeoutSeconds := int64(30)
+	client := &deadlineRecordingTaskClient{}
+
+	_, err := setTask(client, &api.Task{
+		Name: "slow-prestart",
+		Process: &api.Process{
+			Command: []string{"echo", "main"},
+			Lifecycle: &api.ProcessLifecycle{
+				PreStart: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"sleep", "20"},
+					},
+					TimeoutSeconds: &timeoutSeconds,
+				},
+			},
+		},
+	}, testLogger)
+
+	if err != nil {
+		t.Fatalf("setTask returned error: %v", err)
+	}
+	if !client.hasDeadline {
+		t.Fatal("setTask should pass a deadline-bound context")
+	}
+	if remaining := time.Until(client.deadline); remaining < 25*time.Second {
+		t.Fatalf("setTask deadline = %v from now, want at least the preStart hook timeout", remaining)
+	}
+}
+
+func TestSetTaskUsesFallbackDeadlineWhenPreStartHookHasNoTimeout(t *testing.T) {
+	client := &deadlineRecordingTaskClient{}
+
+	_, err := setTask(client, &api.Task{
+		Name: "unbounded-prestart",
+		Process: &api.Process{
+			Command: []string{"echo", "main"},
+			Lifecycle: &api.ProcessLifecycle{
+				PreStart: &api.LifecycleHandler{
+					Exec: &api.ExecAction{
+						Command: []string{"sleep", "20"},
+					},
+				},
+			},
+		},
+	}, testLogger)
+
+	if err != nil {
+		t.Fatalf("setTask returned error: %v", err)
+	}
+	if !client.hasDeadline {
+		t.Fatalf("setTask should apply a fallback deadline to an unbounded preStart hook")
+	}
+	if remaining := time.Until(client.deadline); remaining < 30*time.Minute-defaultTimeout {
+		t.Fatalf("setTask deadline = %v from now, want the fallback preStart timeout", remaining)
+	}
+}
 
 func Test_scheduleSingleTaskNode(t *testing.T) {
 	ctl := gomock.NewController(t)
@@ -315,6 +389,7 @@ func Test_assignTaskNodes(t *testing.T) {
 }
 
 func Test_refreshFreePods(t *testing.T) {
+	deletingSince := metav1.Now()
 	tests := []struct {
 		name          string
 		allPods       []*corev1.Pod
@@ -396,7 +471,7 @@ func Test_refreshFreePods(t *testing.T) {
 			expectedNames: []string{},
 		},
 		{
-			name: "pods without IP addresses",
+			name: "pods without IP addresses or marked for deletion are not free",
 			allPods: []*corev1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "pod-1"},
@@ -405,6 +480,10 @@ func Test_refreshFreePods(t *testing.T) {
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "pod-2"},
 					Status:     corev1.PodStatus{PodIP: ""},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "pod-3", DeletionTimestamp: &deletingSince},
+					Status:     corev1.PodStatus{PodIP: "1.1.1.3"},
 				},
 			},
 			taskNodes: []*taskNode{
@@ -422,6 +501,48 @@ func Test_refreshFreePods(t *testing.T) {
 			},
 			expectedFree:  0,
 			expectedNames: []string{},
+		},
+		{
+			name: "pods explicitly marked NotReady are not free",
+			allPods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "pod-ready"},
+					Status:     corev1.PodStatus{PodIP: "1.1.1.1"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "pod-notready"},
+					Status: corev1.PodStatus{
+						PodIP: "1.1.1.2",
+						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+						},
+					},
+				},
+				{
+					// ConditionUnknown means the node is degraded or partitioned
+					// (lease expired, probe undetermined) while the pod may still
+					// hold its IP: kubelet's own verdict, so the pod is blocked.
+					ObjectMeta: metav1.ObjectMeta{Name: "pod-ready-unknown"},
+					Status: corev1.PodStatus{
+						PodIP: "1.1.1.3",
+						Conditions: []corev1.PodCondition{
+							{Type: corev1.PodReady, Status: corev1.ConditionUnknown},
+						},
+					},
+				},
+				{
+					// No PodReady condition at all: readiness simply has not been
+					// observed, which is not a verdict, so the pod stays free.
+					// This is deliberate.
+					ObjectMeta: metav1.ObjectMeta{Name: "pod-unobserved-readiness"},
+					Status:     corev1.PodStatus{PodIP: "1.1.1.4"},
+				},
+			},
+			taskNodes: []*taskNode{
+				{ObjectMeta: metav1.ObjectMeta{Name: "task-1"}},
+			},
+			expectedFree:  2,
+			expectedNames: []string{"pod-ready", "pod-unobserved-readiness"},
 		},
 	}
 
@@ -628,23 +749,27 @@ func Test_collectTaskStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create mock task status collector
 			mockCollector := NewMocktaskStatusCollector(ctl)
 			if len(tt.expectedCollectIPs) > 0 {
-				mockCollector.EXPECT().Collect(gomock.Any(), tt.expectedCollectIPs).Return(tt.mockReturnTasks).Times(1)
+				mockCollector.EXPECT().Collect(gomock.Any(), tt.expectedCollectIPs).Return(tt.mockReturnTasks, nil).Times(1)
 			}
 
-			// Create scheduler with mock collector
 			sch := &defaultTaskScheduler{
 				taskNodes:           tt.taskNodes,
 				taskStatusCollector: mockCollector,
 				logger:              testLogger,
 			}
+			for _, node := range tt.taskNodes {
+				if node.IP != "" {
+					sch.allPods = append(sch.allPods, &corev1.Pod{
+						ObjectMeta: metav1.ObjectMeta{Name: node.PodName, UID: node.PodUID},
+						Status:     corev1.PodStatus{PodIP: node.IP},
+					})
+				}
+			}
 
-			// Call collectTaskStatus
 			sch.collectTaskStatus(tt.taskNodes)
 
-			// Verify results
 			for i, expectedNode := range tt.expectedTaskNodes {
 				actualNode := tt.taskNodes[i]
 
@@ -690,6 +815,128 @@ func Test_collectTaskStatus(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func Test_collectTaskStatus_queryFailure(t *testing.T) {
+	runningTask := &api.Task{
+		Name: "task-1",
+		ProcessStatus: &api.ProcessStatus{
+			Running: &api.Running{StartedAt: metav1.Now()},
+		},
+	}
+	pod := func(name, ip string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status:     corev1.PodStatus{PodIP: ip},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		allPods    []*corev1.Pod
+		wantStatus *api.Task
+	}{
+		{
+			name:       "pod still exists; keep last known status",
+			allPods:    []*corev1.Pod{pod("pod-1", "1.1.1.1")},
+			wantStatus: runningTask,
+		},
+		{
+			name:       "pod is gone; treat task as deleted",
+			allPods:    nil,
+			wantStatus: nil,
+		},
+		{
+			name:       "pod recreated with a new IP; treat task as deleted",
+			allPods:    []*corev1.Pod{pod("pod-1", "2.2.2.2")},
+			wantStatus: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctl := gomock.NewController(t)
+			mockCollector := NewMocktaskStatusCollector(ctl)
+			if tt.wantStatus != nil {
+				mockCollector.EXPECT().Collect(gomock.Any(), []string{"1.1.1.1"}).
+					Return(map[string]*api.Task{}, errors.New("timeout")).Times(1)
+			}
+
+			tNode := &taskNode{
+				ObjectMeta: metav1.ObjectMeta{Name: "task-1"},
+				IP:         "1.1.1.1",
+				PodName:    "pod-1",
+				Status:     runningTask,
+				tState:     RunningTaskState,
+			}
+			sch := &defaultTaskScheduler{
+				allPods:             tt.allPods,
+				taskStatusCollector: mockCollector,
+				logger:              testLogger,
+			}
+
+			sch.collectTaskStatus([]*taskNode{tNode})
+
+			if tNode.Status != tt.wantStatus {
+				t.Errorf("Status = %v, want %v", tNode.Status, tt.wantStatus)
+			}
+			wantState := RunningTaskState
+			if tt.wantStatus == nil {
+				wantState = FailedTaskState
+				if !tNode.IsResourceReleased() {
+					t.Error("missing pod's task must be released without a query")
+				}
+			}
+			if tNode.tState != wantState {
+				t.Errorf("tState = %v, want %v", tNode.tState, wantState)
+			}
+		})
+	}
+}
+
+// A failed status query while a task is being released must not mark it
+// released: the executor still has to be told to stop the task.
+func Test_defaultTaskScheduler_ScheduleKeepsReleasingOnQueryFailure(t *testing.T) {
+	ctl := gomock.NewController(t)
+	mockCollector := NewMocktaskStatusCollector(ctl)
+	mockCollector.EXPECT().Collect(gomock.Any(), []string{"1.1.1.1"}).
+		Return(map[string]*api.Task{}, errors.New("timeout")).Times(1)
+	mockClient := NewMocktaskClient(ctl)
+	mockClient.EXPECT().Set(gomock.Any(), nil).Return(nil, nil).Times(1)
+
+	tNode := &taskNode{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "task-1",
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+		},
+		IP:      "1.1.1.1",
+		PodName: "pod-1",
+		Status: &api.Task{
+			Name: "task-1",
+			ProcessStatus: &api.ProcessStatus{
+				Running: &api.Running{StartedAt: metav1.Now()},
+			},
+		},
+		tState: RunningTaskState,
+		sState: stateReleasing,
+	}
+	sch := &defaultTaskScheduler{
+		allPods: []*corev1.Pod{{
+			ObjectMeta: metav1.ObjectMeta{Name: "pod-1"},
+			Status:     corev1.PodStatus{PodIP: "1.1.1.1"},
+		}},
+		taskNodes:           []*taskNode{tNode},
+		maxConcurrency:      1,
+		taskStatusCollector: mockCollector,
+		taskClientCreator:   func(string) taskClient { return mockClient },
+		logger:              testLogger,
+	}
+
+	if err := sch.Schedule(); err != nil {
+		t.Fatalf("Schedule() error = %v", err)
+	}
+	if tNode.sState != stateReleasing {
+		t.Errorf("sState = %q, want %q", tNode.sState, stateReleasing)
 	}
 }
 
@@ -1068,10 +1315,8 @@ func Test_scheduleTaskNodes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create mock task clients for each pod IP and task node
 			mockClients := make(map[string]*MocktaskClient)
 
-			// Create task client creator function that returns mock clients
 			taskClientCreator := func(ip string) taskClient {
 				if mockClient, ok := mockClients[ip]; ok {
 					return mockClient
@@ -1081,7 +1326,6 @@ func Test_scheduleTaskNodes(t *testing.T) {
 				return mockClient
 			}
 
-			// Set expectations for Set calls
 			for ip, expectedTask := range tt.expectedSetCalls {
 				mockClient := mockClients[ip]
 				if mockClient == nil {
@@ -1091,7 +1335,6 @@ func Test_scheduleTaskNodes(t *testing.T) {
 				mockClient.EXPECT().Set(gomock.Any(), expectedTask).Return(expectedTask, nil).Times(1)
 			}
 
-			// Create scheduler
 			sch := &defaultTaskScheduler{
 				taskNodes:         tt.taskNodes,
 				freePods:          tt.freePods,
@@ -1099,16 +1342,22 @@ func Test_scheduleTaskNodes(t *testing.T) {
 				taskClientCreator: taskClientCreator,
 				logger:            testLogger,
 			}
+			sch.allPods = append(sch.allPods, tt.freePods...)
+			for _, node := range tt.taskNodes {
+				if node.IP != "" {
+					sch.allPods = append(sch.allPods, &corev1.Pod{
+						ObjectMeta: metav1.ObjectMeta{Name: node.PodName, UID: node.PodUID},
+						Status:     corev1.PodStatus{PodIP: node.IP},
+					})
+				}
+			}
 
-			// Call scheduleTaskNodes
 			err := sch.scheduleTaskNodes()
 
-			// Verify no error
 			if err != nil {
 				t.Errorf("scheduleTaskNodes() error = %v, want nil", err)
 			}
 
-			// Verify results
 			for i, expectedNode := range tt.expectedTaskNodes {
 				actualNode := tt.taskNodes[i]
 
@@ -1125,7 +1374,6 @@ func Test_scheduleTaskNodes(t *testing.T) {
 				}
 			}
 
-			// Verify remaining free pods
 			if len(sch.freePods) != tt.expectedRemainingFreePods {
 				t.Errorf("scheduleTaskNodes() remaining freePods length = %v, want %v", len(sch.freePods), tt.expectedRemainingFreePods)
 			}

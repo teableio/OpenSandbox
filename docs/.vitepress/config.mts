@@ -1,48 +1,443 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import { defineConfig } from "vitepress";
-import { loadManifest } from "./scripts/docs-manifest.mjs";
+import { withMermaid } from "vitepress-plugin-mermaid";
 
-const manifest = loadManifest();
-const docsBase = process.env.DOCS_BASE || "/";
+const sdkSidebar = [
+  {
+    text: "Sandbox SDKs",
+    collapsed: false,
+    items: [
+      { text: "Overview", link: "/sdks/" },
+      { text: "Python", link: "/sdks/python" },
+      { text: "JavaScript", link: "/sdks/javascript" },
+      { text: "Kotlin / Java", link: "/sdks/kotlin" },
+      { text: "Go", link: "/sdks/go" },
+      { text: "C#", link: "/sdks/csharp" },
+    ],
+  },
+  {
+    text: "SDK Features",
+    items: [
+      { text: "Client Pool", link: "/guides/client-pool" },
+      { text: "Observability", link: "/sdks/observability" },
+    ],
+  },
+  {
+    text: "CLI",
+    items: [{ text: "CLI Reference", link: "/cli/" }],
+  },
+  {
+    text: "MCP",
+    collapsed: false,
+    items: [{ text: "MCP Server", link: "/sdks/mcp" }],
+  },
+];
 
-export default defineConfig({
+export default withMermaid(defineConfig({
   title: "OpenSandbox",
-  description: "OpenSandbox documentation site for users and developers",
-  head: [["link", { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }]],
+  description: "Universal Sandbox Infrastructure for AI Applications",
   cleanUrls: true,
   lastUpdated: true,
-  base: docsBase,
-  ignoreDeadLinks: [/^https?:\/\/localhost/, /\/README$/, /\/index$/, "./contributing"],
-  srcExclude: ["node_modules/**", "README_zh.md", "RELEASE_NOTE_TEMPLATE.md"],
-  rewrites: manifest.rewrites,
+  base: process.env.DOCS_BASE || "/",
+  ignoreDeadLinks: [/^https?:\/\/localhost/],
+  // Release notes (docs/releases/*) are GitHub Release bodies referenced
+  // verbatim by the umbrella release workflow — not docs-site pages.
+  srcExclude: ["README.md", "releases/**"],
+
+  head: [
+    ["link", { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
+    [
+      "meta",
+      { property: "og:title", content: "OpenSandbox Documentation" },
+    ],
+    [
+      "meta",
+      {
+        property: "og:description",
+        content: "Universal Sandbox Infrastructure for AI Applications",
+      },
+    ],
+  ],
+
   themeConfig: {
-    logo: "/assets/logo.svg",
+    logo: "/images/logo.svg",
+    siteTitle: "OpenSandbox",
+
+    nav: [
+      { text: "Getting Started", link: "/getting-started/" },
+      { text: "Architecture", link: "/architecture/" },
+      { text: "Guides", link: "/guides/" },
+      {
+        text: "Reference",
+        items: [
+          { text: "SDKs", link: "/sdks/" },
+          { text: "API Specs", link: "/api/" },
+          { text: "CLI", link: "/cli/" },
+          { text: "Deployment", link: "/deployment/" },
+          { text: "Migration Guides", link: "/reference/execd-path-migration" },
+        ],
+      },
+      { text: "Examples", link: "/examples/" },
+      { text: "Community", link: "/community/contributing" },
+    ],
+
+    sidebar: {
+      "/getting-started/": [
+        {
+          text: "Getting Started",
+          items: [
+            { text: "Quick Start", link: "/getting-started/" },
+            { text: "Installation", link: "/getting-started/installation" },
+            {
+              text: "Configuration",
+              link: "/getting-started/configuration",
+            },
+          ],
+        },
+        {
+          text: "Next Steps",
+          items: [
+            { text: "Architecture", link: "/architecture/" },
+            { text: "Guides", link: "/guides/" },
+            { text: "SDKs", link: "/sdks/" },
+          ],
+        },
+      ],
+
+      "/architecture/": [
+        {
+          text: "Architecture",
+          items: [{ text: "Overview", link: "/architecture/" }],
+        },
+        {
+          text: "Control Plane",
+          items: [
+            { text: "Server", link: "/architecture/control-plane/server" },
+            {
+              text: "Kubernetes Controller",
+              link: "/architecture/control-plane/operator",
+            },
+          ],
+        },
+        {
+          text: "Data Plane",
+          items: [
+            { text: "Execd", link: "/architecture/data-plane/execd" },
+            {
+              text: "Node Agent",
+              link: "/architecture/data-plane/node-agent",
+            },
+          ],
+        },
+        {
+          text: "Network",
+          items: [
+            { text: "Ingress", link: "/architecture/network/ingress" },
+            { text: "Egress", link: "/architecture/network/egress" },
+            {
+              text: "Experimental HTTP/2",
+              link: "/architecture/network/osep-0023-h2-integration",
+            },
+            {
+              text: "Single-Host Network (Docker)",
+              link: "/architecture/network/single-host-network",
+            },
+            {
+              text: "Auto-Pause & Wake-on-Access",
+              link: "/architecture/network/auto-pause-wake-on-access",
+            },
+          ],
+        },
+        {
+          text: "Fast Sandbox",
+          items: [
+            { text: "Overview", link: "/architecture/fast-sandbox/" },
+            { text: "Templates", link: "/architecture/fast-sandbox/templates" },
+            {
+              text: "Scheduling",
+              link: "/architecture/fast-sandbox/scheduling",
+            },
+            { text: "Networking", link: "/architecture/fast-sandbox/networking" },
+            {
+              text: "Pause, Resume, and Snapshots",
+              link: "/architecture/fast-sandbox/checkpoints",
+            },
+            { text: "High Availability", link: "/architecture/fast-sandbox/ha" },
+            { text: "Storage", link: "/architecture/fast-sandbox/storage" },
+            {
+              text: "Firecracker",
+              link: "/architecture/fast-sandbox/firecracker",
+            },
+            {
+              text: "Performance",
+              link: "/architecture/fast-sandbox/performance",
+            },
+          ],
+        },
+      ],
+
+      "/deployment/": [
+        {
+          text: "Deployment",
+          items: [
+            {
+              text: "Kubernetes Deployment",
+              link: "/deployment/",
+            },
+            {
+              text: "ACK Deployment",
+              link: "/deployment/ack",
+            },
+          ],
+        },
+      ],
+
+      // Specific guide routes must precede /guides/ for VitePress prefix matching.
+      "/guides/client-pool": sdkSidebar,
+      "/guides/": [
+        {
+          text: "Guides",
+          items: [
+            { text: "Overview", link: "/guides/" },
+            { text: "Developer Console", link: "/guides/developer-console" },
+            { text: "Credential Vault", link: "/guides/credential-vault" },
+            {
+              text: "Chained Upstream Proxy",
+              link: "/guides/egress-upstream-proxy",
+            },
+            {
+              text: "Egress Forward Mode",
+              link: "/guides/egress-forward-mode",
+            },
+            { text: "Secure Access", link: "/guides/secure-access" },
+            {
+              text: "Fast Sandbox System Authentication",
+              link: "/guides/fast-sandbox-system-auth",
+            },
+            { text: "Secure Container", link: "/guides/secure-container" },
+            {
+              text: "Sandbox Network Security",
+              link: "/guides/network-security",
+            },
+            { text: "Multi-Tenancy", link: "/guides/multi-tenancy" },
+            { text: "Isolation Sessions", link: "/guides/isolation-sessions" },
+            { text: "In-Sandbox Privilege Reduction", link: "/guides/privilege-reduction" },
+            { text: "Pause & Resume", link: "/guides/pause-resume" },
+            { text: "OCI Templates", link: "/guides/oci-templates" },
+            {
+              text: "Auto-Pause & Wake-on-Access",
+              link: "/guides/auto-pause-wake",
+            },
+            {
+              text: "Renew-on-Access",
+              link: "/guides/renew-on-access",
+            },
+            {
+              text: "Kubernetes Resume Benchmark",
+              link: "/guides/kubernetes-resume-benchmark",
+            },
+            { text: "Pod Provision Failure Recovery", link: "/guides/pod-recovery" },
+            {
+              text: "QEMU VMState Snapshots",
+              link: "/guides/qemu-vmstate-snapshots",
+            },
+            {
+              text: "Egress SSE Truncation",
+              link: "/guides/egress-sse-truncation",
+            },
+            { text: "Lifecycle Hooks", link: "/guides/lifecycle-hooks" },
+            {
+              text: "Resource-Aware Scheduling for Fast Sandbox",
+              link: "/guides/resource-aware-scheduling",
+            },
+            { text: "Windows Sandbox", link: "/guides/windows-sandbox" },
+            {
+              text: "Node Agent Configuration",
+              link: "/guides/node-agent",
+            },
+            {
+              text: "Telemetry",
+              link: "/guides/telemetry",
+            },
+          ],
+        },
+      ],
+
+      "/sdks/": sdkSidebar,
+
+      "/api/": [
+        {
+          text: "API Reference",
+          items: [
+            { text: "OpenAPI Specs", link: "/api/" },
+            { text: "Implementation Compatibility", link: "/api/implementation-compatibility" },
+          ],
+        },
+      ],
+
+      "/cli/": sdkSidebar,
+
+      "/examples/": [
+        {
+          text: "Examples",
+          items: [{ text: "Overview", link: "/examples/" }],
+        },
+        {
+          text: "Coding Agents",
+          collapsed: false,
+          items: [
+            { text: "Claude Code", link: "/examples/claude-code" },
+            { text: "Gemini CLI", link: "/examples/gemini-cli" },
+            { text: "Codex CLI", link: "/examples/codex-cli" },
+            { text: "Apply Model Patches", link: "/examples/apply-patch" },
+            { text: "OpenCode", link: "/examples/opencode" },
+            { text: "Qwen Code", link: "/examples/qwen-code" },
+            { text: "Kimi CLI", link: "/examples/kimi-cli" },
+            { text: "LangGraph", link: "/examples/langgraph" },
+            { text: "Google ADK", link: "/examples/google-adk" },
+            { text: "OpenClaw", link: "/examples/openclaw" },
+            { text: "DeerFlow", link: "/examples/deer-flow" },
+          ],
+        },
+        {
+          text: "Browser & Desktop",
+          collapsed: false,
+          items: [
+            { text: "Chrome", link: "/examples/chrome" },
+            { text: "Playwright", link: "/examples/playwright" },
+            { text: "Desktop", link: "/examples/desktop" },
+            { text: "VS Code", link: "/examples/vscode" },
+          ],
+        },
+        {
+          text: "Core Usage",
+          collapsed: false,
+          items: [
+            { text: "Code Interpreter", link: "/examples/code-interpreter" },
+            { text: "Scheduled Client Pool", link: "/examples/client-pool-schedule" },
+            { text: "AIO Sandbox", link: "/examples/aio-sandbox" },
+            { text: "Agent Sandbox", link: "/examples/agent-sandbox" },
+            { text: "Windows", link: "/examples/windows" },
+            { text: "AKS Kata", link: "/examples/aks-kata" },
+            { text: "ACK PeerPods", link: "/examples/ack-peerpods" },
+            { text: "Harbor Evaluation", link: "/examples/harbor-evaluation" },
+          ],
+        },
+        {
+          text: "Storage",
+          collapsed: false,
+          items: [
+            {
+              text: "Host Volume Mount",
+              link: "/examples/host-volume-mount",
+            },
+            {
+              text: "Docker PVC Volume",
+              link: "/examples/docker-pvc-volume-mount",
+            },
+            {
+              text: "Docker OSSFS Volume",
+              link: "/examples/docker-ossfs-volume-mount",
+            },
+            {
+              text: "rclone Volume Mount",
+              link: "/examples/rclone-volume-mount",
+            },
+            {
+              text: "Kubernetes PVC",
+              link: "/examples/kubernetes-pvc-volume-mount",
+            },
+          ],
+        },
+      ],
+
+      "/community/": [
+        {
+          text: "Community",
+          items: [
+            { text: "Contributing", link: "/community/contributing" },
+            { text: "Code of Conduct", link: "/community/code-of-conduct" },
+          ],
+        },
+        {
+          text: "Releases",
+          items: [
+            {
+              text: "Versioning",
+              link: "/community/versioning",
+            },
+            {
+              text: "Release Automation",
+              link: "/community/release-automation",
+            },
+            {
+              text: "Release Verification",
+              link: "/community/release-verification",
+            },
+          ],
+        },
+      ],
+
+      "/reference/": [
+        {
+          text: "Reference",
+          items: [
+            {
+              text: "Execd Path Migration",
+              link: "/reference/execd-path-migration",
+            },
+            {
+              text: "Snapshot Store Migration",
+              link: "/reference/snapshot-store-migration",
+            },
+            {
+              text: "Code Interpreter Image Migration",
+              link: "/reference/code-interpreter-image-migration",
+            },
+          ],
+        },
+      ],
+    },
+
+    editLink: {
+      pattern:
+        "https://github.com/opensandbox-group/OpenSandbox/edit/main/docs/:path",
+      text: "Edit this page on GitHub",
+    },
+
+    socialLinks: [
+      {
+        icon: "github",
+        link: "https://github.com/opensandbox-group/OpenSandbox",
+      },
+    ],
+
+    footer: {
+      // VitePress renders message first, followed by copyright.
+      message: "Copyright © OpenSandbox a Series of LF Projects, LLC",
+      copyright:
+        'For web site terms of use, trademark policy and other project policies please see <a href="https://lfprojects.org/" target="_blank" rel="noopener noreferrer">https://lfprojects.org/</a>.',
+    },
+
     search: {
       provider: "local",
     },
-    socialLinks: [{ icon: "github", link: "https://github.com/alibaba/OpenSandbox" }],
-    nav: manifest.nav.en,
-    sidebar: {
-      ...manifest.sidebar.en,
-      ...manifest.sidebar.zh,
-    },
+
     outline: {
       level: [2, 3],
     },
   },
-  locales: {
-    root: {
-      label: "English",
-      lang: "en-US",
-      themeConfig: {
-        nav: manifest.nav.en,
-      },
-    },
-    zh: {
-      label: "简体中文",
-      lang: "zh-CN",
-      themeConfig: {
-        nav: manifest.nav.zh,
-      },
-    },
-  },
-});
+}));

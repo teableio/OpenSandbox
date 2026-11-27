@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,22 @@
 package controller
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// DownloadFile serves a file for download with support for range requests.
+// DownloadFile serves a file for download with support for range requests
+// and line-based reading via offset/limit query parameters.
 func (c *FilesystemController) DownloadFile() {
 	rec := beginFilesystemMetric("download")
 	defer rec.Finish(c.basicController)
@@ -50,6 +53,24 @@ func (c *FilesystemController) DownloadFile() {
 		)
 		return
 	}
+	if err := rejectStagingPath(resolvedFilePath); err != nil {
+		c.handleFileError(err)
+		return
+	}
+
+	rawOffset := c.ctx.Query("offset")
+	rawLimit := c.ctx.Query("limit")
+	hasLineParams := rawOffset != "" || rawLimit != ""
+	rangeHeader := c.ctx.GetHeader("Range")
+
+	if hasLineParams && rangeHeader != "" {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeInvalidRequest,
+			"line-based reading (offset/limit) and byte range (Range header) are mutually exclusive",
+		)
+		return
+	}
 
 	file, err := os.Open(resolvedFilePath)
 	if err != nil {
@@ -67,44 +88,131 @@ func (c *FilesystemController) DownloadFile() {
 		)
 		return
 	}
+	// A directory opens like a file but cannot be read or seeked as one, so
+	// refuse it before either download mode starts.
+	if fileInfo.IsDir() {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeInvalidRequest,
+			fmt.Sprintf("path is a directory: %s", resolvedFilePath),
+		)
+		return
+	}
+
+	if hasLineParams {
+		c.serveLineRange(file, rawOffset, rawLimit)
+		rec.MarkSuccess()
+		return
+	}
+
+	// Parse Range first: the 416 error body must not carry the file's headers.
+	var ranges []httpRange
+	if rangeHeader != "" {
+		ranges, err = ParseRange(rangeHeader, fileInfo.Size())
+		if err != nil {
+			c.RespondError(
+				http.StatusRequestedRangeNotSatisfiable,
+				model.ErrorCodeUnknown,
+				fmt.Sprintf("invalid Range header: %s", rangeHeader),
+			)
+			return
+		}
+	}
 
 	c.ctx.Header("Content-Type", "application/octet-stream")
 	c.ctx.Header("Content-Disposition", formatContentDisposition(filepath.Base(resolvedFilePath)))
 	c.ctx.Header("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
 
-	if rangeHeader := c.ctx.GetHeader("Range"); rangeHeader != "" {
-		ranges, err := ParseRange(rangeHeader, fileInfo.Size())
-		if err != nil {
-			c.RespondError(
-				http.StatusRequestedRangeNotSatisfiable,
-				model.ErrorCodeUnknown,
-			)
-			return
-		}
-		if len(ranges) > 0 {
-			r := ranges[0]
-			c.ctx.Status(http.StatusPartialContent)
-			c.ctx.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", r.start, r.start+r.length-1, fileInfo.Size()))
-			c.ctx.Header("Content-Length", strconv.FormatInt(r.length, 10))
+	if len(ranges) == 1 {
+		r := ranges[0]
+		c.ctx.Status(http.StatusPartialContent)
+		c.ctx.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", r.start, r.start+r.length-1, fileInfo.Size()))
+		c.ctx.Header("Content-Length", strconv.FormatInt(r.length, 10))
 
-			_, _ = file.Seek(r.start, io.SeekStart)
-			_, _ = io.CopyN(c.ctx.Writer, file, r.length)
-			rec.MarkSuccess()
-			return
-		}
+		_, _ = file.Seek(r.start, io.SeekStart)
+		_, _ = io.CopyN(c.ctx.Writer, file, r.length)
+		rec.MarkSuccess()
+		return
+	}
+
+	request := c.ctx.Request
+	if len(ranges) > 1 {
+		// ServeContent would otherwise generate a multipart response.
+		request = request.Clone(request.Context())
+		request.Header.Del("Range")
 	}
 
 	rec.MarkSuccess()
-	http.ServeContent(c.ctx.Writer, c.ctx.Request, filepath.Base(resolvedFilePath), fileInfo.ModTime(), file)
+	http.ServeContent(c.ctx.Writer, request, filepath.Base(resolvedFilePath), fileInfo.ModTime(), file)
+}
+
+// serveLineRange reads lines from file starting at a 1-based offset and
+// returns up to limit lines as text/plain.
+func (c *FilesystemController) serveLineRange(file *os.File, rawOffset, rawLimit string) {
+	offset := int64(1)
+	if rawOffset != "" {
+		parsed, err := strconv.ParseInt(rawOffset, 10, 64)
+		if err != nil || parsed < 1 {
+			c.RespondError(
+				http.StatusBadRequest,
+				model.ErrorCodeInvalidRequest,
+				fmt.Sprintf("invalid query parameter 'offset': %s", rawOffset),
+			)
+			return
+		}
+		offset = parsed
+	}
+
+	limit := int64(-1)
+	if rawLimit != "" {
+		parsed, err := strconv.ParseInt(rawLimit, 10, 64)
+		if err != nil || parsed < 1 {
+			c.RespondError(
+				http.StatusBadRequest,
+				model.ErrorCodeInvalidRequest,
+				fmt.Sprintf("invalid query parameter 'limit': %s", rawLimit),
+			)
+			return
+		}
+		limit = parsed
+	}
+
+	c.ctx.Header("Content-Type", "text/plain; charset=utf-8")
+	c.ctx.Status(http.StatusOK)
+
+	reader := bufio.NewReader(file)
+	var lineNum int64
+	var written int64
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			line = bytes.TrimRight(line, "\r\n")
+			lineNum++
+			if lineNum >= offset {
+				if written > 0 {
+					_, _ = c.ctx.Writer.Write([]byte("\n"))
+				}
+				_, _ = c.ctx.Writer.Write(line)
+				written++
+				if limit >= 0 && written >= limit {
+					break
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
 }
 
 // formatContentDisposition formats the Content-Disposition header value with proper
 // encoding for non-ASCII filenames according to RFC 6266 and RFC 5987.
 func formatContentDisposition(filename string) string {
-	// Check if filename contains non-ASCII characters
 	needsEncoding := false
 	for _, r := range filename {
-		if r > 127 {
+		// A quote closes, and a backslash escapes inside, the quoted-string below.
+		// CR, LF, and other controls would split the header or inject another one.
+		if r < 0x20 || r == 0x7f || r > 127 || r == '"' || r == '\\' {
 			needsEncoding = true
 			break
 		}
@@ -114,8 +222,29 @@ func formatContentDisposition(filename string) string {
 		return "attachment; filename=\"" + filename + "\""
 	}
 
-	// Use RFC 5987 encoding for non-ASCII filenames
-	// Format: attachment; filename="fallback"; filename*=UTF-8''encoded_name
-	encodedFilename := url.PathEscape(filename)
+	encodedFilename := encodeExtValue(filename)
 	return "attachment; filename=\"" + encodedFilename + "\"; filename*=UTF-8''" + encodedFilename
+}
+
+// encodeExtValue percent-encodes every byte outside the RFC 8187 attr-char set.
+// url.PathEscape is not enough: it keeps characters such as '=', ':' and '@',
+// which an ext-value may not contain unencoded.
+func encodeExtValue(value string) string {
+	var b strings.Builder
+	for i := range len(value) {
+		if c := value[i]; isAttrChar(c) {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
+func isAttrChar(c byte) bool {
+	switch {
+	case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+		return true
+	}
+	return strings.IndexByte("!#$&+-.^_`|~", c) >= 0
 }

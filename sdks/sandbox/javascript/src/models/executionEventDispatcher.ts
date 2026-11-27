@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import type { Execution, ExecutionComplete, ExecutionError, ExecutionHandlers, ExecutionInit, ExecutionResult, OutputMessage } from "./execution.js";
+import { normalizeExitCode } from "./execution.js";
 import type { ServerStreamEvent } from "./execd.js";
 
 function extractText(results: ServerStreamEvent["results"] | undefined): string | undefined {
@@ -48,13 +49,17 @@ export class ExecutionEventDispatcher {
       }
       case "stdout": {
         const msg: OutputMessage = { text: ev.text ?? "", timestamp: ts, isError: false };
-        this.execution.logs.stdout.push(msg);
+        if (!this.handlers?.skipAccumulation) {
+          this.execution.logs.stdout.push(msg);
+        }
         await this.handlers?.onStdout?.(msg);
         return;
       }
       case "stderr": {
         const msg: OutputMessage = { text: ev.text ?? "", timestamp: ts, isError: true };
-        this.execution.logs.stderr.push(msg);
+        if (!this.handlers?.skipAccumulation) {
+          this.execution.logs.stderr.push(msg);
+        }
         await this.handlers?.onStderr?.(msg);
         return;
       }
@@ -85,6 +90,10 @@ export class ExecutionEventDispatcher {
             timestamp: ts,
             traceback: Array.isArray(e.traceback) ? e.traceback.map(String) : [],
           };
+          const exitCode = normalizeExitCode(e.exit_code);
+          if (exitCode !== undefined) {
+            err.exitCode = exitCode;
+          }
           this.execution.error = err;
           await this.handlers?.onError?.(err);
         }

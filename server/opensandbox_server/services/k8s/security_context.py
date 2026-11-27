@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -71,5 +71,19 @@ def serialize_security_context_to_dict(
 
     if security_context.privileged is not None:
         result["privileged"] = security_context.privileged
+
+    if getattr(security_context, "seccomp_profile", None) is not None:
+        sp = security_context.seccomp_profile
+        profile_dict: Dict[str, Any] = {"type": sp.type}
+        if getattr(sp, "localhost_profile", None) is not None:
+            profile_dict["localhostProfile"] = sp.localhost_profile
+        result["seccompProfile"] = profile_dict
+
+    if getattr(security_context, "app_armor_profile", None) is not None:
+        ap = security_context.app_armor_profile
+        profile_dict = {"type": ap.type}
+        if getattr(ap, "localhost_profile", None) is not None:
+            profile_dict["localhostProfile"] = ap.localhost_profile
+        result["appArmorProfile"] = profile_dict
 
     return result if result else None

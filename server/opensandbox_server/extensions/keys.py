@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,12 +14,24 @@
 
 """Well-known CreateSandboxRequest.extensions keys and workload storage keys."""
 
-# access.renew.extend.seconds extension key (annotation-based)
+# Deprecated: superseded by lifecycle.renewalPolicy (OSEP-0009); the request
+# entry ends in 2.0, the metadata key stays. See #2289.
 ACCESS_RENEW_EXTEND_SECONDS_KEY = "access.renew.extend.seconds"
 ACCESS_RENEW_EXTEND_SECONDS_METADATA_KEY = "opensandbox.io/access-renew-extend-seconds"
 
-# Extensions to annotations transformation prefix
+# When set to "enable", the sandbox container receives CAP_SYS_ADMIN so that
+# execd can use bwrap namespace isolation (OSEP-0013).
+BOOTSTRAP_EXECD_ISOLATION_KEY = "bootstrap.execd.isolation"
+
+# Default mount path for the isolation upper directory.
+# Must match the execd DefaultConfig().UpperRoot value.
+ISOLATION_UPPER_MOUNT_PATH = "/var/lib/execd/isolation"
+
 # User-specified extension keys starting with EXTENSIONS_ANNOTATION_PREFIX
 # are automatically propagated to Pod annotations with ANNOTATION_METADATA_PREFIX
 EXTENSIONS_ANNOTATION_PREFIX = "opensandbox.extensions."
 ANNOTATION_METADATA_PREFIX = "opensandbox.io/extensions."
+
+# OSEP-0024 idle policy: reserved Sandbox CR annotation (JSON), parsed by the
+# same key on the ingress wake gate. Reserved prefix: user patches cannot set it.
+IDLE_POLICY_ANNOTATION_KEY = "sandbox.opensandbox.io/idle-policy"

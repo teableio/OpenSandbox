@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@
 package runtime
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -30,12 +30,23 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alibaba/opensandbox/internal/safego"
 	"github.com/google/uuid"
 
+	"github.com/alibaba/opensandbox/execd/pkg/isolation"
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
 )
+
+func containsStr(list []string, s string) bool {
+	for _, item := range list {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
 
 const (
 	envDumpStartMarker = "__ENV_DUMP_START__"
@@ -45,7 +56,8 @@ const (
 )
 
 func (c *Controller) createBashSession(req *CreateContextRequest) (string, error) {
-	resolvedCwd, err := pathutil.ExpandPath(req.Cwd)
+	env := newBashSessionEnv()
+	resolvedCwd, err := pathutil.ExpandPathWithEnv(req.Cwd, env)
 	if err != nil {
 		return "", fmt.Errorf("resolve request cwd %s: %w", req.Cwd, err)
 	}
@@ -56,13 +68,13 @@ func (c *Controller) createBashSession(req *CreateContextRequest) (string, error
 		}
 	}
 
-	session := newBashSession(resolvedCwd)
+	session := newBashSession(resolvedCwd, env)
 	if err := session.start(); err != nil {
 		return "", fmt.Errorf("failed to start bash session: %w", err)
 	}
 
 	c.bashSessionClientMap.Store(session.config.Session, session)
-	log.Info("created bash session %s", session.config.Session)
+	log.Info("bash session: created %s", session.config.Session)
 	return session.config.Session, nil
 }
 
@@ -107,21 +119,30 @@ func (c *Controller) RunInBashSession(ctx context.Context, req *ExecuteCodeReque
 	return c.runBashSession(ctx, req)
 }
 
+// ValidateBashSessionCwd validates a run's cwd against the target session's
+// environment (daemon env, EXECD_ENVS file values, and variables exported in
+// earlier runs of the session), so requests referencing session-scoped
+// variables pass web-layer validation instead of failing at expansion time.
+// Returns ErrContextNotFound when the session does not exist.
+func (c *Controller) ValidateBashSessionCwd(sessionID, cwd string) error {
+	session := c.getBashSession(sessionID)
+	if session == nil {
+		return ErrContextNotFound
+	}
+	session.mu.Lock()
+	envSnapshot := copyEnvMap(session.env)
+	session.mu.Unlock()
+	return ValidateWorkingDirWithEnv(cwd, envSnapshot)
+}
+
 func (c *Controller) DeleteBashSession(sessionID string) error {
 	return c.closeBashSession(sessionID)
 }
 
-func newBashSession(cwd string) *bashSession {
+func newBashSession(cwd string, env map[string]string) *bashSession {
 	config := &bashSessionConfig{
 		Session:        uuidString(),
 		StartupTimeout: 5 * time.Second,
-	}
-
-	env := make(map[string]string)
-	for _, kv := range os.Environ() {
-		if k, v, ok := splitEnvPair(kv); ok {
-			env[k] = v
-		}
 	}
 
 	return &bashSession{
@@ -129,6 +150,38 @@ func newBashSession(cwd string) *bashSession {
 		env:    env,
 		cwd:    cwd,
 	}
+}
+
+// newBashSessionEnv builds the initial environment for a new bash session:
+// execd's process environment minus its own config/credential vars, overlaid
+// with the standard user env (sandbox binding envs from /init < EXECD_ENVS
+// file values — the same source the command path applies, with the same
+// precedence over the daemon environment).
+func newBashSessionEnv() map[string]string {
+	// The session env snapshot is exported into the wrapped script at the
+	// top, after the launcher has stripped the process environment — so it
+	// must not carry execd's own config/credential vars or a session user
+	// could recover them with a plain `echo`.
+	blacklist := isolation.ExecdConfigEnvBlacklist()
+	env := make(map[string]string)
+	for _, kv := range os.Environ() {
+		if k, v, ok := splitEnvPair(kv); ok && !containsStr(blacklist, k) {
+			env[k] = v
+		}
+	}
+
+	// Sandbox binding vars and EXECD_ENVS file vars are user-code
+	// environment, not execd config. Blacklisted names stay excluded even if
+	// a layer redefines them, so the snapshot cannot be used to smuggle
+	// execd credentials back in.
+	for k, v := range UserEnvOverlay() {
+		if containsStr(blacklist, k) {
+			continue
+		}
+		env[k] = v
+	}
+
+	return env
 }
 
 func (s *bashSession) start() error {
@@ -143,16 +196,27 @@ func (s *bashSession) start() error {
 	return nil
 }
 
-func (s *bashSession) trackCurrentProcess(pid int) {
+func (s *bashSession) trackRunProcess(pid int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.currentProcessPid = pid
+	if !s.started {
+		// close() ran after this run passed its started check, so nothing
+		// else will stop this process group.
+		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+			log.Warn("bash session: kill process group %d started after close: %v", pid, err)
+		}
+		return
+	}
+	if s.runPids == nil {
+		s.runPids = make(map[int]struct{})
+	}
+	s.runPids[pid] = struct{}{}
 }
 
-func (s *bashSession) untrackCurrentProcess() {
+func (s *bashSession) untrackRunProcess(pid int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.currentProcessPid = 0
+	delete(s.runPids, pid)
 }
 
 //nolint:gocognit
@@ -166,9 +230,8 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	envSnapshot := copyEnvMap(s.env)
 
 	cwd := s.cwd
-	// override original cwd if specified
 	if request.Cwd != "" {
-		expandedCwd, err := pathutil.ExpandPath(request.Cwd)
+		expandedCwd, err := pathutil.ExpandPathWithEnv(request.Cwd, envSnapshot)
 		if err != nil {
 			s.mu.Unlock()
 			return fmt.Errorf("resolve cwd: %w", err)
@@ -185,7 +248,7 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 
 	wait := request.Timeout
 	if wait <= 0 {
-		wait = 24 * 3600 * time.Second // max to 24 hours
+		wait = 24 * 3600 * time.Second
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, wait)
@@ -197,6 +260,8 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 		return fmt.Errorf("create script file: %w", err)
 	}
 	scriptPath := scriptFile.Name()
+	// The script embeds the session environment; do not leave it behind.
+	defer os.Remove(scriptPath)
 	if _, err := scriptFile.WriteString(script); err != nil {
 		_ = scriptFile.Close()
 		return fmt.Errorf("write script file: %w", err)
@@ -205,26 +270,37 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 		return fmt.Errorf("close script file: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", scriptPath)
+	shell, args := shellCommand(scriptPath)
+	cmd := exec.CommandContext(ctx, shell, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Do not pass envSnapshot via cmd.Env to avoid "argument list too long" when session env is large.
 	// Child inherits parent env (nil => default in Go). The script file already has "export K=V" for
 	// all session vars at the top, so the session environment is applied when the script runs.
-	stdout, err := cmd.StdoutPipe()
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
-	cmd.Stderr = cmd.Stdout
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stdoutW
 
-	if err := cmd.Start(); err != nil {
-		log.Error("start bash session failed: %v (command: %q)", err, log.SanitizeCommand(request.Code))
-		return fmt.Errorf("start bash: %w", err)
+	mp, err := launchManaged(cmd)
+	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		log.Error("bash session: start %s: %v (command: %q)", shell, err, log.SanitizeCommand(request.Code))
+		return fmt.Errorf("start %s: %w", shell, err)
 	}
-	defer s.untrackCurrentProcess()
-	s.trackCurrentProcess(cmd.Process.Pid)
+	// The child holds its own copy of the write end; closing ours lets the
+	// scanner below see EOF as soon as the child (and its descendants that
+	// inherited stdout) exit.
+	_ = stdoutW.Close()
+	defer stdoutR.Close()
+	runPid := cmd.Process.Pid
+	s.trackRunProcess(runPid)
+	defer s.untrackRunProcess(runPid)
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	stopGroupKill := killProcessGroupOnDone(ctx, cmd.Process.Pid)
+	defer stopGroupKill()
 
 	var (
 		envLines []string
@@ -232,47 +308,95 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 		exitCode *int
 		inEnv    bool
 	)
+	// Env-dump records are reassembled from raw fragment bytes and only
+	// finalized on LF: values may contain literal CR bytes (dash quotes them
+	// verbatim), so CR-split fragments must be joined before parseExportLine
+	// sees a record.
+	var envRecord strings.Builder
+	flushEnvRecord := func() {
+		if envRecord.Len() == 0 {
+			return
+		}
+		envLines = append(envLines, strings.TrimSuffix(envRecord.String(), "\n"))
+		envRecord.Reset()
+	}
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case line == envDumpStartMarker:
-			inEnv = true
-		case line == envDumpEndMarker:
-			inEnv = false
-		case strings.HasPrefix(line, exitMarkerPrefix):
-			if code, err := strconv.Atoi(strings.TrimPrefix(line, exitMarkerPrefix)); err == nil {
-				exitCode = &code //nolint:ineffassign
-			}
-		case strings.HasPrefix(line, pwdMarkerPrefix):
-			pwdLine = strings.TrimPrefix(line, pwdMarkerPrefix)
-		default:
-			if inEnv {
-				envLines = append(envLines, line)
-				continue
-			}
-			if request.Hooks.OnExecuteStdout != nil {
-				request.Hooks.OnExecuteStdout(line)
-			}
+	emit := func(fragment string) {
+		if request.Hooks.OnExecuteStdout != nil {
+			request.Hooks.OnExecuteStdout(fragment)
 		}
 	}
 
-	scanErr := scanner.Err()
-	waitErr := cmd.Wait()
+	// handleFragment forwards user output while intercepting the wrapper's
+	// protocol lines. The wrapper prints the env-dump marker on its own line,
+	// so user output that lacks a trailing newline merges with the marker
+	// line; stripping the marker suffix keeps that output byte-exact.
+	handleFragment := func(fragment string) {
+		content := lineContent(fragment)
+		switch {
+		case content == envDumpStartMarker:
+			inEnv = true
+			return
+		case strings.HasSuffix(content, envDumpStartMarker):
+			inEnv = true
+			if prefix := strings.TrimSuffix(content, envDumpStartMarker); prefix != "" {
+				emit(prefix)
+			}
+			return
+		case content == envDumpEndMarker:
+			inEnv = false
+			return
+		case strings.HasPrefix(content, exitMarkerPrefix):
+			if code, err := strconv.Atoi(strings.TrimPrefix(content, exitMarkerPrefix)); err == nil {
+				exitCode = &code //nolint:ineffassign
+			}
+			return
+		case strings.HasPrefix(content, pwdMarkerPrefix):
+			pwdLine = strings.TrimPrefix(content, pwdMarkerPrefix)
+			return
+		}
+		if inEnv {
+			envRecord.WriteString(fragment)
+			if strings.HasSuffix(fragment, "\n") {
+				flushEnvRecord()
+			}
+			return
+		}
+		emit(fragment)
+	}
+
+	// carry holds the tail of an unfinished piece of a long line: the wrapper's
+	// env-dump marker follows output that lacks a trailing newline on the same
+	// line, so it can be split across two pieces. The scanner always passes
+	// another fragment after an unfinished piece, so carry is never left over.
+	var carry string
+	scanErr := scanLineFragments(stdoutR, func(fragment string, complete bool) {
+		fragment = carry + fragment
+		carry = ""
+		if !complete {
+			fragment, carry = holdBackMarkerPrefix(fragment, envDumpStartMarker)
+		}
+		handleFragment(fragment)
+	})
+	if inEnv {
+		flushEnvRecord()
+	}
+
+	waitErr := mp.Wait()
 
 	if scanErr != nil {
-		log.Error("read stdout failed: %v (command: %q)", scanErr, log.SanitizeCommand(request.Code))
+		log.Error("bash session: read stdout: %v (command: %q)", scanErr, log.SanitizeCommand(request.Code))
 		return fmt.Errorf("read stdout: %w", scanErr)
 	}
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		log.Error("timeout after %s while running command: %q", wait, log.SanitizeCommand(request.Code))
+		log.Error("bash session: timeout after %s (command: %q)", wait, log.SanitizeCommand(request.Code))
 		return fmt.Errorf("timeout after %s", wait)
 	}
 
-	if exitCode == nil && cmd.ProcessState != nil {
-		code := cmd.ProcessState.ExitCode() //nolint:staticcheck
-		exitCode = &code                    //nolint:ineffassign
+	if exitCode == nil && mp.ExitCode() >= 0 {
+		code := mp.ExitCode()
+		exitCode = &code
 	}
 
 	updatedEnv := parseExportDump(envLines)
@@ -285,10 +409,74 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	}
 	s.mu.Unlock()
 
-	var exitErr *exec.ExitError
-	if waitErr != nil && !errors.As(waitErr, &exitErr) {
-		log.Error("command wait failed: %v (command: %q)", waitErr, log.SanitizeCommand(request.Code))
+	return reportRunResult(request, waitErr, exitCode, startAt)
+}
+
+// scanLineFragments reads r and calls onFragment for each fragment terminated
+// by \n or \r, passing the terminator through; a final unterminated fragment
+// is flushed at EOF. A line longer than maxScanLineBytes is passed in pieces
+// with complete=false for all but the last piece; pieces never split a UTF-8
+// sequence. Concatenating the fragments reproduces the exact byte stream,
+// including blank lines and \r-only progress output.
+func scanLineFragments(r io.Reader, onFragment func(fragment string, complete bool)) error {
+	buf := make([]byte, 64*1024)
+	var pending []byte
+	for {
+		n, readErr := r.Read(buf)
+		for i := range n {
+			b := buf[i]
+			pending = append(pending, b)
+			if b == '\n' || b == '\r' {
+				onFragment(string(pending), true)
+				pending = pending[:0]
+			} else if len(pending) > maxScanLineBytes {
+				// The byte just read stays pending, so the last piece is never
+				// empty.
+				cut := lastRuneBoundary(pending[:maxScanLineBytes])
+				onFragment(string(pending[:cut]), false)
+				pending = pending[:copy(pending, pending[cut:])]
+			}
+		}
+		if readErr != nil {
+			if len(pending) > 0 {
+				onFragment(string(pending), true)
+			}
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
+// lineContent strips the single line-ending byte from a fragment produced by
+// scanLineFragments; unterminated fragments are returned unchanged.
+func lineContent(fragment string) string {
+	if fragment == "" {
+		return ""
+	}
+	if c := fragment[len(fragment)-1]; c == '\n' || c == '\r' {
+		return fragment[:len(fragment)-1]
+	}
+	return fragment
+}
+
+// reportRunResult maps the shell's wait result and parsed exit code onto the
+// request hooks: a non-exit wait error is returned, a non-zero exit code is
+// reported via OnExecuteError, and a clean run via OnExecuteComplete.
+func reportRunResult(request *ExecuteCodeRequest, waitErr error, exitCode *int, startAt time.Time) error {
+	var exitCodeErr exitCoder
+	if waitErr != nil && !errors.As(waitErr, &exitCodeErr) {
+		log.Error("bash session: wait: %v (command: %q)", waitErr, log.SanitizeCommand(request.Code))
 		return waitErr
+	}
+	// A shell terminated by a signal (e.g. `kill -TERM $$`) never prints the
+	// exit marker and reports ExitCode() == -1, which the >= 0 check above
+	// skips. Take the code from the wait error so the run is reported as a
+	// failure (exit_code -1) rather than as a successful completion.
+	if exitCode == nil && exitCodeErr != nil {
+		code := exitCodeErr.ExitCode()
+		exitCode = &code
 	}
 
 	userExitCode := 0
@@ -306,9 +494,10 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 				EName:     "CommandExecError",
 				EValue:    strconv.Itoa(userExitCode),
 				Traceback: []string{errMsg},
+				ExitCode:  &userExitCode,
 			})
 		}
-		log.Error("CommandExecError: %s (command: %q)", errMsg, log.SanitizeCommand(request.Code))
+		log.Error("bash session: command error: %s (command: %q)", errMsg, log.SanitizeCommand(request.Code))
 		return nil
 	}
 
@@ -317,6 +506,28 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	}
 
 	return nil
+}
+
+// killProcessGroupOnDone kills pid's process group, as close() does, if ctx is
+// done before stop is called. exec.CommandContext only kills the leader, and
+// children holding the output pipe would keep the run blocked until they exit.
+func killProcessGroupOnDone(ctx context.Context, pid int) (stop func()) {
+	done := make(chan struct{})
+	safego.Go(func() {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// Re-check done: the run may be returning concurrently, after
+			// which -pid may name a recycled process group.
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
+	})
+	return func() { close(done) }
 }
 
 func buildWrappedScript(command string, env map[string]string, cwd string) string {
@@ -350,7 +561,7 @@ func buildWrappedScript(command string, env map[string]string, cwd string) strin
 	}
 
 	b.WriteString("__USER_EXIT_CODE__=$?\n")
-	b.WriteString("printf \"\\n%s\\n\" \"" + envDumpStartMarker + "\"\n")
+	b.WriteString("printf \"%s\\n\" \"" + envDumpStartMarker + "\"\n")
 	b.WriteString("export -p\n")
 	b.WriteString("printf \"%s\\n\" \"" + envDumpEndMarker + "\"\n")
 	b.WriteString("printf \"" + pwdMarkerPrefix + "%s\\n\" \"$(pwd)\"\n")
@@ -385,21 +596,38 @@ func parseExportDump(lines []string) map[string]string {
 }
 
 func parseExportLine(line string) (string, string, bool) {
-	const prefix = "declare -x "
-	if !strings.HasPrefix(line, prefix) {
+	var rest string
+	switch {
+	case strings.HasPrefix(line, "declare -x "):
+		rest = strings.TrimSpace(strings.TrimPrefix(line, "declare -x "))
+	case strings.HasPrefix(line, "export "):
+		rest = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+	default:
 		return "", "", false
 	}
-	rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
 	if rest == "" {
 		return "", "", false
 	}
+
 	name, value := rest, ""
 	if eq := strings.Index(rest, "="); eq >= 0 {
 		name = rest[:eq]
 		raw := rest[eq+1:]
-		if unquoted, err := strconv.Unquote(raw); err == nil {
+		// Only a double-quoted value is a Go-compatible literal. A single-quoted
+		// one is verbatim shell text: strconv.Unquote would read '\t' or '\\'
+		// as a Go rune literal and turn it into a tab or a single backslash.
+		if unquoted, err := strconv.Unquote(raw); err == nil && strings.HasPrefix(raw, `"`) {
+			value = unquoted
+		} else if unquoted, ok := unquoteShellWord(raw); ok {
+			// POSIX shell word: a concatenation of '...' and "..." segments
+			// possibly with backslash escapes outside quotes. bash writes
+			// embedded quotes as '\'' while dash/BusyBox ash write '"'"',
+			// and neither wraps the whole value in a single pair of quotes
+			// when it starts or ends with a quote character.
 			value = unquoted
 		} else {
+			// Preserve the previous best-effort behavior for shell-specific
+			// formats such as Bash ANSI-C quoting.
 			value = strings.Trim(raw, `"`)
 		}
 	}
@@ -411,6 +639,64 @@ func parseExportLine(line string) (string, string, bool) {
 
 func shellEscape(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
+// unquoteShellWord decodes a concatenation of POSIX shell word segments as
+// produced by `export -p` across bash, zsh, dash, and BusyBox ash. It returns
+// the raw value and true on success, or ("", false) when input is not a
+// well-formed shell word (unterminated quote, dangling backslash, etc.).
+//
+// Recognized segments:
+//   - '...'          Verbatim single-quoted content (no escapes allowed).
+//   - "..."          Double-quoted content with POSIX escapes: \\ \" \$ \` \newline.
+//   - \c             Backslash-escaped character outside quotes.
+//   - any other rune Literal character.
+func unquoteShellWord(raw string) (string, bool) {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); {
+		switch raw[i] {
+		case '\'':
+			end := strings.IndexByte(raw[i+1:], '\'')
+			if end < 0 {
+				return "", false
+			}
+			b.WriteString(raw[i+1 : i+1+end])
+			i += 1 + end + 1
+		case '"':
+			j := i + 1
+			for j < len(raw) && raw[j] != '"' {
+				if raw[j] == '\\' && j+1 < len(raw) {
+					next := raw[j+1]
+					switch next {
+					case '\\', '"', '$', '`':
+						b.WriteByte(next)
+						j += 2
+						continue
+					case '\n':
+						j += 2
+						continue
+					}
+				}
+				b.WriteByte(raw[j])
+				j++
+			}
+			if j >= len(raw) {
+				return "", false
+			}
+			i = j + 1
+		case '\\':
+			if i+1 >= len(raw) {
+				return "", false
+			}
+			b.WriteByte(raw[i+1])
+			i += 2
+		default:
+			b.WriteByte(raw[i])
+			i++
+		}
+	}
+	return b.String(), true
 }
 
 func isValidEnvKey(key string) bool {
@@ -460,15 +746,15 @@ func (s *bashSession) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	pid := s.currentProcessPid
-	s.currentProcessPid = 0
+	pids := s.runPids
+	s.runPids = nil
 	s.started = false
 	s.env = nil
 	s.cwd = ""
 
-	if pid != 0 {
+	for pid := range pids {
 		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
-			log.Warning("kill session process group %d: %v (process may have already exited)", pid, err)
+			log.Warn("bash session: kill process group %d: %v (process may have already exited)", pid, err)
 		}
 	}
 	return nil

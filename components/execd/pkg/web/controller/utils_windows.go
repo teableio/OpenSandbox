@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,7 +40,7 @@ func DeleteFile(filePath string) error {
 
 	fileInfo, err := os.Stat(absPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 		return err
@@ -93,7 +94,7 @@ func RenameFile(item model.RenameFileItem) error {
 	}
 
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-		return fmt.Errorf("source path not found: %s", item.Src)
+		return fmt.Errorf("source path not found: %s: %w", item.Src, err)
 	}
 
 	dstDir := filepath.Dir(dstPath)
@@ -113,34 +114,94 @@ func RenameFile(item model.RenameFileItem) error {
 	return nil
 }
 
+// MkdirAllWithOwnership creates targetDir and any missing parents, then applies
+// owner/group only to the directories that were actually created (not pre-existing ones).
+func MkdirAllWithOwnership(targetDir string, dirPerm os.FileMode, owner, group string) error {
+	firstNew := ""
+	cur := targetDir
+	for {
+		if _, err := os.Stat(cur); err == nil {
+			break
+		}
+		firstNew = cur
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+
+	if err := os.MkdirAll(targetDir, dirPerm); err != nil {
+		return err
+	}
+
+	if firstNew == "" || (owner == "" && group == "") {
+		return nil
+	}
+
+	rel, err := filepath.Rel(firstNew, targetDir)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	cur = firstNew
+	if err := SetFileOwnership(cur, owner, group); err != nil {
+		return err
+	}
+	for _, p := range parts {
+		if p == "." {
+			continue
+		}
+		cur = filepath.Join(cur, p)
+		if err := SetFileOwnership(cur, owner, group); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func MakeDir(dir string, perm model.Permission) error {
 	abs, err := pathutil.ExpandAbsPath(dir)
 	if err != nil {
 		return err
 	}
-	err = os.MkdirAll(abs, os.ModePerm)
-	if err != nil {
+	if err := rejectStagingPath(abs); err != nil {
 		return err
 	}
 
-	return ChmodFile(abs, perm)
+	_, statErr := os.Stat(abs)
+	existed := statErr == nil
+
+	if err := MkdirAllWithOwnership(abs, os.ModePerm, perm.Owner, perm.Group); err != nil {
+		return err
+	}
+
+	if !existed && perm.Mode != 0 {
+		mode, err := strconv.ParseUint(strconv.Itoa(perm.Mode), 8, 32)
+		if err != nil {
+			return err
+		}
+		return os.Chmod(abs, os.FileMode(mode))
+	}
+	return nil
 }
 
-func GetFileInfo(filePath string) (model.FileInfo, error) {
-	absPath, err := pathutil.ExpandAbsPath(filePath)
-	if err != nil {
-		return model.FileInfo{}, fmt.Errorf("invalid path %s: %w", filePath, err)
+func fileType(fileInfo os.FileInfo) string {
+	mode := fileInfo.Mode()
+	if mode&os.ModeSymlink != 0 {
+		return "symlink"
 	}
-
-	fileInfo, err := os.Stat(absPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return model.FileInfo{}, fmt.Errorf("file not found: %s", filePath)
-		}
-		return model.FileInfo{}, fmt.Errorf("error accessing file %s: %w", filePath, err)
+	if fileInfo.IsDir() {
+		return "directory"
 	}
+	if mode.IsRegular() {
+		return "file"
+	}
+	return "other"
+}
 
-	createdAt := getFileCreateTime(fileInfo)
+func buildFileInfo(absPath string, fileInfo os.FileInfo) (model.FileInfo, error) {
+	createdAt := getFileCreateTime(absPath, fileInfo)
 	if data, ok := fileInfo.Sys().(*syscall.Win32FileAttributeData); ok && data != nil {
 		createdAt = time.Unix(0, data.CreationTime.Nanoseconds())
 	}
@@ -149,6 +210,7 @@ func GetFileInfo(filePath string) (model.FileInfo, error) {
 
 	return model.FileInfo{
 		Path:       absPath,
+		Type:       fileType(fileInfo),
 		Size:       fileInfo.Size(),
 		ModifiedAt: fileInfo.ModTime(),
 		CreatedAt:  createdAt,
@@ -163,79 +225,19 @@ func GetFileInfo(filePath string) (model.FileInfo, error) {
 	}, nil
 }
 
-func SearchFileMetadata(metadata map[string]model.FileMetadata, filePath string) (string, model.FileMetadata, bool) {
-	base := filepath.Base(filePath)
-	for path, info := range metadata {
-		if filepath.Base(path) == base {
-			return path, info, true
-		}
+func GetFileInfo(filePath string) (model.FileInfo, error) {
+	absPath, err := pathutil.ExpandAbsPath(filePath)
+	if err != nil {
+		return model.FileInfo{}, fmt.Errorf("invalid path %s: %w", filePath, err)
 	}
 
-	return "", model.FileMetadata{}, false
-}
-
-type httpRange struct {
-	start, length int64
-}
-
-func ParseRange(s string, size int64) ([]httpRange, error) {
-	if !strings.HasPrefix(s, "bytes=") {
-		return nil, errors.New("invalid range")
+	fileInfo, err := os.Lstat(absPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return model.FileInfo{}, fmt.Errorf("file not found: %s: %w", filePath, err)
+		}
+		return model.FileInfo{}, fmt.Errorf("error accessing file %s: %w", filePath, err)
 	}
 
-	ranges := strings.Split(s[6:], ",")
-	result := make([]httpRange, 0, len(ranges))
-
-	for _, ra := range ranges {
-		ra = strings.TrimSpace(ra)
-		if ra == "" {
-			continue
-		}
-		i := strings.Index(ra, "-")
-		if i < 0 {
-			return nil, errors.New("invalid range")
-		}
-		start, end := strings.TrimSpace(ra[:i]), strings.TrimSpace(ra[i+1:])
-		var r httpRange
-
-		if start == "" {
-			// suffix-length
-			n, err := strconv.ParseInt(end, 10, 64)
-			if err != nil || n < 0 {
-				return nil, errors.New("invalid range")
-			}
-			if n > size {
-				n = size
-			}
-			r.start = size - n
-			r.length = size - r.start
-		} else {
-			// start-end
-			i, err := strconv.ParseInt(start, 10, 64)
-			if err != nil || i < 0 {
-				return nil, errors.New("invalid range")
-			}
-			if end == "" {
-				// start-
-				r.start = i
-				r.length = size - i
-			} else {
-				// start-end
-				j, err := strconv.ParseInt(end, 10, 64)
-				if err != nil || j < i {
-					return nil, errors.New("invalid range")
-				}
-				r.start = i
-				r.length = j - i + 1
-			}
-		}
-		if r.start >= size {
-			continue
-		}
-		if r.start+r.length > size {
-			r.length = size - r.start
-		}
-		result = append(result, r)
-	}
-	return result, nil
+	return buildFileInfo(absPath, fileInfo)
 }

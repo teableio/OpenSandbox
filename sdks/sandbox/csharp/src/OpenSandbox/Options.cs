@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,9 @@ namespace OpenSandbox;
 /// </summary>
 public class SandboxCreateOptions
 {
+    /// <summary>Omit SDK resource defaults for a snapshot restore.</summary>
+    public bool InheritSnapshotResources { get; set; }
+
     /// <summary>
     /// Gets or sets the connection configuration.
     /// </summary>
@@ -71,9 +74,19 @@ public class SandboxCreateOptions
     public IReadOnlyDictionary<string, string>? Metadata { get; set; }
 
     /// <summary>
+    /// Gets or sets optional lifecycle hooks applied during sandbox creation.
+    /// </summary>
+    public SandboxLifecycle? Lifecycle { get; set; }
+
+    /// <summary>
     /// Gets or sets the network policy for the sandbox.
     /// </summary>
     public NetworkPolicy? NetworkPolicy { get; set; }
+
+    /// <summary>
+    /// Gets or sets optional Credential Vault proxy startup settings.
+    /// </summary>
+    public CredentialProxyConfig? CredentialProxy { get; set; }
 
     /// <summary>
     /// Gets or sets an optional runtime platform constraint for sandbox provisioning.
@@ -101,6 +114,12 @@ public class SandboxCreateOptions
     public IReadOnlyDictionary<string, string>? Resource { get; set; }
 
     /// <summary>
+    /// Gets or sets the resource requests (guaranteed minimums).
+    /// When set, enables Kubernetes Burstable QoS (requests &lt; limits).
+    /// </summary>
+    public IReadOnlyDictionary<string, string>? ResourceRequests { get; set; }
+
+    /// <summary>
     /// Gets or sets the sandbox timeout in seconds.
     /// </summary>
     public int? TimeoutSeconds { get; set; }
@@ -109,6 +128,87 @@ public class SandboxCreateOptions
     /// Gets or sets whether the sandbox should disable automatic expiration and require explicit cleanup.
     /// </summary>
     public bool ManualCleanup { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether to skip health checks during creation.
+    /// </summary>
+    public bool SkipHealthCheck { get; set; }
+
+    /// <summary>
+    /// Gets or sets a custom health check function.
+    /// </summary>
+    public Func<Sandbox, Task<bool>>? HealthCheck { get; set; }
+
+    /// <summary>
+    /// Gets or sets the timeout for waiting until ready in seconds.
+    /// </summary>
+    public int? ReadyTimeoutSeconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets the health check polling interval in milliseconds.
+    /// </summary>
+    public int? HealthCheckPollingInterval { get; set; }
+}
+
+/// <summary>
+/// Options for creating a new sandbox from a Succeeded fsb template.
+/// </summary>
+/// <remarks>
+/// Template mode fixes the workload shape on the server: the entrypoint, env,
+/// resources, volumes, platform and lifecycle of the sandbox come from the
+/// template's golden image and cannot be overridden here. Only metadata,
+/// network policy and extensions may accompany the template id, and the
+/// timeout is required.
+/// </remarks>
+public class SandboxCreateFromTemplateOptions
+{
+    /// <summary>
+    /// Gets or sets the connection configuration.
+    /// </summary>
+    public ConnectionConfig? ConnectionConfig { get; set; }
+
+    /// <summary>
+    /// Gets or sets diagnostics options such as logging.
+    /// </summary>
+    public SdkDiagnosticsOptions? Diagnostics { get; set; }
+
+    /// <summary>
+    /// Gets or sets the adapter factory for advanced customization.
+    /// </summary>
+    public IAdapterFactory? AdapterFactory { get; set; }
+
+    /// <summary>
+    /// Gets or sets the ID of a Succeeded fsb template
+    /// (see <see cref="SandboxManager.CreateTemplateAsync"/>).
+    /// </summary>
+    public required string TemplateId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the sandbox timeout in seconds. Required in template mode.
+    /// </summary>
+    public required int TimeoutSeconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets the custom metadata tags.
+    /// </summary>
+    public IReadOnlyDictionary<string, string>? Metadata { get; set; }
+
+    /// <summary>
+    /// Gets or sets the network policy for the sandbox.
+    /// </summary>
+    public NetworkPolicy? NetworkPolicy { get; set; }
+
+    /// <summary>
+    /// Gets or sets the extension parameters passed through to the server as-is.
+    /// Prefer namespaced keys (e.g. "storage.id").
+    /// </summary>
+    public IReadOnlyDictionary<string, string>? Extensions { get; set; }
+
+    /// <summary>
+    /// Gets or sets the optional idle behavior (OSEP-0024, fast-sandbox only).
+    /// Control-plane state, not workload shape, so template mode accepts it.
+    /// </summary>
+    public IdlePolicy? IdlePolicy { get; set; }
 
     /// <summary>
     /// Gets or sets whether to skip health checks during creation.
@@ -157,7 +257,7 @@ public class SandboxConnectOptions
     public required string SandboxId { get; set; }
 
     /// <summary>
-    /// Gets or sets whether to skip health checks after connecting.
+    /// Skip health checks; required endpoints are still resolved.
     /// </summary>
     public bool SkipHealthCheck { get; set; }
 
@@ -167,12 +267,14 @@ public class SandboxConnectOptions
     public Func<Sandbox, Task<bool>>? HealthCheck { get; set; }
 
     /// <summary>
-    /// Gets or sets the timeout for waiting until ready in seconds.
+    /// Total endpoint publication and health check budget in seconds.
+    /// Custom checks and handlers must return tasks without synchronous blocking.
+    /// Timeout stops awaiting a task but does not guarantee that its work has stopped.
     /// </summary>
     public int? ReadyTimeoutSeconds { get; set; }
 
     /// <summary>
-    /// Gets or sets the health check polling interval in milliseconds.
+    /// Endpoint publication and health check polling interval in milliseconds.
     /// </summary>
     public int? HealthCheckPollingInterval { get; set; }
 }
@@ -262,6 +364,27 @@ public class SandboxFilter
 
     /// <summary>
     /// Gets or sets the page size.
+    /// </summary>
+    public int? PageSize { get; set; }
+}
+
+/// <summary>
+/// Filter options for listing templates.
+/// </summary>
+public class TemplateFilter
+{
+    /// <summary>
+    /// Gets or sets the metadata to filter by (AND logic).
+    /// </summary>
+    public IReadOnlyDictionary<string, string>? Metadata { get; set; }
+
+    /// <summary>
+    /// Gets or sets the page number (1-indexed).
+    /// </summary>
+    public int? Page { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of items per page (1-200).
     /// </summary>
     public int? PageSize { get; set; }
 }

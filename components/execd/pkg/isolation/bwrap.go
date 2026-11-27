@@ -1,0 +1,544 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build linux
+
+package isolation
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+type bwrapLifecycleArgv struct {
+	gateExecFD string
+	controlFD  string
+	blockFD    string
+	statusFD   string
+}
+
+// buildArgv constructs the legacy bwrap command line from wrap options.
+func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
+	return buildArgvWithLifecycle(opts, seccompFd, nil)
+}
+
+// buildArgvWithLifecycle constructs the bwrap command line and, when lifecycle
+// is non-nil, executes the native fail-closed workload gate directly through
+// its inherited descriptor.
+func buildArgvWithLifecycle(
+	opts WrapOptions,
+	seccompFd string,
+	lifecycle *bwrapLifecycleArgv,
+) ([]string, error) {
+	if err := validateWrapOptions(opts); err != nil {
+		return nil, err
+	}
+
+	useUserns := opts.UidMode == UidModeUserns
+
+	var argv []string
+
+	argv = append(argv, bwrapNamespaceSegment(opts, useUserns)...)
+
+	argv = append(argv, "--ro-bind", "/", "/")
+
+	if !OverlaysCoverPath(opts.Overlays, "/tmp") {
+		if opts.TmpDir != "" {
+			argv = append(argv, "--bind", opts.TmpDir, "/tmp")
+		} else {
+			argv = append(argv, bwrapTmpSegment(opts.Profile)...)
+		}
+	}
+
+	// Mount shallow-to-deep so nested overlays shadow only their own subtrees.
+	ovArgv, err := bwrapOverlaySegments(opts.Overlays)
+	if err != nil {
+		return nil, err
+	}
+	argv = append(argv, ovArgv...)
+
+	// Hide upper roots so the ro-bind of / below cannot expose other
+	// sessions' host state in-namespace.
+	for _, upperRoot := range upperHideRoots(opts.Overlays, opts.TmpDir) {
+		argv = append(argv, "--tmpfs", upperRoot)
+	}
+
+	for _, p := range opts.ExtraWritable {
+		argv = append(argv, "--bind", p, p)
+	}
+
+	for _, b := range opts.Binds {
+		dest := b.Dest
+		if dest == "" {
+			dest = b.Source
+		}
+		flag := "--bind"
+		if b.ReadOnly {
+			flag = "--ro-bind"
+		}
+		argv = append(argv, flag, b.Source, dest)
+	}
+
+	// Mount trusted /run, /dev and /proc last to hide host state and protect the gate's /proc/self/fd path.
+	// The parent mount namespace is trusted; concurrent procfs replacement requires an execveat-based launcher.
+	argv = append(argv, "--tmpfs", "/run", "--dev", "/dev", "--proc", "/proc")
+
+	argv = append(argv, bwrapEnvSegment(opts.EnvPassthrough)...)
+
+	if seccompFd != "" {
+		argv = append(argv, "--seccomp", seccompFd)
+	}
+
+	// Setpgid already makes bwrap a group leader; --new-session would make setsid fail with EPERM.
+	argv = append(argv, "--die-with-parent")
+	if lifecycle != nil {
+		argv = append(
+			argv,
+			"--block-fd", lifecycle.blockFD,
+			"--json-status-fd", lifecycle.statusFD,
+		)
+	}
+
+	argv = append(argv, "--")
+
+	// In setpriv mode the trusted gate must run before credentials are dropped.
+	// Execd authenticates and inspects the blocked gate through /proc; moving
+	// setpriv after the gate keeps those checks available without granting
+	// CAP_SYS_PTRACE. Once READY arrives, the gate execs setpriv and the caller's
+	// command in the same PID and namespaces.
+	if lifecycle != nil {
+		argv = append(
+			argv,
+			"/proc/self/fd/"+lifecycle.gateExecFD,
+			lifecycle.controlFD,
+			lifecycle.gateExecFD,
+			"--",
+		)
+	}
+
+	// In userns mode, uid/gid are set via --uid/--gid in segment 1.
+	if !useUserns {
+		uid := uint32(os.Getuid())
+		gid := uint32(os.Getgid())
+		if opts.Uid != nil {
+			uid = *opts.Uid
+		}
+		if opts.Gid != nil {
+			gid = *opts.Gid
+		}
+
+		if uid != 0 || gid != 0 {
+			setprivArgv := []string{
+				"setpriv",
+				fmt.Sprintf("--reuid=%d", uid),
+				fmt.Sprintf("--regid=%d", gid),
+				"--clear-groups",
+			}
+			argv = append(argv, setprivArgv...)
+		}
+	}
+
+	return argv, nil
+}
+
+func bwrapNamespaceSegment(opts WrapOptions, useUserns bool) []string {
+	var argv []string
+	if useUserns {
+		argv = append(argv, "--unshare-user")
+		// --disable-userns is unsupported by the setuid build of bwrap;
+		// only add it for the non-setuid binary.
+		if !bwrapIsSetuid {
+			argv = append(argv, "--disable-userns")
+		}
+	}
+	argv = append(argv, "--unshare-pid", "--unshare-uts", "--hostname", "sandbox", "--unshare-ipc", "--unshare-cgroup")
+	if !opts.ShareNet {
+		argv = append(argv, "--unshare-net")
+	}
+	if useUserns {
+		uid := uint32(os.Getuid())
+		gid := uint32(os.Getgid())
+		if opts.Uid != nil {
+			uid = *opts.Uid
+		}
+		if opts.Gid != nil {
+			gid = *opts.Gid
+		}
+		argv = append(argv,
+			"--uid", strconv.FormatUint(uint64(uid), 10),
+			"--gid", strconv.FormatUint(uint64(gid), 10),
+		)
+	}
+	return argv
+}
+
+func validateWrapOptions(opts WrapOptions) error {
+	if len(opts.Overlays) == 0 {
+		return errors.New("isolation: at least one overlay is required")
+	}
+	var tmpRoot string
+	if opts.TmpDir != "" {
+		tmpRoot = filepath.Dir(filepath.Dir(opts.TmpDir))
+	}
+	if err := validateOverlaySpecs(opts.Overlays, tmpRoot); err != nil {
+		return err
+	}
+	if !opts.Profile.Valid() {
+		return fmt.Errorf("isolation: unknown profile %q", opts.Profile)
+	}
+	if !opts.EnvPassthrough.Mode.Valid() && opts.EnvPassthrough.Mode != "" {
+		return fmt.Errorf("isolation: unknown env mode %q", opts.EnvPassthrough.Mode)
+	}
+	if opts.UidMode != "" && !opts.UidMode.Valid() {
+		return fmt.Errorf("isolation: unknown uid mode %q", opts.UidMode)
+	}
+	if opts.TmpDir != "" {
+		if !filepath.IsAbs(opts.TmpDir) {
+			return fmt.Errorf("isolation: tmp dir %q must be an absolute path", opts.TmpDir)
+		}
+		// The hide root is Dir(Dir(TmpDir)); shallower paths would derive
+		// "/" and brick the namespace (same rule as validateUpperDirs).
+		if pathDepth(opts.TmpDir) < 3 {
+			return fmt.Errorf(
+				"isolation: tmp dir %q must live under an upper root (<root>/<session>/tmp)",
+				opts.TmpDir,
+			)
+		}
+	}
+	return validateBinds(opts.Binds)
+}
+
+func validateOverlaySpecs(overlays []OverlaySpec, extraHideRoot string) error {
+	seen := make(map[string]struct{}, len(overlays))
+	for i := range overlays {
+		if err := validateOverlaySpec(&overlays[i]); err != nil {
+			return err
+		}
+		key := filepath.Clean(overlays[i].Path)
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("isolation: duplicate overlay path %q", overlays[i].Path)
+		}
+		seen[key] = struct{}{}
+	}
+	// The upper-root hiding tmpfs is emitted after the overlay segments, so
+	// an overlay destination under a derived upper root would be silently
+	// shadowed — a dead mount whose writes never surface. Fail fast instead.
+	// extraHideRoot is the /tmp backing dir's derived root, hidden likewise.
+	hideRoots := distinctUpperRoots(overlays)
+	if extraHideRoot != "" {
+		hideRoots = append(hideRoots, extraHideRoot)
+	}
+	for _, upperRoot := range hideRoots {
+		for i := range overlays {
+			p := filepath.Clean(overlays[i].Path)
+			if p == upperRoot || strings.HasPrefix(p, upperRoot+"/") {
+				return fmt.Errorf(
+					"isolation: overlay %q is shadowed by the upper-root tmpfs at %s",
+					overlays[i].Path,
+					upperRoot,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func validateOverlaySpec(ov *OverlaySpec) error {
+	if ov.Path == "" {
+		return errors.New("isolation: overlay.path is required")
+	}
+	if !filepath.IsAbs(ov.Path) {
+		return fmt.Errorf("isolation: overlay.path %q must be an absolute path", ov.Path)
+	}
+	if !ov.Mode.Valid() {
+		return fmt.Errorf("isolation: unknown overlay mode %q", ov.Mode)
+	}
+	if ov.Mode != WorkspaceOverlay && (ov.UpperDir != "" || ov.WorkDir != "") {
+		return fmt.Errorf(
+			"isolation: overlay %q: upperdir/workdir apply only to overlay mode",
+			ov.Path,
+		)
+	}
+	if ov.UpperDir == "" && ov.WorkDir != "" {
+		return fmt.Errorf(
+			"isolation: overlay %q: workdir requires an upperdir",
+			ov.Path,
+		)
+	}
+	return validateUpperDirs(ov)
+}
+
+func validateUpperDirs(ov *OverlaySpec) error {
+	if ov.UpperDir == "" {
+		return nil
+	}
+	// The upper dirs flow into bwrap argv verbatim and the upper-root
+	// hiding derives <upper_root> as Dir(Dir(UpperDir)), so they must be
+	// absolute and deep enough: a relative upperdir would resolve against
+	// execd's cwd, and a shallow one would derive "/" and emit --tmpfs /,
+	// hiding the whole namespace rootfs. Reject both here so callers get
+	// a named error instead of a misdirected or bricked sandbox.
+	if !filepath.IsAbs(ov.UpperDir) {
+		return fmt.Errorf(
+			"isolation: overlay %q: upperdir %q must be an absolute path",
+			ov.Path,
+			ov.UpperDir,
+		)
+	}
+	if ov.WorkDir != "" && !filepath.IsAbs(ov.WorkDir) {
+		return fmt.Errorf(
+			"isolation: overlay %q: workdir %q must be an absolute path",
+			ov.Path,
+			ov.WorkDir,
+		)
+	}
+	if pathDepth(ov.UpperDir) < 3 {
+		return fmt.Errorf(
+			"isolation: overlay %q: upperdir %q must live under an upper root (<root>/<session>/upper)",
+			ov.Path,
+			ov.UpperDir,
+		)
+	}
+	return nil
+}
+
+func validateBinds(binds []BindMount) error {
+	for _, b := range binds {
+		if b.Source == "" {
+			return errors.New("isolation: bind.source is required")
+		}
+		if !filepath.IsAbs(b.Source) {
+			return fmt.Errorf("isolation: bind.source %q must be an absolute path", b.Source)
+		}
+		if b.Dest != "" && !filepath.IsAbs(b.Dest) {
+			return fmt.Errorf("isolation: bind.dest %q must be an absolute path", b.Dest)
+		}
+		// Dest / shadows every earlier mount in the namespace while the
+		// files view keeps serving them — reject the divergence.
+		if filepath.Clean(b.Dest) == "/" {
+			return fmt.Errorf(`isolation: bind.dest "/" would shadow the namespace root`)
+		}
+	}
+	return nil
+}
+
+func bwrapTmpSegment(p Profile) []string {
+	switch p {
+	case ProfileStrict:
+		return []string{"--tmpfs", "/tmp"}
+	default:
+		// balanced and others: share container /tmp.
+		return []string{"--bind", "/tmp", "/tmp"}
+	}
+}
+
+// pathDepth counts the segments of a cleaned absolute path: "/" → 0,
+// "/workspace" → 1, "/workspace/sub" → 2.
+func pathDepth(p string) int {
+	cleaned := filepath.Clean(p)
+	if cleaned == "/" {
+		return 0
+	}
+	return strings.Count(cleaned, "/")
+}
+
+// sortOverlaysShallowFirst returns the overlays ordered by path depth,
+// preserving caller order for equal depth. bubblewrap processes mounts in
+// argv order and a later mount shadows earlier ones in its subtree, so a
+// nested overlay must be emitted after its ancestors for the nesting to
+// take effect.
+func sortOverlaysShallowFirst(overlays []OverlaySpec) []OverlaySpec {
+	ordered := append([]OverlaySpec(nil), overlays...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return pathDepth(ordered[i].Path) < pathDepth(ordered[j].Path)
+	})
+	return ordered
+}
+
+// upperHideRoots returns the roots to hide in-namespace: one per overlay
+// upper root plus the /tmp backing dir's derived root, deduped. Dir(Dir(
+// upper|tmpDir)) yields the operator-configured upper root for both.
+func upperHideRoots(overlays []OverlaySpec, tmpDir string) []string {
+	roots := distinctUpperRoots(overlays)
+	if tmpDir == "" {
+		return roots
+	}
+	root := filepath.Dir(filepath.Dir(tmpDir))
+	for _, r := range roots {
+		if r == root {
+			return roots
+		}
+	}
+	return append(roots, root)
+}
+
+// distinctUpperRoots returns one hidden root per distinct upper root
+// containing a persistent overlay upper: filepath.Dir(filepath.Dir(upper)),
+// i.e. the operator-configured upper_root itself.
+func distinctUpperRoots(overlays []OverlaySpec) []string {
+	seen := make(map[string]struct{})
+	var roots []string
+	for _, ov := range overlays {
+		if ov.Mode != WorkspaceOverlay || ov.UpperDir == "" {
+			continue
+		}
+		root := filepath.Dir(filepath.Dir(ov.UpperDir))
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		roots = append(roots, root)
+	}
+	return roots
+}
+
+func bwrapOverlaySegments(overlays []OverlaySpec) ([]string, error) {
+	var argv []string
+	for _, ov := range sortOverlaysShallowFirst(overlays) {
+		switch ov.Mode {
+		case WorkspaceRW:
+			argv = append(argv, "--bind", ov.Path, ov.Path)
+
+		case WorkspaceRO:
+			argv = append(argv, "--ro-bind", ov.Path, ov.Path)
+
+		case WorkspaceOverlay:
+			if ov.UpperDir == "" {
+				// tmpfs upper — ephemeral. --tmp-overlay DEST (bwrap v0.11.x).
+				argv = append(argv, "--overlay-src", ov.Path, "--tmp-overlay", ov.Path)
+				continue
+			}
+			workDir := ov.WorkDir
+			if workDir == "" {
+				workDir = ov.UpperDir + "-work"
+			}
+			// --overlay-src LOWER --overlay RWSRC WORKDIR DEST
+			argv = append(argv, "--overlay-src", ov.Path, "--overlay", ov.UpperDir, workDir, ov.Path)
+
+		default:
+			return nil, fmt.Errorf("isolation: unknown overlay mode %q", ov.Mode)
+		}
+	}
+	return argv, nil
+}
+
+func unsetExecdConfigEnv() []string {
+	argv := make([]string, 0, 2*len(execdConfigEnvBlacklist))
+	for _, key := range execdConfigEnvBlacklist {
+		argv = append(argv, "--unsetenv", key)
+	}
+	return argv
+}
+
+func unsetBlacklistedEnv() []string {
+	var argv []string
+	for _, pattern := range strictEnvBlacklist {
+		for _, env := range os.Environ() {
+			kv := strings.SplitN(env, "=", 2)
+			if matchEnvPattern(kv[0], pattern) {
+				argv = append(argv, "--unsetenv", kv[0])
+			}
+		}
+	}
+	return argv
+}
+
+// bwrapEnvSegment returns environment passthrough args. execd's own config
+// env (execdConfigEnvBlacklist) is always stripped, regardless of mode.
+func bwrapEnvSegment(spec EnvSpec) []string {
+	if spec.Mode == "" {
+		argv := unsetExecdConfigEnv()
+		return append(argv, unsetBlacklistedEnv()...)
+	}
+
+	switch spec.Mode {
+	case EnvModeDeny:
+		argv := unsetExecdConfigEnv()
+		for _, key := range spec.Keys {
+			argv = append(argv, "--unsetenv", key)
+		}
+		if len(spec.Keys) == 0 {
+			argv = append(argv, unsetBlacklistedEnv()...)
+		}
+		return argv
+
+	case EnvModeAllow:
+		// --clearenv wipes everything; refuse to re-inject execd config env
+		// even if the caller allow-lists it.
+		argv := []string{"--clearenv"}
+		blacklist := make(map[string]struct{}, len(execdConfigEnvBlacklist))
+		for _, k := range execdConfigEnvBlacklist {
+			blacklist[k] = struct{}{}
+		}
+		for _, key := range spec.Keys {
+			if _, blocked := blacklist[key]; blocked {
+				continue
+			}
+			if val, ok := os.LookupEnv(key); ok {
+				argv = append(argv, "--setenv", key, val)
+			}
+		}
+		return argv
+
+	default:
+		return nil
+	}
+}
+
+// strictEnvBlacklist defines glob patterns stripped in strict profile.
+var strictEnvBlacklist = []string{
+	"*_API_KEY", "*_TOKEN", "*_SECRET", "*_PASSWORD",
+	"AWS_*", "ALI_*", "ALIYUN_*", "K8S_*", "KUBE_*",
+}
+
+// matchEnvPattern performs a simple case-insensitive glob match.
+func matchEnvPattern(name, pattern string) bool {
+	name = strings.ToUpper(name)
+	pattern = strings.ToUpper(pattern)
+
+	// Wildcard-only: *TOKEN* → contains TOKEN
+	if strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*") {
+		mid := pattern[1 : len(pattern)-1]
+		return strings.Contains(name, mid)
+	}
+	// Suffix wildcard: *_TOKEN → has suffix _TOKEN
+	if strings.HasPrefix(pattern, "*") {
+		suffix := pattern[1:]
+		return strings.HasSuffix(name, suffix)
+	}
+	// Prefix wildcard: AWS_* → has prefix AWS_
+	if strings.HasSuffix(pattern, "*") {
+		prefix := pattern[:len(pattern)-1]
+		return strings.HasPrefix(name, prefix)
+	}
+	// Exact match.
+	return name == pattern
+}
+
+func wrapWithArgv(cmd *exec.Cmd, bwrapPath string, argv []string) {
+	// argv already contains the bwrap separator and any lifecycle gate or
+	// identity-switch prefix. The original cmd.Args[0] follows that prefix.
+	userArgs := cmd.Args
+	cmd.Args = make([]string, 0, len(argv)+len(userArgs))
+	cmd.Args = append(cmd.Args, bwrapPath)
+	cmd.Args = append(cmd.Args, argv...)
+	cmd.Args = append(cmd.Args, userArgs...)
+	cmd.Path = bwrapPath
+}

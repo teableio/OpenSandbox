@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -90,6 +90,33 @@ func TestVerifySignature_OKAnd401(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestVerifySignature_SingleByteDiffRejected guards the constant-time
+// signature comparison in VerifySignature: a signature that differs from
+// the expected value in a single hex character must still be rejected.
+// This locks in the behavior that the check is not merely length-based
+// and catches a regression where an equal-length forgery could slip
+// through a misused crypto/subtle call.
+func TestVerifySignature_SingleByteDiffRejected(t *testing.T) {
+	secret := []byte("test-secret-bytes")
+	sb := "my-sandbox"
+	port := 9000
+	exp := testExpiresB36(t)
+	hex8 := ExpectedHex8(Inner(secret, CanonicalBytes(sb, port, exp)))
+	v := &Verifier{Keys: map[string][]byte{"z": secret}}
+
+	// Replace the last hex char of the expected signature with a
+	// deterministically different lowercase hex digit. Same length,
+	// same key id, only one nibble different.
+	other := byte('0')
+	if hex8[7] == '0' {
+		other = '1'
+	}
+	tampered := hex8[:7] + string(other) + "z"
+	err := v.VerifySignature(tampered, sb, port, exp)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrUnauthorized))
+}
+
 func TestVerifySignature_ExpiryComparisonAvoidsUint64Overflow(t *testing.T) {
 	secret := []byte("test-secret-bytes")
 	sb := "my-sandbox"
@@ -102,11 +129,11 @@ func TestVerifySignature_ExpiryComparisonAvoidsUint64Overflow(t *testing.T) {
 	assert.NoError(t, v.VerifySignature(sig, sb, port, exp))
 }
 
-func TestHTTPStatusForErr(t *testing.T) {
-	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForErr(fmt.Errorf("%w: x", ErrUnauthorized)))
-	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForErr(ErrAccessExpired))
-	assert.Equal(t, http.StatusBadRequest, HTTPStatusForErr(fmt.Errorf("bad format")))
-	assert.Equal(t, 0, HTTPStatusForErr(nil))
+func TestHTTPStatusForIngressErr(t *testing.T) {
+	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForIngressErr(fmt.Errorf("%w: x", ErrUnauthorized)))
+	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForIngressErr(ErrAccessExpired))
+	assert.Equal(t, http.StatusBadRequest, HTTPStatusForIngressErr(fmt.Errorf("bad format")))
+	assert.Equal(t, 0, HTTPStatusForIngressErr(nil))
 	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForIngressErr(ErrSecureHeaderMismatch))
 	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForIngressErr(ErrSignatureRequired))
 	assert.Equal(t, http.StatusServiceUnavailable, HTTPStatusForIngressErr(ErrVerifierNotConfigured))
@@ -189,4 +216,16 @@ func TestParseKeys(t *testing.T) {
 
 	_, err = ParseKeys("K=" + base64.StdEncoding.EncodeToString(raw))
 	assert.Error(t, err)
+}
+
+func TestParsePortSegment_RejectsSign(t *testing.T) {
+	// OSEP-0011: port is decimal 1..65535 with no leading zeros. strconv.Atoi
+	// also takes a sign, which would let "+08080" slip past the zero check.
+	for _, s := range []string{"+8080", "+08080", "-1", "+0"} {
+		_, err := ParsePortSegment(s)
+		assert.Errorf(t, err, "port %q", s)
+	}
+	p, err := ParsePortSegment("8080")
+	assert.NoError(t, err)
+	assert.Equal(t, 8080, p)
 }

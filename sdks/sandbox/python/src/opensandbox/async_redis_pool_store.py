@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,13 +22,22 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar, cast
 
-from opensandbox.exceptions import PoolStateStoreUnavailableException
-from opensandbox.pool_types import IdleEntry, StoreCounters
+from opensandbox.exceptions import (
+    PoolDestroyedException,
+    PoolStateStoreUnavailableException,
+)
+from opensandbox.pool_types import (
+    IdleEntry,
+    PoolDestroyState,
+    StoreCounters,
+    TakeIdleResult,
+)
 from opensandbox.redis_pool_store import (
     _REQUIRED_REDIS_METHODS,
     Redis,
     RedisPoolStateStore,
     _decode,
+    _decode_take_idle_result,
     _millis,
     _validate_owner_and_ttl,
 )
@@ -55,6 +64,20 @@ class AsyncRedisPoolStateStore:
         self._default_idle_ttl = timedelta(hours=24)
 
     async def try_take_idle(self, pool_name: str) -> str | None:
+        result = await self._eval_take_idle(pool_name, "0")
+        return result.sandbox_id
+
+    async def try_take_idle_min_ttl(
+        self, pool_name: str, min_remaining_ttl: timedelta
+    ) -> TakeIdleResult:
+        """Variant of :meth:`try_take_idle` that skips entries with insufficient remaining TTL."""
+        if min_remaining_ttl.total_seconds() <= 0:
+            return TakeIdleResult(sandbox_id=await self.try_take_idle(pool_name))
+        return await self._eval_take_idle(pool_name, str(max(0, _millis(min_remaining_ttl))))
+
+    async def _eval_take_idle(
+        self, pool_name: str, min_remaining_ttl_ms: str
+    ) -> TakeIdleResult:
         result = await self._execute(
             "try_take_idle",
             pool_name,
@@ -65,10 +88,11 @@ class AsyncRedisPoolStateStore:
                     2,
                     self._idle_list_key(pool_name),
                     self._idle_expires_key(pool_name),
+                    min_remaining_ttl_ms,
                 ),
             ),
         )
-        return _decode(result) if result is not None else None
+        return _decode_take_idle_result(result)
 
     async def put_idle(self, pool_name: str, sandbox_id: str) -> None:
         if not sandbox_id or not sandbox_id.strip():
@@ -77,16 +101,15 @@ class AsyncRedisPoolStateStore:
         await self._execute(
             "put_idle",
             pool_name,
-            lambda: cast(
-                Awaitable[Any],
-                self._redis.eval(
-                    RedisPoolStateStore._PUT_IDLE_SCRIPT,
-                    2,
-                    self._idle_list_key(pool_name),
-                    self._idle_expires_key(pool_name),
-                    sandbox_id,
-                    str(ttl_millis),
-                ),
+            lambda: self._eval_fenced_write(
+                pool_name,
+                3,
+                RedisPoolStateStore._PUT_IDLE_SCRIPT,
+                self._idle_list_key(pool_name),
+                self._idle_expires_key(pool_name),
+                self._destroy_state_key(pool_name),
+                sandbox_id,
+                str(ttl_millis),
             ),
         )
 
@@ -110,19 +133,22 @@ class AsyncRedisPoolStateStore:
         self, pool_name: str, owner_id: str, ttl: timedelta
     ) -> bool:
         _validate_owner_and_ttl(owner_id, ttl)
-
-        async def op() -> bool:
-            acquired = await self._redis.set(
-                self._primary_lock_key(pool_name),
-                owner_id,
-                nx=True,
-                px=max(1, _millis(ttl)),
-            )
-            return bool(acquired) or await self.renew_primary_lock(
-                pool_name, owner_id, ttl
-            )
-
-        return await self._execute("try_acquire_primary_lock", pool_name, op)
+        result = await self._execute(
+            "try_acquire_primary_lock",
+            pool_name,
+            lambda: cast(
+                Awaitable[Any],
+                self._redis.eval(
+                    RedisPoolStateStore._ACQUIRE_LOCK_SCRIPT,
+                    2,
+                    self._primary_lock_key(pool_name),
+                    self._destroy_state_key(pool_name),
+                    owner_id,
+                    str(max(1, _millis(ttl))),
+                ),
+            ),
+        )
+        return result == 1 or result == b"1"
 
     async def renew_primary_lock(
         self, pool_name: str, owner_id: str, ttl: timedelta
@@ -135,8 +161,9 @@ class AsyncRedisPoolStateStore:
                 Awaitable[Any],
                 self._redis.eval(
                     RedisPoolStateStore._RENEW_LOCK_SCRIPT,
-                    1,
+                    2,
                     self._primary_lock_key(pool_name),
+                    self._destroy_state_key(pool_name),
                     owner_id,
                     str(max(1, _millis(ttl))),
                 ),
@@ -160,7 +187,24 @@ class AsyncRedisPoolStateStore:
         )
 
     async def reap_expired_idle(self, pool_name: str, now: datetime) -> None:
-        await self._execute(
+        await self._reap_idle(pool_name, "0")
+
+    async def reap_expired_idle_min_ttl(
+        self, pool_name: str, now: datetime, min_remaining_ttl: timedelta
+    ) -> tuple[str, ...]:
+        """Variant of :meth:`reap_expired_idle` that also evicts near-expiry entries.
+
+        Returns IDs of alive evicted sandboxes (excluding fully-expired entries).
+        """
+        if min_remaining_ttl.total_seconds() <= 0:
+            await self.reap_expired_idle(pool_name, now)
+            return ()
+        return await self._reap_idle(pool_name, str(max(0, _millis(min_remaining_ttl))))
+
+    async def _reap_idle(
+        self, pool_name: str, min_remaining_ttl_ms: str
+    ) -> tuple[str, ...]:
+        result = await self._execute(
             "reap_expired_idle",
             pool_name,
             lambda: cast(
@@ -170,9 +214,13 @@ class AsyncRedisPoolStateStore:
                     2,
                     self._idle_list_key(pool_name),
                     self._idle_expires_key(pool_name),
+                    min_remaining_ttl_ms,
                 ),
             ),
         )
+        if not result:
+            return ()
+        return tuple(_decode(item) for item in result)
 
     async def snapshot_counters(self, pool_name: str) -> StoreCounters:
         async def op() -> StoreCounters:
@@ -246,7 +294,14 @@ class AsyncRedisPoolStateStore:
         await self._execute(
             "set_max_idle",
             pool_name,
-            lambda: self._redis.set(self._max_idle_key(pool_name), str(max_idle)),
+            lambda: self._eval_fenced_write(
+                pool_name,
+                2,
+                RedisPoolStateStore._SET_VALUE_SCRIPT,
+                self._max_idle_key(pool_name),
+                self._destroy_state_key(pool_name),
+                str(max_idle),
+            ),
         )
 
     async def set_idle_entry_ttl(self, pool_name: str, idle_ttl: timedelta) -> None:
@@ -255,10 +310,93 @@ class AsyncRedisPoolStateStore:
         await self._execute(
             "set_idle_entry_ttl",
             pool_name,
-            lambda: self._redis.set(
-                self._idle_ttl_key(pool_name), str(max(1, _millis(idle_ttl)))
+            lambda: self._eval_fenced_write(
+                pool_name,
+                2,
+                RedisPoolStateStore._SET_VALUE_SCRIPT,
+                self._idle_ttl_key(pool_name),
+                self._destroy_state_key(pool_name),
+                str(max(1, _millis(idle_ttl))),
             ),
         )
+
+    async def get_destroy_state(self, pool_name: str) -> PoolDestroyState:
+        value = await self._execute(
+            "get_destroy_state",
+            pool_name,
+            lambda: self._redis.get(self._destroy_state_key(pool_name)),
+        )
+        if value is None:
+            return PoolDestroyState.ACTIVE
+        decoded = _decode(value)
+        if decoded == PoolDestroyState.DESTROYING.value:
+            return PoolDestroyState.DESTROYING
+        if decoded == PoolDestroyState.DESTROYED.value:
+            return PoolDestroyState.DESTROYED
+        return PoolDestroyState.ACTIVE
+
+    async def begin_destroy(self, pool_name: str, owner_id: str) -> None:
+        if not owner_id or not owner_id.strip():
+            raise ValueError("owner_id must not be blank")
+
+        async def op() -> None:
+            result = await cast(
+                Awaitable[Any],
+                self._redis.eval(
+                    RedisPoolStateStore._BEGIN_DESTROY_SCRIPT,
+                    2,
+                    self._destroy_state_key(pool_name),
+                    self._destroy_owner_key(pool_name),
+                    PoolDestroyState.DESTROYING.value,
+                    PoolDestroyState.DESTROYED.value,
+                    owner_id,
+                ),
+            )
+            if result == -1 or result == b"-1":
+                raise PoolDestroyedException(
+                    f"Pool namespace is already DESTROYED: pool_name={pool_name}"
+                )
+
+        await self._execute("begin_destroy", pool_name, op)
+
+    async def clear_pool_state(self, pool_name: str) -> None:
+        await self._execute(
+            "clear_pool_state",
+            pool_name,
+            lambda: self._redis.delete(
+                self._idle_list_key(pool_name),
+                self._idle_expires_key(pool_name),
+                self._primary_lock_key(pool_name),
+                self._max_idle_key(pool_name),
+                self._idle_ttl_key(pool_name),
+            ),
+        )
+
+    async def mark_destroyed(
+        self, pool_name: str, owner_id: str, tombstone_ttl: timedelta | None
+    ) -> None:
+        if not owner_id or not owner_id.strip():
+            raise ValueError("owner_id must not be blank")
+        if tombstone_ttl is not None and tombstone_ttl.total_seconds() <= 0:
+            raise ValueError("tombstone_ttl must be positive")
+
+        async def op() -> None:
+            if tombstone_ttl is None:
+                await self._redis.set(
+                    self._destroy_state_key(pool_name),
+                    PoolDestroyState.DESTROYED.value,
+                )
+                await self._redis.set(self._destroy_owner_key(pool_name), owner_id)
+            else:
+                px = max(1, _millis(tombstone_ttl))
+                await self._redis.set(
+                    self._destroy_state_key(pool_name),
+                    PoolDestroyState.DESTROYED.value,
+                    px=px,
+                )
+                await self._redis.set(self._destroy_owner_key(pool_name), owner_id, px=px)
+
+        await self._execute("mark_destroyed", pool_name, op)
 
     async def _resolve_idle_ttl(self, pool_name: str) -> timedelta:
         value = await self._execute(
@@ -288,6 +426,26 @@ class AsyncRedisPoolStateStore:
     def _idle_ttl_key(self, pool_name: str) -> str:
         return self._pool_key(pool_name, "idleTtlMillis")
 
+    def _destroy_state_key(self, pool_name: str) -> str:
+        return self._pool_key(pool_name, "destroy:state")
+
+    def _destroy_owner_key(self, pool_name: str) -> str:
+        return self._pool_key(pool_name, "destroy:owner")
+
+    async def _eval_fenced_write(
+        self, pool_name: str, numkeys: int, script: str, *args: str
+    ) -> Any:
+        result = await cast(
+            Awaitable[Any],
+            self._redis.eval(script, numkeys, *args),
+        )
+        if result == -1 or result == b"-1":
+            state = await self.get_destroy_state(pool_name)
+            raise PoolDestroyedException(
+                f"Pool namespace is {state.value}: pool_name={pool_name}"
+            )
+        return result
+
     def _pool_key(self, pool_name: str, suffix: str) -> str:
         if not pool_name or not pool_name.strip():
             raise ValueError("pool_name must not be blank")
@@ -299,7 +457,7 @@ class AsyncRedisPoolStateStore:
     ) -> T:
         try:
             return await block()
-        except ValueError:
+        except (ValueError, PoolDestroyedException):
             raise
         except Exception as exc:
             raise PoolStateStoreUnavailableException(

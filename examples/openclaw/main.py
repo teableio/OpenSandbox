@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,7 +54,8 @@ def check_openclaw(sbx: SandboxSync, port: int = DEFAULT_PORT) -> bool:
                     elapsed = time.perf_counter() - start
                     print(f"[check] sandbox ready after {elapsed:.1f}s")
                     return True
-            except Exception as exc:
+            except Exception:
+                # The gateway may still be starting; retry quietly until polling times out.
                 pass
             time.sleep(0.2)
         return False
@@ -72,8 +73,8 @@ def main() -> None:
     port = DEFAULT_PORT
 
     print(f"Creating openclaw sandbox with image={image} on OpenSandbox server {server}...")
-    print(f"  API Key: {api_key[:16]}..." if len(api_key) > 16 else f"  API Key: {api_key}")
-    print(f"  Token: {token[:16]}..." if len(token) > 16 else f"  Token: {token}")
+    print(f"  API Key: {'[REDACTED] (set)' if api_key else '[NOT SET]'}")
+    print(f"  Token: {'[REDACTED] (set)' if token else '[NOT SET]'}")
     print(f"  Port: {port}")
     print(f"  Timeout: {timeout_seconds}s")
     

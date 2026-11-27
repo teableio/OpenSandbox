@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,18 +18,32 @@
 from opensandbox._async_pool_store import InMemoryAsyncPoolStateStore
 from opensandbox._pool_store import InMemoryPoolStateStore
 from opensandbox.pool_async import AsyncSandboxPool, SandboxPoolAsync
+from opensandbox.pool_manager import (
+    SandboxPoolManager,
+    SandboxPoolManagerAsync,
+    SandboxPoolManagerSync,
+)
 from opensandbox.pool_types import (
     AcquirePolicy,
     AsyncPoolConfig,
+    AsyncPooledSandboxCreator,
     AsyncPoolStateStore,
     IdleEntry,
     PoolConfig,
     PoolCreationSpec,
+    PoolDestroyOptions,
+    PoolDestroyResult,
+    PoolDestroyState,
+    PoolDestroyStrategy,
+    PooledSandboxCreateContext,
+    PooledSandboxCreateReason,
+    PooledSandboxCreator,
     PoolLifecycleState,
     PoolSnapshot,
     PoolState,
     PoolStateStore,
     StoreCounters,
+    TakeIdleResult,
 )
 from opensandbox.sync.pool import SandboxPoolSync
 
@@ -37,20 +51,32 @@ SandboxPool = SandboxPoolSync
 
 __all__ = [
     "AcquirePolicy",
+    "AsyncPooledSandboxCreator",
     "AsyncPoolConfig",
     "AsyncPoolStateStore",
     "AsyncSandboxPool",
     "IdleEntry",
     "InMemoryAsyncPoolStateStore",
     "InMemoryPoolStateStore",
+    "PooledSandboxCreateContext",
+    "PooledSandboxCreateReason",
+    "PooledSandboxCreator",
     "PoolConfig",
     "PoolCreationSpec",
+    "PoolDestroyOptions",
+    "PoolDestroyResult",
+    "PoolDestroyState",
+    "PoolDestroyStrategy",
     "PoolLifecycleState",
     "PoolSnapshot",
     "PoolState",
     "PoolStateStore",
     "SandboxPoolAsync",
     "SandboxPool",
+    "SandboxPoolManager",
+    "SandboxPoolManagerAsync",
+    "SandboxPoolManagerSync",
     "SandboxPoolSync",
     "StoreCounters",
+    "TakeIdleResult",
 ]

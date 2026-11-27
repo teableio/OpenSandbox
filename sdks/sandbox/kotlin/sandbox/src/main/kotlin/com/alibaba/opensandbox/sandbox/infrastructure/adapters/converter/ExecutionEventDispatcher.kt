@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,11 +24,16 @@ import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.ExecutionH
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.ExecutionInit
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.ExecutionResult
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.OutputMessage
+import org.slf4j.LoggerFactory
 
 class ExecutionEventDispatcher(
     private val execution: Execution,
     private val handlers: ExecutionHandlers? = null,
 ) {
+    private companion object {
+        val logger = LoggerFactory.getLogger(ExecutionEventDispatcher::class.java)
+    }
+
     fun dispatch(eventNode: EventNode) {
         val type = eventNode.type
         val timestamp = eventNode.timestamp
@@ -62,7 +67,9 @@ class ExecutionEventDispatcher(
     ) {
         val stdoutText = eventNode.text ?: ""
         val stdoutMessage = OutputMessage(stdoutText, timestamp, false)
-        execution.logs.addStdout(stdoutMessage)
+        if (handlers?.skipAccumulation != true) {
+            execution.logs.addStdout(stdoutMessage)
+        }
         handlers?.onStdout?.handle(stdoutMessage)
     }
 
@@ -72,7 +79,9 @@ class ExecutionEventDispatcher(
     ) {
         val stderrText = eventNode.text ?: ""
         val stderrMessage = OutputMessage(stderrText, timestamp, true)
-        execution.logs.addStderr(stderrMessage)
+        if (handlers?.skipAccumulation != true) {
+            execution.logs.addStderr(stderrMessage)
+        }
         handlers?.onStderr?.handle(stderrMessage)
     }
 
@@ -80,7 +89,13 @@ class ExecutionEventDispatcher(
         eventNode: EventNode,
         timestamp: Long,
     ) {
-        val resultText = eventNode.results?.getText() ?: ""
+        val resultText =
+            try {
+                eventNode.results?.getText().orEmpty()
+            } catch (e: IllegalArgumentException) {
+                logger.error("Failed to decode SSE result text: {}", eventNode, e)
+                return
+            }
         val result =
             ExecutionResult(resultText, timestamp).apply {
                 this.timestamp = timestamp
@@ -93,13 +108,15 @@ class ExecutionEventDispatcher(
         eventNode: EventNode,
         timestamp: Long,
     ) {
-        val errorData = eventNode.error!!
+        // Ignore malformed error events rather than throwing past dispatch.
+        val errorData = eventNode.error ?: return
         val error =
             ExecutionError(
                 name = errorData.name ?: "",
                 value = errorData.value ?: "",
                 traceback = errorData.traceback,
                 timestamp = timestamp,
+                exitCode = errorData.exitCode?.toInt(),
             )
         execution.error = error
         handlers?.onError?.handle(error)
@@ -113,6 +130,7 @@ class ExecutionEventDispatcher(
             ExecutionComplete(
                 executionTimeInMillis = eventNode.executionTimeInMillis ?: 0L,
                 timestamp = timestamp,
+                exitCode = eventNode.exitCode?.toInt(),
             )
         execution.complete = complete
         handlers?.onExecutionComplete?.handle(complete)

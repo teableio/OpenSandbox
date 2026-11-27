@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ build_arg_if_set() {
 }
 
 TAG=${TAG:-latest}
+GHCR_REPO=${GHCR_REPO:-}
 VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo "dev")}
 GIT_COMMIT=${GIT_COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo "unknown")}
 BUILD_TIME=${BUILD_TIME:-$(default_build_time)}
@@ -53,21 +54,37 @@ docker buildx inspect --bootstrap
 
 docker buildx ls
 
+IMAGE_TAGS=(-t opensandbox/execd:${TAG} -t sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:${TAG})
 LATEST_TAGS=()
+if [[ -n "${GHCR_REPO}" ]]; then
+  IMAGE_TAGS+=(-t "${GHCR_REPO}/execd:${TAG}")
+fi
 if [[ "${TAG}" == v* ]]; then
   LATEST_TAGS+=(-t opensandbox/execd:latest -t sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:latest)
+  if [[ -n "${GHCR_REPO}" ]]; then
+    LATEST_TAGS+=(-t "${GHCR_REPO}/execd:latest")
+  fi
+fi
+
+PUSH=${PUSH:-true}
+if [ "$PUSH" == "true" ]; then
+  PLATFORM="linux/amd64,linux/arm64"
+  EXPORTER=(--push)
+else
+  # dry-run / local rehearsal: single-arch, load into the local docker
+  PLATFORM="linux/amd64"
+  EXPORTER=(--load)
 fi
 
 docker buildx build \
-  -t opensandbox/execd:${TAG} \
-  -t sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:${TAG} \
+  "${IMAGE_TAGS[@]}" \
   "${LATEST_TAGS[@]}" \
   -f components/execd/Dockerfile \
   "${BUILD_ARGS[@]}" \
   --build-arg VERSION="${VERSION}" \
   --build-arg GIT_COMMIT="${GIT_COMMIT}" \
   --build-arg BUILD_TIME="${BUILD_TIME}" \
-  --platform linux/amd64,linux/arm64 \
+  --platform "${PLATFORM}" \
   --metadata-file "${BUILD_METADATA_FILE}" \
-  --push \
+  "${EXPORTER[@]}" \
   .

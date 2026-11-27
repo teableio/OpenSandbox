@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,11 @@ package controller
 
 import (
 	"context"
+	"text/template"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -32,52 +34,61 @@ import (
 )
 
 const (
-	// SandboxSnapshotFinalizer is the finalizer for SandboxSnapshot cleanup
-	SandboxSnapshotFinalizer = "sandboxsnapshot.sandbox.opensandbox.io/cleanup"
+	sandboxSnapshotFinalizer = "sandboxsnapshot.sandbox.opensandbox.io/cleanup"
 
-	// DefaultCommitJobTimeout is the default timeout for commit jobs
-	DefaultCommitJobTimeout = 10 * time.Minute
+	defaultCommitJobTimeout = 10 * time.Minute
 
 	// DefaultCommitJobBackoffLimit bounds commit/push retries so stable failures
 	// surface as snapshot failures within the pause/resume e2e timeout window while
 	// still tolerating a few transient job failures.
 	DefaultCommitJobBackoffLimit int32 = 3
 
-	DefaultTTLSecondsAfterFinished = 300
+	defaultTTLSecondsAfterFinished = 300
 
-	// CommitJobContainerName is the container name in commit job
-	CommitJobContainerName = "commit"
+	commitJobContainerName = "commit"
 
-	// ContainerdSocketPath is the default containerd socket path
 	ContainerdSocketPath = "/var/run/containerd/containerd.sock"
 
-	// LabelSandboxSnapshotName is the label key for sandbox snapshot name
-	LabelSandboxSnapshotName = "sandbox.opensandbox.io/sandbox-snapshot-name"
+	// containerdFIFODir is available to image-committer implementations that
+	// use containerd task exec with FIFO-backed process I/O.
+	containerdFIFODir = "/run/containerd/fifo"
+
+	labelSandboxSnapshotName = "sandbox.opensandbox.io/sandbox-snapshot-name"
 )
 
-// SandboxSnapshotReconciler reconciles a SandboxSnapshot object.
-// Pure atomic capability: reads BatchSandbox via spec.sandboxName, finds Pod,
-// creates commit Job to commit+push container images, reports status.
-// No business logic (no scaling, no pool, no resume).
+// Snapshot reconciliation owns image commit jobs, not sandbox scaling or resume orchestration.
 type SandboxSnapshotReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 
-	// ImageCommitterImage is the image for image-committer (uses nerdctl to commit/push container images)
+	// APIReader reads straight from the API server, bypassing the informer
+	// cache. It is required when a cached read can be stale (for example the
+	// commit Pod status that lags behind the commit Job status).
+	APIReader client.Reader
+
+	// ImageCommitterImage is the image used for commit and unpause Jobs.
 	ImageCommitterImage string
 
-	// ContainerdSocketPath is containerd socket path for image-committer (nerdctl --address)
+	// ContainerdSocketPath is the host containerd socket mounted into image-committer Jobs.
 	ContainerdSocketPath string
 
-	// CommitJobTimeout is the timeout for commit jobs (default: 10 minutes)
 	CommitJobTimeout time.Duration
 
-	// SnapshotRegistry is the OCI registry for snapshot images (from Controller Manager startup params)
 	SnapshotRegistry string
+
+	// SnapshotImageURITemplate overrides image naming; nil uses DefaultSnapshotImageURITemplate.
+	SnapshotImageURITemplate *template.Template
 
 	// SnapshotPushSecret is the K8s Secret name for pushing to registry (from Controller Manager startup params)
 	SnapshotPushSecret string
+
+	// ImageCommitterPullSecret is the K8s Secret name used to pull the image-committer image in commit Jobs.
+	// Required when imageCommitterImage lives in a private registry.
+	ImageCommitterPullSecret string
+
+	// ImageCommitterPodTemplate overlays operator-controlled commit Job Pod settings.
+	ImageCommitterPodTemplate *corev1.PodTemplateSpec
 
 	// SnapshotRegistryInsecure controls whether image-committer uses insecure registry mode.
 	SnapshotRegistryInsecure bool
@@ -108,14 +119,12 @@ func (r *SandboxSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	// Handle deletion
 	if !snapshot.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, snapshot)
 	}
 
-	// Add finalizer if not present
-	if !controllerutil.ContainsFinalizer(snapshot, SandboxSnapshotFinalizer) {
-		if err := utils.UpdateFinalizer(r.Client, snapshot, utils.AddFinalizerOpType, SandboxSnapshotFinalizer); err != nil {
+	if !controllerutil.ContainsFinalizer(snapshot, sandboxSnapshotFinalizer) {
+		if err := utils.UpdateFinalizer(r.Client, snapshot, utils.AddFinalizerOpType, sandboxSnapshotFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: time.Millisecond * 100}, nil
@@ -153,6 +162,9 @@ func (r *SandboxSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *SandboxSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1alpha1.SandboxSnapshot{}).
 		Owns(&batchv1.Job{}).

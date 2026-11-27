@@ -4,8 +4,8 @@ authors:
   - "@Pangjiping"
   - "@ninan-nn"
 creation-date: 2026-03-18
-last-updated: 2026-04-12
-status: implementing
+last-updated: 2026-07-03
+status: implemented
 ---
 
 # OSEP-0010: OpenTelemetry Metrics and Logs (execd, egress, and ingress)
@@ -146,7 +146,7 @@ Meter name: **`opensandbox/egress`**.
 
 | Category | Metric name (suggested) | Type | Description |
 |----------|-------------------------|------|-------------|
-| **HTTP** | `ingress.http.request.count` | Counter | Request count by method, status_code, proxy_type (http/websocket) (QPS derivable) |
+| **HTTP** | `ingress.http.request.count` | Counter | Request count by `http_method`, `http_status_code`, `proxy_type` (http/websocket) (QPS derivable) |
 | | `ingress.http.request.duration` | Histogram | Request duration (including routing and proxy) by method, proxy_type |
 | **Routing** | `ingress.routing.resolutions.count` | Counter | Resolutions by result (success/not_found/not_ready/error) |
 | | `ingress.routing.resolution.duration` | Histogram | Time to resolve sandbox target (from cache or API) |
@@ -155,7 +155,7 @@ Meter name: **`opensandbox/egress`**.
 | **System** | `ingress.system.cpu.usage` | Gauge | CPU usage |
 | | `ingress.system.memory.usage_bytes` | Gauge | Memory usage |
 
-Note: Ingress typically returns 200 (success), 400 (bad request), 404 (sandbox not found), 502 (upstream error), 503 (sandbox not ready); aggregate by `http.status_code` for error-rate monitoring.
+Note: Ingress typically returns 200 (success), 400 (bad request), 404 (sandbox not found), 502 (upstream error), 503 (sandbox not ready); aggregate by `http_status_code` for error-rate monitoring.
 
 Metric namespaces are `execd.*`, `egress.*`, and `ingress.*` for easy filtering in a shared backend. **Execd (current implementation)** attaches `sandbox_id` from `OPENSANDBOX_ID` when set; ingress obtains sandbox-related identifiers from routing context where applicable.
 
@@ -273,14 +273,16 @@ Policy **deny** is not represented in this log (use **`egress.policy.denied_tota
   Implement `InitOpenTelemetry(ctx context.Context, opts InitOptions) (shutdown func(), err error)` in main for execd, egress, and ingress (or in a shared `pkg/telemetry`):
   - Create `MeterProvider` and register an OTLP metric exporter (e.g., `go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp` or gRPC).
   - Optionally create `LoggerProvider` and register an OTLP log exporter; otherwise rely on zap and optional **Logs Bridge** (execd/ingress as applicable).
-  - **Egress (reference):** `components/internal/telemetry` initializes **MeterProvider + OTLP HTTP metrics** only; **no** `LoggerProvider`; zap remains the sole log sink.
+  - **Egress (reference):** `components/internal/telemetry` initializes **MeterProvider + OTLP HTTP/protobuf or gRPC metrics** only; **no** `LoggerProvider`; zap remains the sole log sink.
   - Set global `otel.SetMeterProvider` (and logger provider if used), and return a `shutdown` function (Flush + ForceFlush) to call on process exit.
   - **Do not** set `TracerProvider` for production use; omit or use a no-op tracer provider.
 
 - **OTLP exporter**  
-  Support HTTP and gRPC OTLP endpoints via environment variables:
-  - `OTEL_EXPORTER_OTLP_ENDPOINT` (or per-signal `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`).
-  - If unset, do not export or use a Noop provider to avoid connection errors.
+  The shared metrics exporter supports OTLP HTTP/protobuf and gRPC. `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` takes precedence over `OTEL_EXPORTER_OTLP_PROTOCOL`; supported values are `http/protobuf` (the default) and `grpc`, case-insensitively. Unknown or unsupported values, including `http/json`, produce a warning and use HTTP/protobuf. This selection does not enable OTLP trace or log export.
+  - `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT`. Use an endpoint URL for either transport. Explicit ports are preserved; the URL's `http` or `https` scheme selects plaintext or TLS rather than the protocol. The upstream exporter handles standard TLS, headers, compression, and timeout environment variables.
+  - R5 calls for no export when unconfigured. The current execd/egress/ingress implementation retains a historical node-IP fallback (`HOST_IP`, then `/etc/hostinfo`) for compatibility: port 4318 for HTTP/protobuf or 4317 for gRPC, plaintext in both cases. `OTEL_SDK_DISABLED=true` or `OTEL_METRICS_EXPORTER=none` explicitly disables export, taking precedence over both explicit endpoints and this fallback. Components may opt out of fallback with the shared `DisableEndpointFallback` configuration field; node-agent does so.
+  - `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` accepts `cumulative`, `delta`, and `lowmemory` using the upstream exporter's semantics. When unset, synchronous counters/histograms retain delta temporality and observable counters retain cumulative temporality. Prometheus-style pipelines need cumulative export or Collector `deltatocumulative` conversion.
+  - See [telemetry reference](../docs/guides/telemetry.md) for current deployment behavior and process-environment configuration.
 
 - **Environment variables**  
   Support at least (names follow OpenTelemetry conventions where applicable):

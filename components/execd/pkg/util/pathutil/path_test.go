@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package pathutil
 
 import (
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -46,7 +47,25 @@ func TestExpandPath_EnvVarInMiddle(t *testing.T) {
 	require.Equal(t, filepath.Join("prefix", "segment", "suffix"), got)
 }
 
+func TestExpandPath_KeepsDollarWithoutVariableNameLiteral(t *testing.T) {
+	for _, path := range []string{
+		"/workspace/Outer$1.class",
+		"/workspace/a$$",
+		"/workspace/a$-b",
+		"/workspace/a$@b",
+		"/workspace/a${}b",
+		"/workspace/${1}x",
+		"/workspace/cost$",
+	} {
+		got, err := ExpandPath(path)
+		require.NoError(t, err, path)
+		require.Equal(t, path, got)
+	}
+}
+
 func TestExpandPathWithEnv_RequestOverrideHasHigherPriority(t *testing.T) {
+	// Different casing identifies one variable on Windows and two on Unix.
+	t.Setenv("workdir", "lowercase")
 	t.Setenv("WORKDIR", "from-process")
 
 	got, err := ExpandPathWithEnv("base/$WORKDIR", map[string]string{
@@ -54,6 +73,14 @@ func TestExpandPathWithEnv_RequestOverrideHasHigherPriority(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, filepath.Join("base", "from-request"), got)
+	got, err = ExpandPathWithEnv("$workdir", map[string]string{"WORKDIR": "from-request"})
+	require.NoError(t, err)
+	expected := "lowercase"
+	if runtime.GOOS == "windows" {
+		expected = "from-request"
+	}
+	require.Equal(t, expected, got)
+
 }
 
 func TestExpandPathWithEnv_CanResolveVarOnlyInOverride(t *testing.T) {
@@ -84,4 +111,13 @@ func TestExpandPath_UndefinedEnvVarOnlyReturnsError(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "NOT_SET")
 	require.Equal(t, "", got)
+}
+
+func TestExpandAbsPath_EmptyReturnsError(t *testing.T) {
+	t.Setenv("EMPTY_DIR", "")
+	for _, path := range []string{"", "$EMPTY_DIR", "${EMPTY_DIR}"} {
+		got, err := ExpandAbsPath(path)
+		require.Error(t, err, "path %q", path)
+		require.Equal(t, "", got)
+	}
 }

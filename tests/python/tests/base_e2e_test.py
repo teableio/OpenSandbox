@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -52,7 +52,6 @@ OPENSANDBOX_TEST_SECURE_ACCESS_VERIFIABLE = "OPENSANDBOX_TEST_SECURE_ACCESS_VERI
 
 
 def get_sandbox_image() -> str:
-    """Get the default sandbox image for E2E tests."""
     return TEST_IMAGE
 
 
@@ -73,7 +72,6 @@ def get_e2e_sandbox_resource() -> dict[str, str]:
 
 
 def is_kubernetes_runtime() -> bool:
-    """Whether the current E2E run targets the Kubernetes backend."""
     return TEST_RUNTIME == "kubernetes"
 
 
@@ -89,22 +87,18 @@ def is_secure_access_verifiable() -> bool:
 
 
 def should_use_server_proxy() -> bool:
-    """Whether SDK calls should proxy execd traffic through the server."""
     return TEST_USE_SERVER_PROXY
 
 
 def get_test_pvc_name() -> str:
-    """Get the PVC name used by runtime E2E tests."""
     return TEST_PVC_NAME
 
 
 def get_test_host_volume_dir() -> str:
-    """Get the host directory used by host-volume E2E tests."""
     return TEST_HOST_VOLUME_DIR
 
 
 def create_connection_config() -> ConnectionConfig:
-    """Create async ConnectionConfig for E2E tests."""
     return ConnectionConfig(
         domain=TEST_DOMAIN,
         api_key=TEST_API_KEY,
@@ -115,7 +109,6 @@ def create_connection_config() -> ConnectionConfig:
 
 
 def create_connection_config_server_proxy() -> ConnectionConfig:
-    """Create async ConnectionConfig for E2E tests using server-proxied endpoints."""
     return ConnectionConfig(
         domain=TEST_DOMAIN,
         api_key=TEST_API_KEY,
@@ -126,7 +119,6 @@ def create_connection_config_server_proxy() -> ConnectionConfig:
 
 
 def create_connection_config_sync() -> ConnectionConfigSync:
-    """Create sync ConnectionConfig for E2E tests."""
     return ConnectionConfigSync(
         domain=TEST_DOMAIN,
         api_key=TEST_API_KEY,
@@ -140,22 +132,4 @@ def create_connection_config_sync() -> ConnectionConfigSync:
         ),
         protocol=TEST_PROTOCOL,
         use_server_proxy=should_use_server_proxy(),
-    )
-
-
-def create_connection_config_sync_server_proxy() -> ConnectionConfigSync:
-    """Create sync ConnectionConfig for E2E tests using server-proxied endpoints."""
-    return ConnectionConfigSync(
-        domain=TEST_DOMAIN,
-        api_key=TEST_API_KEY,
-        request_timeout=timedelta(minutes=3),
-        transport=httpx.HTTPTransport(
-            limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
-                keepalive_expiry=15,
-            )
-        ),
-        protocol=TEST_PROTOCOL,
-        use_server_proxy=True,
     )

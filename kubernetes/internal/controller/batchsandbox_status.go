@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,6 +37,13 @@ type runtimeView struct {
 	endpointIPs     []string
 	resumeCompleted bool
 }
+
+const (
+	terminalPodFailedReason           = "PodFailed"
+	terminalContainerFailedReason     = "ContainerFailed"
+	terminalInitContainerFailedReason = "InitContainerFailed"
+	containerCompletedReason          = "Completed"
+)
 
 func setConditionInStatus(
 	status *sandboxv1alpha1.BatchSandboxStatus,
@@ -78,6 +85,30 @@ func setConditionInStatus(
 	status.Conditions = filtered
 }
 
+// recordCompletedReadyCondition upserts the Ready condition as False with
+// reason=Completed and the completion detail (pod, container, exit code,
+// finishedAt) in the message. Unlike setConditionInStatus — which represents
+// False by removing the condition — completion must stay legible on the object:
+// it is the only exit-code observability a retained terminal sandbox carries.
+// applyBatchSandboxPhaseConditions deliberately leaves Ready untouched for the
+// Completed phase so the detail survives later reconciles.
+func recordCompletedReadyCondition(status *sandboxv1alpha1.BatchSandboxStatus, message string) {
+	updated := sandboxv1alpha1.BatchSandboxCondition{
+		Type:               sandboxv1alpha1.BatchSandboxConditionReady,
+		Status:             sandboxv1alpha1.ConditionFalse,
+		Reason:             containerCompletedReason,
+		Message:            message,
+		LastTransitionTime: ptr.To(metav1.Now()),
+	}
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == sandboxv1alpha1.BatchSandboxConditionReady {
+			status.Conditions[i] = updated
+			return
+		}
+	}
+	status.Conditions = append(status.Conditions, updated)
+}
+
 func applyBatchSandboxPhaseConditions(status *sandboxv1alpha1.BatchSandboxStatus) {
 	switch status.Phase {
 	case sandboxv1alpha1.BatchSandboxPhasePending:
@@ -104,10 +135,23 @@ func applyBatchSandboxPhaseConditions(status *sandboxv1alpha1.BatchSandboxStatus
 		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionReady, sandboxv1alpha1.ConditionFalse, "Failed", "Sandbox is unavailable")
 		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionProgressing, sandboxv1alpha1.ConditionFalse, "", "")
 		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionPaused, sandboxv1alpha1.ConditionFalse, "", "")
+	case sandboxv1alpha1.BatchSandboxPhaseCompleted:
+		// Ready is left untouched here: the transition in applySteadyRuntimePhase
+		// records the completing container, exit code, and finishedAt in the Ready
+		// condition message, and that detail must survive later reconciles.
+		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionProgressing, sandboxv1alpha1.ConditionFalse, "", "")
+		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionPaused, sandboxv1alpha1.ConditionFalse, "", "")
 	}
 }
 
 func getPodFailureReasonAndMessage(pod *corev1.Pod) (string, string, bool) {
+	// Deleting pods no longer contribute new runtime failures, including waiting states.
+	if pod.DeletionTimestamp != nil {
+		return "", "", false
+	}
+	if reason, message, failed := getTerminalPodFailureReasonAndMessage(pod); failed {
+		return reason, message, true
+	}
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.State.Waiting == nil {
 			continue
@@ -120,21 +164,166 @@ func getPodFailureReasonAndMessage(pod *corev1.Pod) (string, string, bool) {
 	return "", "", false
 }
 
+func getTerminalPodFailureReasonAndMessage(pod *corev1.Pod) (string, string, bool) {
+	// Kubernetes may publish a terminal failure while deleting an old runtime pod.
+	// Ignore it for new failure attribution; already recorded sandbox failures remain terminal.
+	if pod.DeletionTimestamp != nil {
+		return "", "", false
+	}
+	if pod.Status.Phase == corev1.PodFailed {
+		for i := range pod.Status.InitContainerStatuses {
+			if reason, message, failed := terminatedContainerFailure(pod, &pod.Status.InitContainerStatuses[i], true); failed {
+				return reason, message, true
+			}
+		}
+		for i := range pod.Status.ContainerStatuses {
+			if reason, message, failed := terminatedContainerFailure(pod, &pod.Status.ContainerStatuses[i], false); failed {
+				return reason, message, true
+			}
+		}
+
+		message := fmt.Sprintf("Pod %s entered Failed phase", pod.Name)
+		if pod.Status.Reason != "" {
+			message += fmt.Sprintf(" (%s)", pod.Status.Reason)
+		}
+		if pod.Status.Message != "" {
+			message += ": " + pod.Status.Message
+		}
+		return terminalPodFailedReason, message, true
+	}
+
+	// A Running pod can be terminal even before Kubernetes flips its phase: when
+	// the restart policy is Never and the main container (the first regular
+	// container, matching the server-side convention) has already terminated with
+	// a non-zero exit code, no restart will bring the sandbox runtime back.
+	// This matters for multi-container pods (for example an egress sidecar keeps
+	// the pod Running) that would otherwise never reach the PodFailed phase.
+	if reason, message, failed := terminatedMainContainerFailure(pod); failed {
+		return reason, message, true
+	}
+	return "", "", false
+}
+
+// Ignore restarts and deletion-induced exits so they cannot latch a terminal failure.
+func terminatedMainContainerFailure(pod *corev1.Pod) (string, string, bool) {
+	if pod.DeletionTimestamp != nil ||
+		pod.Spec.RestartPolicy != corev1.RestartPolicyNever ||
+		len(pod.Spec.Containers) == 0 {
+		return "", "", false
+	}
+	mainName := pod.Spec.Containers[0].Name
+	for i := range pod.Status.ContainerStatuses {
+		status := &pod.Status.ContainerStatuses[i]
+		if status.Name != mainName {
+			continue
+		}
+		return terminatedContainerFailure(pod, status, false)
+	}
+	return "", "", false
+}
+
+func terminatedContainerFailure(pod *corev1.Pod, status *corev1.ContainerStatus, initContainer bool) (string, string, bool) {
+	terminated := status.State.Terminated
+	if terminated == nil || terminated.ExitCode == 0 {
+		return "", "", false
+	}
+
+	reason := terminalContainerFailedReason
+	kind := "container"
+	if initContainer {
+		reason = terminalInitContainerFailedReason
+		kind = "init container"
+	}
+	message := fmt.Sprintf("Pod %s %s %s exited with code %d", pod.Name, kind, status.Name, terminated.ExitCode)
+	if terminated.Reason != "" {
+		message += fmt.Sprintf(" (%s)", terminated.Reason)
+	}
+	if terminated.Message != "" {
+		message += ": " + terminated.Message
+	}
+	return reason, message, true
+}
+
+// Sidecars can keep a completed Pod Running; use the main container's final exit to avoid regressing to Pending.
+// RestartPolicyAlways and deletion-induced exits are not final completions.
+func terminatedMainContainerCompletion(pod *corev1.Pod) (string, bool) {
+	if pod.DeletionTimestamp != nil ||
+		(pod.Spec.RestartPolicy != corev1.RestartPolicyNever &&
+			pod.Spec.RestartPolicy != corev1.RestartPolicyOnFailure) ||
+		len(pod.Spec.Containers) == 0 {
+		return "", false
+	}
+	mainName := pod.Spec.Containers[0].Name
+	for i := range pod.Status.ContainerStatuses {
+		status := &pod.Status.ContainerStatuses[i]
+		if status.Name != mainName {
+			continue
+		}
+		terminated := status.State.Terminated
+		if terminated == nil || terminated.ExitCode != 0 {
+			return "", false
+		}
+		message := fmt.Sprintf("Pod %s container %s exited with code 0", pod.Name, status.Name)
+		if !terminated.FinishedAt.IsZero() {
+			message += fmt.Sprintf(" at %s", terminated.FinishedAt.UTC().Format(time.RFC3339))
+		}
+		return message, true
+	}
+	return "", false
+}
+
+// summarizePodCompletions reports whether every observed pod's main container
+// completed successfully (with at least one pod observed). With multiple
+// replicas a single finished pod must not complete the whole sandbox while its
+// siblings are still running or starting. Failure detection always runs first
+// (see applySteadyRuntimePhase), so this only classifies workloads with no
+// observed failures.
+func summarizePodCompletions(pods []*corev1.Pod) (string, bool) {
+	if len(pods) == 0 {
+		return "", false
+	}
+	message := ""
+	for i, pod := range pods {
+		podMessage, completed := terminatedMainContainerCompletion(pod)
+		if !completed {
+			return "", false
+		}
+		if i == 0 {
+			message = podMessage
+		}
+	}
+	return message, true
+}
+
 type podFailureSummary struct {
 	observed      int
 	failed        int
 	primaryReason string
 	samplePod     string
+	sampleDetail  string
 }
 
 func summarizePodFailures(pods []*corev1.Pod) (podFailureSummary, bool) {
+	return summarizePodFailuresWith(pods, getPodFailureReasonAndMessage, true)
+}
+
+func summarizeTerminalPodFailures(pods []*corev1.Pod) (podFailureSummary, bool) {
+	return summarizePodFailuresWith(pods, getTerminalPodFailureReasonAndMessage, true)
+}
+
+func summarizePodFailuresWith(
+	pods []*corev1.Pod,
+	detectFailure func(*corev1.Pod) (string, string, bool),
+	includeSampleDetail bool,
+) (podFailureSummary, bool) {
 	summary := podFailureSummary{observed: len(pods)}
 	reasonCounts := make(map[string]int)
 	firstPodByReason := make(map[string]string)
+	firstDetailByReason := make(map[string]string)
 	primaryCount := 0
 
 	for _, pod := range pods {
-		reason, _, failed := getPodFailureReasonAndMessage(pod)
+		reason, message, failed := detectFailure(pod)
 		if !failed {
 			continue
 		}
@@ -142,12 +331,16 @@ func summarizePodFailures(pods []*corev1.Pod) (podFailureSummary, bool) {
 		summary.failed++
 		if _, exists := firstPodByReason[reason]; !exists {
 			firstPodByReason[reason] = pod.Name
+			firstDetailByReason[reason] = message
 		}
 		reasonCounts[reason]++
 		if reasonCounts[reason] > primaryCount {
 			primaryCount = reasonCounts[reason]
 			summary.primaryReason = reason
 			summary.samplePod = firstPodByReason[reason]
+			if includeSampleDetail {
+				summary.sampleDetail = firstDetailByReason[reason]
+			}
 		}
 	}
 
@@ -159,7 +352,11 @@ func (s podFailureSummary) message(duringResume bool) string {
 	if duringResume {
 		scope = "observed pods failed during resume"
 	}
-	return fmt.Sprintf("%d/%d %s; primary reason=%s; sample pod=%s", s.failed, s.observed, scope, s.primaryReason, s.samplePod)
+	message := fmt.Sprintf("%d/%d %s; primary reason=%s; sample pod=%s", s.failed, s.observed, scope, s.primaryReason, s.samplePod)
+	if s.sampleDetail != "" {
+		message += "; sample detail=" + s.sampleDetail
+	}
+	return message
 }
 
 func buildRuntimeView(batchSbx *sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod) runtimeView {
@@ -199,6 +396,14 @@ func buildRuntimeView(batchSbx *sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod
 	}
 }
 
+// isResumeInFlight reports whether a resume request has been issued but not yet
+// acknowledged, mirroring the dispatch table's resume detection. It is used to
+// preserve resume failure semantics when the cached phase lags behind.
+func isResumeInFlight(batchSbx *sandboxv1alpha1.BatchSandbox) bool {
+	return batchSbx.Generation > batchSbx.Status.PauseObservedGeneration &&
+		batchSbx.Spec.Pause != nil && !*batchSbx.Spec.Pause
+}
+
 func applyResumingRuntimePhase(status *sandboxv1alpha1.BatchSandboxStatus, pods []*corev1.Pod) {
 	if summary, hasFailures := summarizePodFailures(pods); hasFailures {
 		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionResumeFailed, sandboxv1alpha1.ConditionTrue, summary.primaryReason, summary.message(true))
@@ -209,19 +414,56 @@ func applyResumingRuntimePhase(status *sandboxv1alpha1.BatchSandboxStatus, pods 
 	if status.Ready > 0 {
 		status.Phase = sandboxv1alpha1.BatchSandboxPhaseSucceed
 		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionPodFailed, sandboxv1alpha1.ConditionFalse, "", "")
+		return
+	}
+	// A restored workload whose main container already exited cleanly (before the
+	// pod ever became Ready again) is finished: converge to the sticky Completed
+	// phase instead of staying in Resuming until expireTime.
+	if message, completed := summarizePodCompletions(pods); completed {
+		status.Phase = sandboxv1alpha1.BatchSandboxPhaseCompleted
+		recordCompletedReadyCondition(status, message)
+		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionPodFailed, sandboxv1alpha1.ConditionFalse, "", "")
+		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionResumeFailed, sandboxv1alpha1.ConditionFalse, "", "")
 	}
 }
 
 func applySteadyRuntimePhase(batchSbx *sandboxv1alpha1.BatchSandbox, status *sandboxv1alpha1.BatchSandboxStatus, pods []*corev1.Pod) {
-	if summary, hasFailures := summarizePodFailures(pods); hasFailures {
+	summary, hasFailures := summarizePodFailures(pods)
+	if batchSbx.Status.Phase == "" || batchSbx.Status.Phase == sandboxv1alpha1.BatchSandboxPhasePending {
+		summary, hasFailures = summarizeTerminalPodFailures(excludeAdmissionRecovery(pods))
+	}
+	if hasFailures {
 		if batchSbx.Status.Phase != sandboxv1alpha1.BatchSandboxPhaseFailed {
 			setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionPodFailed, sandboxv1alpha1.ConditionTrue, summary.primaryReason, summary.message(false))
+			// Under informer lag a resume-in-progress failure can be observed while the
+			// cached phase is not Resuming; keep the resume failure semantics anyway.
+			if isResumeInFlight(batchSbx) {
+				setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionResumeFailed, sandboxv1alpha1.ConditionTrue, summary.primaryReason, summary.message(true))
+			}
 			status.Phase = sandboxv1alpha1.BatchSandboxPhaseFailed
 		}
 		return
 	}
 
 	if status.Phase == sandboxv1alpha1.BatchSandboxPhaseFailed {
+		return
+	}
+
+	// A completed sandbox is terminal: once the clean exit has been recorded, a
+	// later Ready=0 reconcile (sidecar teardown, informer lag, pod removal) must
+	// not regress the phase to Pending.
+	if status.Phase == sandboxv1alpha1.BatchSandboxPhaseCompleted {
+		return
+	}
+
+	// Completion detection runs after failure detection so a non-zero exit keeps
+	// precedence and converges to Failed. A clean exit of the main container under
+	// restartPolicy=Never is final: converge to the sticky Completed phase within
+	// one reconcile instead of regressing to Pending until expireTime.
+	if message, completed := summarizePodCompletions(pods); completed {
+		status.Phase = sandboxv1alpha1.BatchSandboxPhaseCompleted
+		recordCompletedReadyCondition(status, message)
+		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionPodFailed, sandboxv1alpha1.ConditionFalse, "", "")
 		return
 	}
 
@@ -233,12 +475,54 @@ func applySteadyRuntimePhase(batchSbx *sandboxv1alpha1.BatchSandbox, status *san
 	status.Phase = sandboxv1alpha1.BatchSandboxPhasePending
 }
 
+// excludeAdmissionRecovery drops pods recoverable by pod recovery, so stuck
+// kubelet admission rejections do not freeze a never-Ready sandbox.
+func excludeAdmissionRecovery(pods []*corev1.Pod) []*corev1.Pod {
+	filtered := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if isRecoverableAdmissionFailure(pod) {
+			continue
+		}
+		filtered = append(filtered, pod)
+	}
+	return filtered
+}
+
+func hasTerminalPodFailureCondition(conditions []sandboxv1alpha1.BatchSandboxCondition) bool {
+	for _, condition := range conditions {
+		if condition.Type != sandboxv1alpha1.BatchSandboxConditionPodFailed || condition.Status != sandboxv1alpha1.ConditionTrue {
+			continue
+		}
+		switch condition.Reason {
+		case terminalPodFailedReason, terminalContainerFailedReason, terminalInitContainerFailedReason:
+			return true
+		}
+	}
+	return false
+}
+
 // isInitialUnallocatedSandbox returns true when the sandbox has just been created
 // and no pods have been allocated yet. In this case we skip writing the initial
 // Pending status — the next reconcile after allocation will write Succeed directly.
 func isInitialUnallocatedSandbox(batchSbx *sandboxv1alpha1.BatchSandbox, view runtimeView) bool {
 	return view.status.Replicas == 0 && batchSbx.Status.Phase == "" &&
-		batchSbx.Spec.Replicas != nil && *batchSbx.Spec.Replicas > 0
+		batchSbx.Spec.Replicas != nil && *batchSbx.Spec.Replicas > 0 &&
+		!hasTrueBatchSandboxCondition(
+			view.status.Conditions,
+			sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending,
+		)
+}
+
+func hasTrueBatchSandboxCondition(
+	conditions []sandboxv1alpha1.BatchSandboxCondition,
+	conditionType sandboxv1alpha1.BatchSandboxConditionType,
+) bool {
+	for _, condition := range conditions {
+		if condition.Type == conditionType && condition.Status == sandboxv1alpha1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *BatchSandboxReconciler) persistRuntimeView(
@@ -246,11 +530,14 @@ func (r *BatchSandboxReconciler) persistRuntimeView(
 	batchSbx *sandboxv1alpha1.BatchSandbox,
 	view runtimeView,
 ) (time.Duration, []error) {
+	// Task cleanup runs before persistence and must continue during deletion.
+	// Its runtime view no longer describes a live sandbox, so do not publish it.
+	if batchSbx.DeletionTimestamp != nil {
+		return 0, nil
+	}
+
 	var aggErrors []error
 	log := logf.FromContext(ctx)
-	if err := r.patchBatchSandboxEndpoints(ctx, batchSbx, view.endpointIPs); err != nil {
-		aggErrors = append(aggErrors, err)
-	}
 	if !equality.Semantic.DeepEqual(*view.status, batchSbx.Status) {
 		if isInitialUnallocatedSandbox(batchSbx, view) {
 			return 0, aggErrors
@@ -264,12 +551,6 @@ func (r *BatchSandboxReconciler) persistRuntimeView(
 				return time.Second, aggErrors
 			}
 			log.Info("Proceeding with status update despite stale cache (timeout exceeded)", "unsatisfiedDuration", dur.String())
-			// Fetch the latest object so lifecycle conditions (PauseFailed/ResumeFailed)
-			// written by pause/resume handlers are not overwritten by the stale cache.
-			latest := &sandboxv1alpha1.BatchSandbox{}
-			if err := r.Get(ctx, types.NamespacedName{Namespace: batchSbx.Namespace, Name: batchSbx.Name}, latest); err == nil {
-				batchSbx = latest
-			}
 		}
 		if err := r.updateStatus(ctx, batchSbx, view.status); err != nil {
 			aggErrors = append(aggErrors, err)
@@ -277,7 +558,16 @@ func (r *BatchSandboxReconciler) persistRuntimeView(
 		}
 	}
 
-	if view.status.Phase == sandboxv1alpha1.BatchSandboxPhaseSucceed {
+	// Updating endpoints advances resourceVersion; persist status first so its
+	// optimistic lock still matches the object used to compute the runtime view.
+	if err := r.patchBatchSandboxEndpoints(ctx, batchSbx, view.endpointIPs); err != nil {
+		aggErrors = append(aggErrors, err)
+	}
+
+	if view.status.Phase == sandboxv1alpha1.BatchSandboxPhaseSucceed ||
+		view.status.Phase == sandboxv1alpha1.BatchSandboxPhaseCompleted {
+		// Completed implies the resume succeeded and the workload then finished;
+		// the internal pause snapshot is obsolete either way.
 		if err := r.deleteInternalPauseSnapshot(ctx, batchSbx); err != nil {
 			log.Error(err, "Failed to delete SandboxSnapshot after successful resume")
 			aggErrors = append(aggErrors, err)
@@ -288,12 +578,12 @@ func (r *BatchSandboxReconciler) persistRuntimeView(
 
 func (r *BatchSandboxReconciler) patchBatchSandboxEndpoints(ctx context.Context, batchSbx *sandboxv1alpha1.BatchSandbox, endpointIPs []string) error {
 	raw, _ := json.Marshal(endpointIPs)
-	if batchSbx.Annotations[AnnotationSandboxEndpoints] == string(raw) {
+	if batchSbx.Annotations[annotationSandboxEndpoints] == string(raw) {
 		return nil
 	}
 	// Skip writing empty endpoints when annotation doesn't exist yet (e.g. sandbox just created, no pods assigned).
 	// Still allow clearing endpoints when annotation was previously set (e.g. pause scenario).
-	_, annotationExists := batchSbx.Annotations[AnnotationSandboxEndpoints]
+	_, annotationExists := batchSbx.Annotations[annotationSandboxEndpoints]
 	if !annotationExists && string(raw) == "[]" {
 		return nil
 	}
@@ -301,7 +591,7 @@ func (r *BatchSandboxReconciler) patchBatchSandboxEndpoints(ctx context.Context,
 	patchData, _ := json.Marshal(map[string]any{
 		"metadata": map[string]any{
 			"annotations": map[string]string{
-				AnnotationSandboxEndpoints: string(raw),
+				annotationSandboxEndpoints: string(raw),
 			},
 		},
 	})
@@ -314,7 +604,10 @@ func (r *BatchSandboxReconciler) updateStatus(ctx context.Context, batchSandbox 
 	log := logf.FromContext(ctx)
 	mergedStatus := newStatus.DeepCopy()
 	mergedStatus.Conditions = mergeLifecycleConditions(mergedStatus.Conditions, batchSandbox.Status.Conditions)
-	patchData, err := json.Marshal(map[string]any{"status": mergedStatus})
+	patchData, err := json.Marshal(map[string]any{
+		"metadata": map[string]string{"resourceVersion": batchSandbox.ResourceVersion},
+		"status":   mergedStatus,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to marshal status patch: %w", err)
 	}

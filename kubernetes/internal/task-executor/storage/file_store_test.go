@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@ import (
 )
 
 func TestNewFileStore(t *testing.T) {
-	// Test case 1: Valid directory
 	tmpDir := t.TempDir()
 	store, err := NewFileStore(tmpDir)
 	if err != nil {
@@ -36,7 +35,6 @@ func TestNewFileStore(t *testing.T) {
 		t.Fatal("NewFileStore returned nil store")
 	}
 
-	// Test case 2: Empty directory
 	_, err = NewFileStore("")
 	if err == nil {
 		t.Fatal("NewFileStore should fail with empty dir")
@@ -58,18 +56,15 @@ func TestFileStore_CRUD(t *testing.T) {
 		},
 	}
 
-	// 1. Create
 	if err := store.Create(ctx, task); err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
 
-	// Verify file exists
 	taskDir := filepath.Join(tmpDir, task.Name)
 	if _, err := os.Stat(taskDir); os.IsNotExist(err) {
 		t.Error("Task directory was not created")
 	}
 
-	// 2. Get
 	got, err := store.Get(ctx, task.Name)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
@@ -78,7 +73,6 @@ func TestFileStore_CRUD(t *testing.T) {
 		t.Errorf("Get returned wrong name: got %s, want %s", got.Name, task.Name)
 	}
 
-	// 3. Update
 	now := time.Now()
 	got.DeletionTimestamp = &now
 
@@ -94,7 +88,6 @@ func TestFileStore_CRUD(t *testing.T) {
 		t.Error("Update failed to persist DeletionTimestamp")
 	}
 
-	// 4. List
 	tasks, err := store.List(ctx)
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
@@ -106,12 +99,10 @@ func TestFileStore_CRUD(t *testing.T) {
 		t.Errorf("List returned wrong task: %s", tasks[0].Name)
 	}
 
-	// 5. Delete
 	if err := store.Delete(ctx, task.Name); err != nil {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
-	// Verify deletion
 	if _, err := store.Get(ctx, task.Name); err == nil {
 		t.Error("Get should fail after delete")
 	}
@@ -124,7 +115,6 @@ func TestFileStore_CRUD(t *testing.T) {
 		t.Errorf("List returned %d tasks after delete, want 0", len(tasks))
 	}
 
-	// Verify directory gone
 	if _, err := os.Stat(taskDir); !os.IsNotExist(err) {
 		t.Error("Task directory still exists after delete")
 	}
@@ -135,34 +125,28 @@ func TestFileStore_EdgeCases(t *testing.T) {
 	store, _ := NewFileStore(tmpDir)
 	ctx := context.Background()
 
-	// Create with nil task
 	if err := store.Create(ctx, nil); err == nil {
 		t.Error("Create should fail with nil task")
 	}
 
-	// Create with empty name
 	if err := store.Create(ctx, &types.Task{}); err == nil {
 		t.Error("Create should fail with empty name")
 	}
 
-	// Create duplicate
 	task := &types.Task{Name: "dup"}
 	store.Create(ctx, task)
 	if err := store.Create(ctx, task); err == nil {
 		t.Error("Create should fail for duplicate task")
 	}
 
-	// Update non-existent
 	if err := store.Update(ctx, &types.Task{Name: "missing"}); err == nil {
 		t.Error("Update should fail for non-existent task")
 	}
 
-	// Get non-existent
 	if _, err := store.Get(ctx, "missing"); err == nil {
 		t.Error("Get should fail for non-existent task")
 	}
 
-	// Delete non-existent
 	if err := store.Delete(ctx, "missing"); err != nil {
 		t.Errorf("Delete should not fail for non-existent task, got %v", err)
 	}
@@ -193,7 +177,6 @@ func TestFileStore_CorruptedData(t *testing.T) {
 	}
 }
 
-// TestConcurrency verifies thread safety
 func TestFileStore_Concurrency(t *testing.T) {
 	tmpDir := t.TempDir()
 	store, _ := NewFileStore(tmpDir)
@@ -218,5 +201,72 @@ func TestFileStore_Concurrency(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		<-done
+	}
+}
+
+// TestFileStore_AtomicPublish locks in the guarantee writeTaskFile actually owes
+// its callers: task.json is published by an atomic rename, so a reader never sees
+// a partial file and no temp file is left behind. This is the invariant that must
+// survive independently of whether the write is fsynced.
+func TestFileStore_AtomicPublish(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := NewFileStore(tmpDir)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+
+	ctx := context.Background()
+	task := &types.Task{
+		Name: "atomic-task",
+		Process: &api.Process{
+			Command: []string{"echo", "hello"},
+		},
+	}
+
+	taskDir := filepath.Join(tmpDir, task.Name)
+	taskFile := filepath.Join(taskDir, "task.json")
+	tmpFile := taskFile + ".tmp"
+
+	if err := store.Create(ctx, task); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if _, err := os.Stat(taskFile); err != nil {
+		t.Fatalf("task.json missing after Create: %v", err)
+	}
+	if _, err := os.Stat(tmpFile); !os.IsNotExist(err) {
+		t.Error("temp file left behind after Create")
+	}
+
+	// Update must publish through the same rename, leaving no temp file either.
+	now := time.Now()
+	task.DeletionTimestamp = &now
+	if err := store.Update(ctx, task); err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+	if _, err := os.Stat(tmpFile); !os.IsNotExist(err) {
+		t.Error("temp file left behind after Update")
+	}
+	got, err := store.Get(ctx, task.Name)
+	if err != nil {
+		t.Fatalf("Get after update failed: %v", err)
+	}
+	if got.DeletionTimestamp == nil {
+		t.Error("Update did not persist DeletionTimestamp")
+	}
+
+	// A temp file stranded by a writer that died mid-write must not be visible to
+	// readers: they only ever resolve task.json.
+	if err := os.WriteFile(tmpFile, []byte("{ truncated"), 0644); err != nil {
+		t.Fatalf("failed to plant stale temp file: %v", err)
+	}
+	if _, err := store.Get(ctx, task.Name); err != nil {
+		t.Errorf("Get must ignore a stale temp file, got: %v", err)
+	}
+	tasks, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Name != task.Name {
+		t.Errorf("List must ignore a stale temp file, got %d tasks", len(tasks))
 	}
 }

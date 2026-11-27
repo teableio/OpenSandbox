@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import (
 	"flag"
 	stdlog "log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,18 +31,26 @@ const (
 	accessTokenEnv             = "EXECD_ACCESS_TOKEN"
 	gracefulShutdownTimeoutEnv = "EXECD_API_GRACE_SHUTDOWN"
 	jupyterIdlePollIntervalEnv = "EXECD_JUPYTER_IDLE_POLL_INTERVAL"
+	jupyterReplyFinalizeEnv    = "EXECD_JUPYTER_REPLY_FINALIZE_TIMEOUT"
+	isolationConfigEnv         = "EXECD_ISOLATION_CONFIG"
+	runtimeInitEnv             = "EXECD_RUNTIME_INIT"
+	sseLegacyCompatEnv         = "EXECD_SSE_LEGACY_COMPAT"
 )
 
 // InitFlags registers CLI flags and env overrides.
 func InitFlags() {
-	// Set default values
 	ServerPort = 44772
 	ServerLogLevel = 6
 	ServerAccessToken = ""
-	ApiGracefulShutdownTimeout = time.Second * 1
+	ApiGracefulShutdownTimeout = 200 * time.Millisecond
 	JupyterIdlePollInterval = 100 * time.Millisecond
+	JupyterReplyFinalizeTimeout = 2 * time.Second
+	IsolationConfigPath = ""
+	InitMode = false
+	LifecycleStartupStatusFile = ""
+	RuntimeInit = false
+	SseLegacyCompat = false
 
-	// First, set default values from environment variables
 	if jupyterFromEnv := os.Getenv(jupyterHostEnv); jupyterFromEnv != "" {
 		if !strings.HasPrefix(jupyterFromEnv, "http://") && !strings.HasPrefix(jupyterFromEnv, "https://") {
 			stdlog.Panic("Invalid JUPYTER_HOST format: must start with http:// or https://")
@@ -57,7 +66,6 @@ func InitFlags() {
 		ServerAccessToken = accessTokenFromEnv
 	}
 
-	// Then define flags with current values as defaults
 	flag.StringVar(&JupyterServerHost, "jupyter-host", JupyterServerHost, "Jupyter server host address (e.g., http://localhost, http://192.168.1.100)")
 	flag.StringVar(&JupyterServerToken, "jupyter-token", JupyterServerToken, "Jupyter server authentication token")
 	flag.IntVar(&ServerPort, "port", ServerPort, "Server listening port (default: 44772)")
@@ -84,17 +92,65 @@ func InitFlags() {
 		}
 	}
 
-	flag.DurationVar(&ApiGracefulShutdownTimeout, "graceful-shutdown-timeout", ApiGracefulShutdownTimeout, "API graceful shutdown timeout duration (default: 1s)")
-	flag.DurationVar(&JupyterIdlePollInterval, "jupyter-idle-poll-interval", JupyterIdlePollInterval, "Polling interval after Jupyter idle status before closing stream (default: 100ms)")
+	if replyFinalize := os.Getenv(jupyterReplyFinalizeEnv); replyFinalize != "" {
+		duration, err := time.ParseDuration(replyFinalize)
+		if err != nil {
+			stdlog.Panicf("Failed to parse jupyter reply finalize timeout from env: %v", err)
+		}
+		if duration <= 0 {
+			stdlog.Printf("Invalid %s=%s; fallback to default %s", jupyterReplyFinalizeEnv, replyFinalize, JupyterReplyFinalizeTimeout)
+		} else {
+			JupyterReplyFinalizeTimeout = duration
+		}
+	}
 
-	// Parse flags - these will override environment variables if provided
+	flag.DurationVar(&ApiGracefulShutdownTimeout, "graceful-shutdown-timeout", ApiGracefulShutdownTimeout, "API graceful shutdown timeout duration (default: 200ms)")
+	flag.DurationVar(&JupyterIdlePollInterval, "jupyter-idle-poll-interval", JupyterIdlePollInterval, "Polling interval after Jupyter idle status before closing stream (default: 100ms)")
+	flag.DurationVar(&JupyterReplyFinalizeTimeout, "jupyter-reply-finalize-timeout", JupyterReplyFinalizeTimeout, "Wait for the matching idle status after execute_reply before finalizing; the wait extends while IOPub output keeps arriving (default: 2s)")
+
+	if v := os.Getenv(isolationConfigEnv); v != "" {
+		IsolationConfigPath = v
+	}
+	flag.StringVar(&IsolationConfigPath, "isolation-config", IsolationConfigPath, "Path to isolation TOML config file (default: built-in defaults)")
+
+	// Init mode must be enabled explicitly; bootstrap.sh passes it together
+	// with EXECD_INIT so the shell's exec/background decision stays in lockstep.
+	flag.BoolVar(&InitMode, "init", false, "Run as the sandbox init: reap children, forward signals, own the container lifecycle")
+	flag.StringVar(&LifecycleStartupStatusFile, "lifecycle-startup-status-file", "", "Write the internal lifecycle startup result to this file")
+
+	if runtimeInitFromEnv := os.Getenv(runtimeInitEnv); runtimeInitFromEnv != "" {
+		enabled, err := strconv.ParseBool(runtimeInitFromEnv)
+		if err != nil {
+			stdlog.Panicf("Invalid %s=%s: must be a boolean value", runtimeInitEnv, runtimeInitFromEnv)
+		}
+		RuntimeInit = enabled
+	}
+	flag.BoolVar(&RuntimeInit, "runtime-init", RuntimeInit, "Gate preStart and the entrypoint on POST /internal/init; until then only /ping, /ready, and /internal/init are served")
+
+	if sseLegacyCompatFromEnv := os.Getenv(sseLegacyCompatEnv); sseLegacyCompatFromEnv != "" {
+		enabled, err := strconv.ParseBool(sseLegacyCompatFromEnv)
+		if err != nil {
+			stdlog.Panicf("Invalid %s=%s: must be a boolean value", sseLegacyCompatEnv, sseLegacyCompatFromEnv)
+		}
+		SseLegacyCompat = enabled
+	}
+
 	flag.Parse()
 	if JupyterIdlePollInterval <= 0 {
 		stdlog.Printf("Invalid --jupyter-idle-poll-interval=%s; fallback to default %s", JupyterIdlePollInterval, 100*time.Millisecond)
 		JupyterIdlePollInterval = 100 * time.Millisecond
 	}
+	if JupyterReplyFinalizeTimeout <= 0 {
+		stdlog.Printf("Invalid --jupyter-reply-finalize-timeout=%s; fallback to default %s", JupyterReplyFinalizeTimeout, 2*time.Second)
+		JupyterReplyFinalizeTimeout = 2 * time.Second
+	}
 
-	// Log final values
-	log.Info("Jupyter server host is: %s", JupyterServerHost)
-	log.Info("Jupyter server token is: %s", log.MaskToken(JupyterServerToken))
+	log.Info("jupyter: server host=%s", JupyterServerHost)
+	log.Info("jupyter: server token=%s", log.MaskToken(JupyterServerToken))
+}
+
+// Args returns the non-flag arguments after flag.Parse — in init mode this is
+// the user command passed after "--" (e.g. `execd --init -- sh -c "..."`).
+func Args() []string {
+	return flag.Args()
 }

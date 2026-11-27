@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,4 +31,37 @@ test("ConnectionConfig preserves path prefix while normalizing v1 suffix", () =>
   });
 
   assert.equal(connectionConfig.getBaseUrl(), "https://api.opensandbox.test/proxy/v1");
+});
+
+// Regression: the default User-Agent version is hand-maintained and must be
+// bumped together with the package version. Update this expectation when releasing.
+test("ConnectionConfig default userAgent matches package version", () => {
+  const connectionConfig = new ConnectionConfig({
+    domain: "https://api.opensandbox.test",
+  });
+
+  assert.equal(connectionConfig.userAgent, "OpenSandbox-JS-SDK/1.2.1");
+});
+
+test("ConnectionConfig.disableMetrics is preserved by withTransportIfMissing", () => {
+  const connectionConfig = new ConnectionConfig({
+    domain: "https://api.opensandbox.test",
+    disableMetrics: true,
+  });
+  assert.equal(connectionConfig.disableMetrics, true);
+  assert.equal(connectionConfig.withTransportIfMissing().disableMetrics, true);
+});
+
+test("ConnectionConfig does not duplicate an API key header supplied in another casing", () => {
+  const connectionConfig = new ConnectionConfig({
+    domain: "https://api.opensandbox.test",
+    apiKey: "tenant-secret",
+    headers: { "open-sandbox-api-key": "explicit-secret" },
+  });
+
+  const apiKeyHeaders = Object.keys(connectionConfig.headers).filter(
+    (key) => key.toLowerCase() === "open-sandbox-api-key",
+  );
+  assert.deepEqual(apiKeyHeaders, ["open-sandbox-api-key"]);
+  assert.equal(connectionConfig.headers["open-sandbox-api-key"], "explicit-secret");
 });

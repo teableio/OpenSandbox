@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,11 @@ public static class SandboxErrorCodes
     public const string InternalUnknownError = "INTERNAL_UNKNOWN_ERROR";
 
     /// <summary>
+    /// The foreground command stream ended without a completion or execution error event.
+    /// </summary>
+    public const string CommandStreamIncomplete = "COMMAND_STREAM_INCOMPLETE";
+
+    /// <summary>
     /// Timeout waiting for sandbox to become ready.
     /// </summary>
     public const string ReadyTimeout = "READY_TIMEOUT";
@@ -43,6 +48,14 @@ public static class SandboxErrorCodes
     /// Unexpected response from the server.
     /// </summary>
     public const string UnexpectedResponse = "UNEXPECTED_RESPONSE";
+
+    /// <summary>
+    /// The OSEP-0024 wake retry budget was exhausted: every attempt answered
+    /// 503 with the "OpenSandbox-Wake: expired" marker and the sandbox restore
+    /// did not finish in time. The request was never forwarded, so a later
+    /// manual retry is safe.
+    /// </summary>
+    public const string WakeTimeout = "WAKE_TIMEOUT";
 }
 
 /// <summary>
@@ -165,6 +178,58 @@ public class SandboxApiException : SandboxException
     {
         StatusCode = statusCode;
         RawBody = rawBody;
+    }
+}
+
+/// <summary>
+/// Exception thrown when the OSEP-0024 wake retry budget is exhausted.
+/// <para>
+/// The gateway answered 503 with the "OpenSandbox-Wake: expired" marker on
+/// every attempt: the sandbox restore did not finish within the wake retry
+/// budget. The request was never forwarded, so retrying later is safe — the
+/// server-side resume continues in the background regardless.
+/// </para>
+/// </summary>
+public class SandboxWakeTimeoutException : SandboxApiException
+{
+    /// <summary>
+    /// Gets the number of marked wake-timeout responses received.
+    /// </summary>
+    public int Attempts { get; }
+
+    /// <summary>
+    /// Gets the total wall-clock time spent across waits, retries, and
+    /// request time.
+    /// </summary>
+    public TimeSpan Waited { get; }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="SandboxWakeTimeoutException"/> class.
+    /// </summary>
+    /// <param name="attempts">The number of marked wake-timeout responses received.</param>
+    /// <param name="waited">The total wall-clock time spent waiting.</param>
+    /// <param name="message">The error message.</param>
+    /// <param name="requestId">The request ID from the last marked response.</param>
+    /// <param name="rawBody">The raw body of the last marked response.</param>
+    /// <param name="innerException">The inner exception.</param>
+    public SandboxWakeTimeoutException(
+        int attempts,
+        TimeSpan waited,
+        string? message = null,
+        string? requestId = null,
+        object? rawBody = null,
+        Exception? innerException = null)
+        : base(
+            message ?? "sandbox wake timeout: restore did not finish within the wake retry budget; " +
+                "the request was never forwarded and is safe to retry",
+            statusCode: 503,
+            requestId: requestId,
+            rawBody: rawBody,
+            innerException: innerException,
+            error: new SandboxError(SandboxErrorCodes.WakeTimeout))
+    {
+        Attempts = attempts;
+        Waited = waited;
     }
 }
 

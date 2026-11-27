@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
@@ -37,6 +38,21 @@ func TestDeleteFile(t *testing.T) {
 	require.NoError(t, DeleteFile(file), "expected no error deleting missing file")
 }
 
+func TestDeleteFileKeepsDollarDigitLiteral(t *testing.T) {
+	tmp := t.TempDir()
+	inner := filepath.Join(tmp, "Outer$1.class")
+	outer := filepath.Join(tmp, "Outer.class")
+	require.NoError(t, os.WriteFile(inner, []byte("inner"), 0o644))
+	require.NoError(t, os.WriteFile(outer, []byte("outer"), 0o644))
+
+	require.NoError(t, DeleteFile(inner))
+
+	_, err := os.Stat(inner)
+	require.True(t, os.IsNotExist(err), "expected %s removed, got err=%v", inner, err)
+	_, err = os.Stat(outer)
+	require.NoError(t, err, "deleting Outer$1.class must not touch Outer.class")
+}
+
 func TestRenameFile(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src.txt")
@@ -50,24 +66,114 @@ func TestRenameFile(t *testing.T) {
 	_, err = os.Stat(src)
 	require.True(t, os.IsNotExist(err), "expected source removed, got err=%v", err)
 
-	// destination exists -> expect error
 	require.NoError(t, os.WriteFile(src, []byte("data"), 0o644))
 	require.Error(t, RenameFile(model.RenameFileItem{Src: src, Dest: dst}), "expected error when destination already exists")
 }
 
-func TestSearchFileMetadata(t *testing.T) {
-	metadata := map[string]model.FileMetadata{
-		"/tmp/a/notes.txt": {Path: "/tmp/a/notes.txt"},
-		"/tmp/b/readme.md": {Path: "/tmp/b/readme.md"},
+func TestMakeDir_PreExistingDir(t *testing.T) {
+	tmp := t.TempDir()
+	existing := filepath.Join(tmp, "existing")
+	require.NoError(t, os.Mkdir(existing, 0o755))
+
+	origInfo, err := os.Stat(existing)
+	require.NoError(t, err)
+	origMode := origInfo.Mode().Perm()
+
+	err = MakeDir(existing, model.Permission{Mode: 700})
+	require.NoError(t, err, "MakeDir on pre-existing dir should not fail")
+
+	afterInfo, err := os.Stat(existing)
+	require.NoError(t, err)
+	require.Equal(t, origMode, afterInfo.Mode().Perm(), "permissions of pre-existing dir should be unchanged")
+}
+
+func TestMakeDir_NewDir(t *testing.T) {
+	tmp := t.TempDir()
+	newDir := filepath.Join(tmp, "brand-new")
+
+	err := MakeDir(newDir, model.Permission{Mode: 755})
+	require.NoError(t, err)
+
+	info, err := os.Stat(newDir)
+	require.NoError(t, err)
+	require.True(t, info.IsDir())
+	if runtime.GOOS != "windows" {
+		require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
 	}
+}
 
-	path, info, ok := SearchFileMetadata(metadata, "/any/notes.txt")
-	require.True(t, ok, "expected metadata entry")
-	require.Equal(t, "/tmp/a/notes.txt", path)
-	require.Equal(t, "/tmp/a/notes.txt", info.Path)
+func TestMkdirAllWithOwnership_NewNestedDirs(t *testing.T) {
+	tmp := t.TempDir()
+	nested := filepath.Join(tmp, "a", "b", "c")
 
-	_, _, ok = SearchFileMetadata(metadata, "/foo/unknown.txt")
-	require.False(t, ok, "expected no match")
+	err := MkdirAllWithOwnership(nested, 0o755, "", "")
+	require.NoError(t, err)
+
+	for _, seg := range []string{"a", "a/b", "a/b/c"} {
+		info, err := os.Stat(filepath.Join(tmp, seg))
+		require.NoError(t, err)
+		require.True(t, info.IsDir())
+	}
+}
+
+func TestMkdirAllWithOwnership_PreExistingParent(t *testing.T) {
+	tmp := t.TempDir()
+	existing := filepath.Join(tmp, "existing")
+	require.NoError(t, os.Mkdir(existing, 0o755))
+
+	origInfo, err := os.Stat(existing)
+	require.NoError(t, err)
+	origMode := origInfo.Mode().Perm()
+
+	nested := filepath.Join(existing, "new-child", "deep")
+	err = MkdirAllWithOwnership(nested, 0o755, "", "")
+	require.NoError(t, err)
+
+	afterInfo, err := os.Stat(existing)
+	require.NoError(t, err)
+	require.Equal(t, origMode, afterInfo.Mode().Perm(), "pre-existing dir should be unchanged")
+
+	info, err := os.Stat(nested)
+	require.NoError(t, err)
+	require.True(t, info.IsDir())
+}
+
+func TestMkdirAllWithOwnership_AllExist(t *testing.T) {
+	tmp := t.TempDir()
+	existing := filepath.Join(tmp, "already")
+	require.NoError(t, os.MkdirAll(existing, 0o755))
+
+	err := MkdirAllWithOwnership(existing, 0o755, "", "")
+	require.NoError(t, err, "all dirs exist — should be no-op")
+}
+
+func TestSetFileOwnership_EmptyOwnerGroup(t *testing.T) {
+	tmp := t.TempDir()
+	file := filepath.Join(tmp, "test.txt")
+	require.NoError(t, os.WriteFile(file, []byte("data"), 0o644))
+
+	err := SetFileOwnership(file, "", "")
+	require.NoError(t, err, "empty owner and group should be a no-op")
+}
+
+func TestSetFileOwnership_MissingFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("SetFileOwnership is a no-op on Windows")
+	}
+	err := SetFileOwnership("/nonexistent/path/file.txt", "root", "")
+	require.Error(t, err, "chown on missing file should return error")
+}
+
+func TestSetFileOwnership_InvalidOwner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("SetFileOwnership is a no-op on Windows")
+	}
+	tmp := t.TempDir()
+	file := filepath.Join(tmp, "test.txt")
+	require.NoError(t, os.WriteFile(file, []byte("data"), 0o644))
+
+	err := SetFileOwnership(file, "nonexistent_user_xyz", "")
+	require.Error(t, err, "invalid owner should return error")
 }
 
 func TestParseRange(t *testing.T) {
@@ -89,6 +195,30 @@ func TestParseRange(t *testing.T) {
 			header: "bytes=-5",
 			size:   10,
 			want:   []httpRange{{start: 5, length: 5}},
+		},
+		{
+			name:   "end past size is clamped",
+			header: "bytes=5-100",
+			size:   10,
+			want:   []httpRange{{start: 5, length: 5}},
+		},
+		{
+			name:   "end at max int64",
+			header: "bytes=0-9223372036854775807",
+			size:   10,
+			want:   []httpRange{{start: 0, length: 10}},
+		},
+		{
+			name:   "start past size is skipped",
+			header: "bytes=20-30",
+			size:   10,
+			want:   []httpRange{},
+		},
+		{
+			name:   "start plus end overflows",
+			header: "bytes=1-9223372036854775807",
+			size:   10,
+			want:   []httpRange{{start: 1, length: 9}},
 		},
 		{
 			name:      "invalid",

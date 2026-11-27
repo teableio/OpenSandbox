@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,7 +49,9 @@ def _get_annotation(workload: Any, key: str) -> Optional[str]:
     return None
 
 
-def _attach_egress_auth_headers(endpoint: Endpoint, workload: Any) -> None:
+def _attach_egress_auth_headers(endpoint: Endpoint, workload: Any, port: int) -> None:
+    if port != 18080:
+        return
     token = _get_egress_auth_token(workload)
     if not token:
         return

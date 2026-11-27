@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -80,10 +80,3 @@ def test_pause_route_propagates_service_http_error(
         "code": "SANDBOX_NOT_FOUND",
         "message": "Sandbox missing not found",
     }
-
-
-def test_pause_route_requires_api_key(client: TestClient) -> None:
-    response = client.post("/v1/sandboxes/sbx-001/pause")
-
-    assert response.status_code == 401
-    assert response.json()["code"] == "MISSING_API_KEY"

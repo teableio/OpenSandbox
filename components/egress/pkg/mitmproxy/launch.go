@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,38 +15,228 @@
 package mitmproxy
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"io"
+	"math"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/egress/pkg/mitmpassthrough"
+	"github.com/alibaba/opensandbox/egress/pkg/telemetry"
 	"github.com/alibaba/opensandbox/internal/safego"
 )
 
 const RunAsUser = "mitmproxy"
 
+const revisionRuntimeErrorMessage = "credential proxy: invalid revision runtime configuration"
+
+const (
+	revisionIPCSocketEnv            = "OPENSANDBOX_EGRESS_REVISION_IPC_SOCKET"
+	revisionIPCTokenEnv             = "OPENSANDBOX_EGRESS_REVISION_IPC_TOKEN"
+	revisionIPCControlGenerationEnv = "OPENSANDBOX_EGRESS_REVISION_CONTROL_GENERATION"
+	revisionIPCSubjectGenerationEnv = "OPENSANDBOX_EGRESS_REVISION_SUBJECT_GENERATION"
+	revisionIPCMaxSnapshotBytesEnv  = "OPENSANDBOX_EGRESS_REVISION_MAX_SNAPSHOT_BYTES"
+	// Live admission bundle: presence of all three values in the child selects
+	// the OSEP-0023 live credential-bound receiver instead of the
+	// installation-only receiver. The launcher owns them; sandbox users cannot.
+	revisionIPCTLSCapacityEnv         = "OPENSANDBOX_EGRESS_REVISION_TLS_CAPACITY"
+	revisionIPCRequestCapacityEnv     = "OPENSANDBOX_EGRESS_REVISION_REQUEST_CAPACITY"
+	revisionIPCDrainTimeoutSecondsEnv = "OPENSANDBOX_EGRESS_REVISION_DRAIN_TIMEOUT_SECONDS"
+)
+
+var (
+	errInvalidRevisionIPCConfig = errors.New("mitmproxy: invalid revision IPC configuration")
+	revisionIPCEnvNames         = []string{
+		constants.EnvMitmproxyPassthroughHosts,
+		revisionIPCSocketEnv,
+		revisionIPCTokenEnv,
+		revisionIPCControlGenerationEnv,
+		revisionIPCSubjectGenerationEnv,
+		revisionIPCMaxSnapshotBytesEnv,
+		revisionIPCTLSCapacityEnv,
+		revisionIPCRequestCapacityEnv,
+		revisionIPCDrainTimeoutSecondsEnv,
+	}
+)
+
 // Loopback: transparent mode receives via REDIRECT; do not listen on 0.0.0.0 in the netns.
+// Kept as a Go constant only for the startup log line; the actual listen_host is set in
+// /var/lib/mitmproxy/.mitmproxy/config.yaml (shipped via the egress Dockerfile).
 const listenHostLoopback = "127.0.0.1"
+
+// The IPv6 loopback twin: the ip6 nat OUTPUT redirect lands on ::1 (mitmproxy's mode spec wants
+// the bare address, no brackets).
+const listenHostLoopbackV6 = "::1"
 
 // systemScriptPath: bundled system addon shipped via the egress Dockerfile
 // (COPY components/egress/mitmscripts /var/egress/mitmscripts). Always loaded.
 const systemScriptPath = "/var/egress/mitmscripts/system.py"
 
-// Config: mitmdump --mode transparent; UserName must match iptables ! --uid-owner, ConfDir is mitm state/CA.
+// Config carries only per-launch dynamic values, applied via `--set`. Static
+// options (mode, listen_host, connection_strategy, stream_large_bodies,
+// ignore_hosts, ssl_verify_upstream_trusted_confdir) are auto-loaded by
+// mitmdump from /var/lib/mitmproxy/.mitmproxy/config.yaml (shipped from
+// components/egress/mitmproxy/config.yaml).
 type Config struct {
 	ListenPort int
-	UserName   string
-	ConfDir    string
-	// ScriptPath is an optional user-supplied addon, loaded after the system addon.
-	ScriptPath string
+	// ListenHost overrides the baked-in config.yaml listen_host
+	// (127.0.0.1 for the sidecar). The fast-sandbox profile passes 0.0.0.0: the
+	// per-subject interception DNAT lands traffic on the gateway veth
+	// address, which a loopback bind would never receive (same reason the
+	// fast-sandbox DNS proxy binds :15353).
+	ListenHost string
+	// ListenV6 adds a transparent listener on [::1]:ListenPort next to the loopback one (the
+	// ip6 OUTPUT REDIRECT lands there). nil = probe ::1 at launch; ignored when ListenHost is set.
+	ListenV6 *bool
+	UserName string
+	// ScriptPaths are optional user-supplied addons, loaded after the system addon
+	// in the order given. Parsed from the comma-separated OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT env var.
+	ScriptPaths []string
 	// OnExit is called (if non-nil) when mitmdump exits. Called from a background goroutine.
 	OnExit func(error)
+	// RevisionIPC is an internal, per-process receiver session. Callers own the
+	// private socket parent and must not reuse this configuration after the
+	// child exits. Nil keeps the receiver disabled and removes inherited values.
+	RevisionIPC *RevisionIPCConfig
+	// SubjectRevisionIPC selects the independent shared-process installation receiver.
+	SubjectRevisionIPC *SubjectRevisionIPCConfig
+}
+
+// RevisionIPCConfig is handed only to the mitmdump child. The bearer token is
+// transport authentication; the generation pair independently fences stale
+// sessions. Public configuration must not populate this structure directly.
+type RevisionIPCConfig struct {
+	SocketPath        string
+	SessionToken      string
+	ControlGeneration string
+	SubjectGeneration string
+	MaxSnapshotBytes  int
+	// LiveAdmission selects the OSEP-0023 live credential-bound receiver: the
+	// addon consults the installed decision snapshot for TLS decrypt and
+	// request admission. False keeps the installation-only receiver.
+	StaticPassthrough   mitmpassthrough.Config
+	LiveAdmission       bool
+	TLSCapacity         int
+	RequestCapacity     int
+	DrainTimeoutSeconds int
+}
+
+// SubjectRevisionScriptPath is the bundled installation-only shared receiver addon.
+const SubjectRevisionScriptPath = "/var/egress/mitmscripts/subject_runtime.py"
+
+const subjectRevisionEnvPrefix = "OPENSANDBOX_EGRESS_SUBJECT_REVISION_"
+
+// SubjectRevisionIPCConfig is an internal handoff, never an operator setting.
+// It deliberately has no single SubjectGeneration.
+type SubjectRevisionIPCConfig struct {
+	SocketPath            string
+	SessionToken          string
+	ControlGeneration     string
+	MaxSubjects           int
+	MaxSnapshotBytes      int
+	RetainedPayloadBudget int64
+	TLSAdmission          bool
+	TLSCapacity           int
+	ProcessTLSCapacity    int
+	// DrainTimeoutSeconds bounds subject transport retirement after a binding
+	// transition. It is shipped and validated only when TLSAdmission is set.
+	DrainTimeoutSeconds int
+}
+
+func validateSubjectRevisionIPCConfig(cfg Config) error {
+	subject := cfg.SubjectRevisionIPC
+	if subject == nil {
+		return nil
+	}
+	if cfg.RevisionIPC != nil || !filepath.IsAbs(subject.SocketPath) ||
+		strings.IndexByte(subject.SocketPath, 0) >= 0 || len(subject.SocketPath) > 103 ||
+		!validRevisionIPCToken(subject.SessionToken) || !validRevisionIPCGeneration(subject.ControlGeneration) ||
+		subject.MaxSubjects <= 0 || subject.MaxSnapshotBytes <= 0 ||
+		int64(subject.MaxSubjects) > math.MaxInt64/2/int64(subject.MaxSnapshotBytes) ||
+		subject.RetainedPayloadBudget < 2*int64(subject.MaxSubjects)*int64(subject.MaxSnapshotBytes) {
+		return errInvalidRevisionIPCConfig
+	}
+	if subject.TLSAdmission && (subject.TLSCapacity < 1 || subject.TLSCapacity > 1<<20 ||
+		subject.ProcessTLSCapacity < 1 || subject.ProcessTLSCapacity > 1<<20 ||
+		subject.DrainTimeoutSeconds < 1 || subject.DrainTimeoutSeconds > 300) {
+		return errInvalidRevisionIPCConfig
+	}
+	count := 0
+	for _, path := range cfg.ScriptPaths {
+		if path == SubjectRevisionScriptPath {
+			count++
+		}
+	}
+	if count != 1 {
+		return errInvalidRevisionIPCConfig
+	}
+	return nil
+}
+
+// WithSubjectRevision returns an owned launch config; the template is reusable
+// only without its per-child session. The system addon receives no v1 bundle.
+func WithSubjectRevision(cfg Config, handoff SubjectRevisionIPCConfig) (Config, error) {
+	if cfg.RevisionIPC != nil || cfg.SubjectRevisionIPC != nil {
+		return Config{}, errInvalidRevisionIPCConfig
+	}
+	cfg.ScriptPaths = append(append([]string(nil), cfg.ScriptPaths...), SubjectRevisionScriptPath)
+	cfg.SubjectRevisionIPC = &handoff
+	if err := validateSubjectRevisionIPCConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+// Nil subject configuration delegates verbatim to the existing sidecar builder.
+func buildMitmdumpChildEnv(base []string, home string, cfg Config) []string {
+	env := buildMitmdumpEnv(base, home, cfg.RevisionIPC)
+	if cfg.SubjectRevisionIPC == nil {
+		// Preserve inherited OPENSANDBOX_EGRESS_SUBJECT_REVISION_* values
+		// intentionally: the disabled path has no reader for this prefix.
+		return env
+	}
+	clean := make([]string, 0, len(env)+12)
+	for _, value := range env {
+		name, _, _ := strings.Cut(value, "=")
+		if !strings.HasPrefix(name, subjectRevisionEnvPrefix) {
+			clean = append(clean, value)
+		}
+	}
+	s := cfg.SubjectRevisionIPC
+	clean = append(clean,
+		subjectRevisionEnvPrefix+"MODE=subject-v2",
+		subjectRevisionEnvPrefix+"SOCKET="+s.SocketPath,
+		subjectRevisionEnvPrefix+"TOKEN="+s.SessionToken,
+		subjectRevisionEnvPrefix+"CONTROL_GENERATION="+s.ControlGeneration,
+		subjectRevisionEnvPrefix+"MAX_SUBJECTS="+strconv.Itoa(s.MaxSubjects),
+		subjectRevisionEnvPrefix+"MAX_SNAPSHOT_BYTES="+strconv.Itoa(s.MaxSnapshotBytes),
+		subjectRevisionEnvPrefix+"RETAINED_PAYLOAD_BUDGET="+strconv.FormatInt(s.RetainedPayloadBudget, 10),
+	)
+	if s.TLSAdmission {
+		clean = append(clean, subjectRevisionEnvPrefix+"TLS_ADMISSION=true",
+			subjectRevisionEnvPrefix+"TLS_CAPACITY="+strconv.Itoa(s.TLSCapacity),
+			subjectRevisionEnvPrefix+"PROCESS_TLS_CAPACITY="+strconv.Itoa(s.ProcessTLSCapacity),
+			subjectRevisionEnvPrefix+"DRAIN_TIMEOUT_SECONDS="+strconv.Itoa(s.DrainTimeoutSeconds),
+			// The child reads its static passthrough policy only from this
+			// handoff: inheritance is stripped above and main.go rejects an
+			// operator-set value for fast-sandbox, so the policy is empty.
+			// parse_handoff treats a missing value as an error, including for
+			// an empty policy, so admission must ship it explicitly.
+			constants.EnvMitmproxyPassthroughHosts+"=[]")
+	}
+	return clean
 }
 
 // Running: child mitmdump; use GracefulShutdown to SIGTERM+reap before process exit.
@@ -76,12 +266,21 @@ func LookupUser(userName string) (uid, gid uint32, home string, err error) {
 
 // Launch starts mitmdump in the background; check Wait/GracefulShutdown on the returned Running.
 func Launch(cfg Config) (*Running, error) {
+	if err := validateUpstreamProxyEnv(); err != nil {
+		return nil, fmt.Errorf("mitmproxy: %w", err)
+	}
 	if runtime.GOOS != "linux" {
 		return nil, fmt.Errorf("mitmproxy: transparent mitmdump is only supported on linux")
 	}
 
 	if cfg.ListenPort <= 0 {
 		return nil, fmt.Errorf("mitmproxy: invalid listen port")
+	}
+	if err := validateRevisionIPCConfig(cfg.RevisionIPC); err != nil {
+		return nil, err
+	}
+	if err := validateSubjectRevisionIPCConfig(cfg); err != nil {
+		return nil, err
 	}
 	uname := cfg.UserName
 	if strings.TrimSpace(uname) == "" {
@@ -92,75 +291,280 @@ func Launch(cfg Config) (*Running, error) {
 		return nil, fmt.Errorf("mitmproxy: lookup user %q: %w", uname, err)
 	}
 
-	args := []string{
-		"--mode", "transparent",
-		"--listen-host", listenHostLoopback,
-		"--listen-port", strconv.Itoa(cfg.ListenPort),
-	}
-
-	trustDir := strings.TrimSpace(os.Getenv(constants.EnvMitmproxyUpstreamTrustDir))
-	if trustDir == "" {
-		trustDir = "/etc/ssl/certs"
-	}
-	args = append(args, "--set", "ssl_verify_upstream_trusted_confdir="+trustDir)
-
-	// Stream large bodies instead of buffering them in memory (OOM prevention).
-	args = append(args, "--set", "stream_large_bodies=1m")
-
-	// Lazy connection strategy: defer upstream connection until the request is fully received,
-	// which avoids unnecessary connections for blocked/filtered requests.
-	args = append(args, "--set", "connection_strategy=lazy")
-
-	// Transparent mode redirects TCP to IP addresses. Clients connecting to IPs
-	// do not send SNI, so upstream TLS cert hostname verification fails with
-	// "IP address mismatch". Set OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE=true
-	// to skip upstream verification when clients connect by IP.
-	if constants.IsTruthy(os.Getenv(constants.EnvMitmproxySslInsecure)) {
-		args = append(args, "--set", "ssl_insecure=true")
-	}
-
-	homeEnv := home
-	if strings.TrimSpace(cfg.ConfDir) != "" {
-		cd := strings.TrimSpace(cfg.ConfDir)
-		args = append(args, "--set", "confdir="+cd)
-		homeEnv = cd
-	}
-	// Load the system addon first so user addons can observe / override its hooks.
-	args = append(args, "-s", systemScriptPath)
-	if user := strings.TrimSpace(cfg.ScriptPath); user != "" {
-		args = append(args, "-s", user)
-	}
-
-	// Upstream passthrough: each pattern becomes --set ignore_hosts= (regex; IP ranges are practical in transparent mode).
-	for _, p := range strings.Split(os.Getenv(constants.EnvMitmproxyIgnoreHosts), ";") {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		args = append(args, "--set", "ignore_hosts="+p)
+	args := buildMitmdumpArgs(cfg)
+	if cfg.ListenV6 == nil {
+		cfg.ListenV6 = loopbackV6Available()
+		args = buildMitmdumpArgs(cfg)
 	}
 
 	cmd := exec.Command("mitmdump", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	mitmOut, mitmIn := io.Pipe()
+	cmd.Stdout = mitmIn
+	cmd.Stderr = mitmIn
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{Uid: uid, Gid: gid},
 	}
-	cmd.Env = append(os.Environ(), "HOME="+homeEnv)
+	// HOME determines mitm's confdir (~/.mitmproxy) which holds both the CA
+	// and the baked-in config.yaml.
+	cmd.Env = buildMitmdumpChildEnv(os.Environ(), home, cfg)
 
 	if err := cmd.Start(); err != nil {
+		_ = mitmIn.Close()
 		return nil, fmt.Errorf("mitmproxy: start mitmdump: %w", err)
 	}
+	safego.Go(func() { forwardMitmdumpOutput(mitmOut) })
 	done := make(chan error, 1)
 	onExit := cfg.OnExit
 	safego.Go(func() {
 		err := cmd.Wait()
+		// cmd.Wait waits for the internal copy from the child to complete, so
+		// closing the write end here EOFs the reader only after the remaining
+		// mitmdump output has been drained.
+		_ = mitmIn.Close()
 		done <- err
 		if onExit != nil {
 			onExit(err)
 		}
 	})
 
-	log.Infof("[mitmproxy] mitmdump started (pid %d, transparent on %s:%d)", cmd.Process.Pid, listenHostLoopback, cfg.ListenPort)
+	hosts := listenHostLoopback
+	if h := strings.TrimSpace(cfg.ListenHost); h != "" {
+		hosts = h
+	} else if cfg.ListenV6 != nil && *cfg.ListenV6 {
+		hosts += " + " + listenHostLoopbackV6
+	}
+	log.Infof("[mitmproxy] mitmdump started (pid %d, transparent on %s:%d)", cmd.Process.Pid, hosts, cfg.ListenPort)
 	return &Running{Cmd: cmd, done: done}, nil
+}
+
+// loopbackV6Available reports whether ::1 can be bound (false with ipv6.disable=1 or no v6 stack).
+// mitmdump exits when any listener fails, so the v6 mode is only requested when it will bind.
+func loopbackV6Available() *bool {
+	ok := false
+	if l, err := net.Listen("tcp6", net.JoinHostPort(listenHostLoopbackV6, "0")); err == nil {
+		_ = l.Close()
+		ok = true
+	}
+	return &ok
+}
+
+func buildMitmdumpArgs(cfg Config) []string {
+	// Explicit mode specs replace config.yaml's `mode: [transparent]` + `listen_host`: the ip6
+	// OUTPUT REDIRECT delivers to [::1]:<port>, which an IPv4 loopback listener never sees. Both
+	// stay on loopback unless ListenHost says otherwise (see config.yaml on why transparent mode
+	// must not listen on the LAN).
+	host := listenHostLoopback
+	if h := strings.TrimSpace(cfg.ListenHost); h != "" {
+		host = h
+	}
+	args := []string{
+		"--mode", fmt.Sprintf("transparent@%s:%d", host, cfg.ListenPort),
+	}
+	if host == listenHostLoopback && cfg.ListenV6 != nil && *cfg.ListenV6 {
+		args = append(args, "--mode", fmt.Sprintf("transparent@%s:%d", listenHostLoopbackV6, cfg.ListenPort))
+	}
+	args = append(args,
+		"--listen-port", strconv.Itoa(cfg.ListenPort),
+		"--set", "flow_detail=0",
+	)
+	if strings.TrimSpace(cfg.ListenHost) != "" {
+		args = append(args, "--listen-host", cfg.ListenHost)
+	}
+
+	if trustDir := strings.TrimSpace(os.Getenv(constants.EnvMitmproxyUpstreamTrustDir)); trustDir != "" {
+		args = append(args, "--set", "ssl_verify_upstream_trusted_confdir="+trustDir)
+	}
+	if extraCA := strings.TrimSpace(os.Getenv(constants.EnvMitmproxyUpstreamExtraCA)); extraCA != "" {
+		args = append(args, "--set", "ssl_verify_upstream_trusted_ca="+extraCA)
+	}
+
+	if constants.IsTruthy(os.Getenv(constants.EnvMitmproxySslInsecure)) {
+		args = append(args, "--set", "ssl_insecure=true")
+	}
+
+	if cfg.SubjectRevisionIPC != nil && cfg.SubjectRevisionIPC.TLSAdmission {
+		args = append(args, "--set", "http2=false")
+	}
+
+	args = append(args, "-s", systemScriptPath)
+	if strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxy)) != "" {
+		args = append(args, "-s", upstreamProxyScriptPath)
+	}
+	for _, p := range cfg.ScriptPaths {
+		if s := strings.TrimSpace(p); s != "" {
+			args = append(args, "-s", s)
+		}
+	}
+	return args
+}
+
+func buildMitmdumpEnv(base []string, home string, revisionIPC *RevisionIPCConfig) []string {
+	blocked := make(map[string]struct{}, len(revisionIPCEnvNames))
+	for _, name := range revisionIPCEnvNames {
+		blocked[name] = struct{}{}
+	}
+	env := make([]string, 0, len(base)+1+len(revisionIPCEnvNames))
+	for _, value := range base {
+		name, _, found := strings.Cut(value, "=")
+		if _, remove := blocked[name]; found && remove {
+			continue
+		}
+		env = append(env, value)
+	}
+	env = append(env, "HOME="+home)
+	if revisionIPC != nil {
+		env = append(env,
+			revisionIPCSocketEnv+"="+revisionIPC.SocketPath,
+			revisionIPCTokenEnv+"="+revisionIPC.SessionToken,
+			revisionIPCControlGenerationEnv+"="+revisionIPC.ControlGeneration,
+			revisionIPCSubjectGenerationEnv+"="+revisionIPC.SubjectGeneration,
+			revisionIPCMaxSnapshotBytesEnv+"="+strconv.Itoa(revisionIPC.MaxSnapshotBytes),
+		)
+		if revisionIPC.LiveAdmission {
+			env = append(env,
+				constants.EnvMitmproxyPassthroughHosts+"="+revisionIPC.StaticPassthrough.JSON(),
+				revisionIPCTLSCapacityEnv+"="+strconv.Itoa(revisionIPC.TLSCapacity),
+				revisionIPCRequestCapacityEnv+"="+strconv.Itoa(revisionIPC.RequestCapacity),
+				revisionIPCDrainTimeoutSecondsEnv+"="+strconv.Itoa(revisionIPC.DrainTimeoutSeconds),
+			)
+		}
+	}
+	return env
+}
+
+func validateRevisionIPCConfig(cfg *RevisionIPCConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if !filepath.IsAbs(cfg.SocketPath) || strings.IndexByte(cfg.SocketPath, 0) >= 0 ||
+		!validRevisionIPCToken(cfg.SessionToken) ||
+		!validRevisionIPCGeneration(cfg.ControlGeneration) ||
+		!validRevisionIPCGeneration(cfg.SubjectGeneration) || cfg.MaxSnapshotBytes <= 0 {
+		return errInvalidRevisionIPCConfig
+	}
+	if cfg.LiveAdmission &&
+		(cfg.TLSCapacity <= 0 || cfg.RequestCapacity <= 0 ||
+			cfg.DrainTimeoutSeconds < 1 || cfg.DrainTimeoutSeconds > 300) {
+		return errInvalidRevisionIPCConfig
+	}
+	// The live credential-bound mode never runs with insecure upstream
+	// verification: credential injection requires the verified origin
+	// identity. The installation-only receiver keeps the legacy escape hatch.
+	if cfg.LiveAdmission && !cfg.StaticPassthrough.Empty() && strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxy)) != "" {
+		return errInvalidRevisionIPCConfig
+	}
+	if cfg.LiveAdmission && constants.IsTruthy(os.Getenv(constants.EnvMitmproxySslInsecure)) {
+		return errInvalidRevisionIPCConfig
+	}
+	return nil
+}
+
+func validRevisionIPCToken(value string) bool {
+	if len(value) < 32 || len(value) > 256 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == '-' || character == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func validRevisionIPCGeneration(value string) bool {
+	return value != "" && strings.IndexByte(value, 0) < 0 && utf8.ValidString(value) &&
+		utf8.RuneCountInString(value) <= 128
+}
+
+// forwardMitmdumpOutput relays credential proxy log lines from mitmdump
+// stdout/stderr into the egress zap logger at warn level, so they land in the
+// same sink as egress logs (OPENSANDBOX_LOG_OUTPUT) and stand out from
+// mitmproxy's own high-volume flow logs, which are dropped.
+func forwardMitmdumpOutput(r io.ReadCloser) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), " \t\r")
+		msg, ok := credentialProxyMessage(line)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(msg, "credential proxy: tls-budget-v1 ") {
+			scope, occupied, budget, ok := tlsBudgetEvent(msg)
+			if ok {
+				telemetry.RecordTLSBudget(scope, occupied, budget)
+			}
+			continue
+		}
+		if strings.HasPrefix(msg, "credential proxy: tls-admission-") {
+			if decision, reason, ok := tlsAdmissionEvent(msg); ok {
+				telemetry.RecordTLSAdmission(decision, reason)
+			}
+			// Consume malformed events too; never forward their raw payload.
+			continue
+		}
+		if strings.HasPrefix(msg, "credential proxy: tls-shadow ") {
+			telemetry.RecordTLSShadow(strings.TrimPrefix(msg, "credential proxy: tls-shadow "))
+			continue
+		}
+		log.Warnf("[mitmproxy] %s", msg)
+	}
+	// On ErrTooLong (a newline-free line over the buffer limit) Scan stops
+	// early; closing the read end makes the exec copy goroutine fail with
+	// ErrClosedPipe so cmd.Wait returns instead of hanging forever.
+	_ = r.Close()
+}
+
+const tlsAdmissionPrefix = "credential proxy: tls-admission-v1"
+
+func tlsBudgetEvent(msg string) (scope string, occupied, budget int64, ok bool) {
+	payload, found := strings.CutPrefix(msg, "credential proxy: tls-budget-v1 ")
+	parts := strings.Split(payload, " ")
+	if !found || len(parts) != 3 || (parts[0] != "process" && parts[0] != "subject") {
+		return "", 0, 0, false
+	}
+	occupied, first := strconv.ParseInt(parts[1], 10, 64)
+	budget, second := strconv.ParseInt(parts[2], 10, 64)
+	return parts[0], occupied, budget, first == nil && second == nil &&
+		occupied >= 0 && budget >= 1 && budget <= 1<<20 && occupied <= budget
+}
+
+// tlsAdmissionEvent validates framing only. The recorder validates the closed
+// decision/reason pairs before creating attributes.
+func tlsAdmissionEvent(msg string) (decision, reason string, ok bool) {
+	payload, found := strings.CutPrefix(msg, tlsAdmissionPrefix+" ")
+	if !found || strings.ContainsAny(payload, "\t\r\n\v\f") {
+		return "", "", false
+	}
+	values := strings.Split(payload, " ")
+	if len(values) != 2 || values[0] == "" || values[1] == "" {
+		return "", "", false
+	}
+	return values[0], values[1], true
+}
+
+// credentialProxyMessage returns the message of a credential proxy log line,
+// stripping the leading [HH:MM:SS.mmm] timestamp that mitmproxy 11.x terminal
+// logger prepends to ctx.log.* records. It reports false for any other line,
+// so mitmproxy's own high-volume flow logs stay filtered out.
+func credentialProxyMessage(line string) (string, bool) {
+	if strings.HasPrefix(line, "[") {
+		if end := strings.Index(line, "] "); end != -1 {
+			line = line[end+2:]
+		}
+	}
+	if executable, message, found := strings.Cut(line, ": "); found &&
+		filepath.Base(executable) == "mitmdump" && message == revisionRuntimeErrorMessage {
+		return message, true
+	}
+	if !strings.HasPrefix(line, "credential proxy:") {
+		return "", false
+	}
+	if strings.HasPrefix(line, "credential proxy: tls-budget-") {
+		if _, _, _, ok := tlsBudgetEvent(line); !ok {
+			return "", false
+		}
+	}
+	return line, true
 }

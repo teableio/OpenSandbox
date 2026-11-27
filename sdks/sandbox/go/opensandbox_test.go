@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package opensandbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,13 +23,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// newLifecycleServer creates an httptest.Server and a LifecycleClient pointing at it.
 func newLifecycleServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *LifecycleClient) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -37,7 +38,6 @@ func newLifecycleServer(t *testing.T, handler http.HandlerFunc) (*httptest.Serve
 	return srv, client
 }
 
-// newEgressServer creates an httptest.Server and an EgressClient pointing at it.
 func newEgressServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *EgressClient) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -46,7 +46,6 @@ func newEgressServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, 
 	return srv, client
 }
 
-// newExecdServer creates an httptest.Server and an ExecdClient pointing at it.
 func newExecdServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *ExecdClient) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -230,6 +229,19 @@ func TestCreateSandbox_ManualCleanup(t *testing.T) {
 		// Timeout is nil — simulates ManualCleanup (no timeout sent)
 	})
 	require.NoErrorf(t, err, "CreateSandbox with ManualCleanup")
+}
+
+func TestSnapshotResourceLimitsWirePresence(t *testing.T) {
+	for _, tc := range []struct {
+		limits ResourceLimits
+		want   string
+	}{{nil, ""}, {ResourceLimits{}, "{}"}, {ResourceLimits{"cpu": "500m"}, `{"cpu":"500m"}`}} {
+		raw, err := json.Marshal(CreateSandboxRequest{SnapshotID: "snap", ResourceLimits: tc.limits})
+		require.NoError(t, err)
+		var obj map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(raw, &obj))
+		require.Equal(t, tc.want, string(obj["resourceLimits"]))
+	}
 }
 
 func TestCreateSandbox_FromSnapshot(t *testing.T) {
@@ -417,15 +429,23 @@ func TestSnapshotLifecycle(t *testing.T) {
 	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/sandboxes/sbx-1/snapshots":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				assert.Fail(t, fmt.Sprintf("read body: %v", err))
+			}
 			var req CreateSnapshotRequest
-			json.NewDecoder(r.Body).Decode(&req)
+			json.NewDecoder(bytes.NewReader(body)).Decode(&req)
 			if req.Name != "before-upgrade" {
 				assert.Fail(t, fmt.Sprintf("Name = %q, want %q", req.Name, "before-upgrade"))
+			}
+			if req.Mode != SnapshotModeRootfsOnly {
+				assert.Fail(t, fmt.Sprintf("Mode = %q, want %q", req.Mode, SnapshotModeRootfsOnly))
 			}
 			jsonResponse(w, http.StatusAccepted, SnapshotInfo{
 				ID:        "snap-1",
 				SandboxID: "sbx-1",
 				Name:      "before-upgrade",
+				Mode:      SnapshotModeRootfsOnly,
 				Status:    SnapshotStatus{State: SnapshotStateCreating},
 				CreatedAt: now,
 			})
@@ -439,6 +459,9 @@ func TestSnapshotLifecycle(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/snapshots":
 			if r.URL.Query().Get("sandboxId") != "sbx-1" {
 				assert.Fail(t, fmt.Sprintf("sandboxId = %q, want %q", r.URL.Query().Get("sandboxId"), "sbx-1"))
+			}
+			if r.URL.Query().Get("name") != "toolchain:go@rev-1" {
+				assert.Fail(t, fmt.Sprintf("name = %q, want %q", r.URL.Query().Get("name"), "toolchain:go@rev-1"))
 			}
 			jsonResponse(w, http.StatusOK, ListSnapshotsResponse{
 				Items: []SnapshotInfo{{
@@ -456,25 +479,55 @@ func TestSnapshotLifecycle(t *testing.T) {
 		}
 	})
 
-	created, err := client.CreateSnapshot(context.Background(), "sbx-1", CreateSnapshotRequest{Name: "before-upgrade"})
+	created, err := client.CreateSnapshot(context.Background(), "sbx-1", CreateSnapshotRequest{Name: "before-upgrade", Mode: SnapshotModeRootfsOnly})
 	require.NoErrorf(t, err, "CreateSnapshot")
 	require.Equal(t, "snap-1", created.ID)
+	require.Equal(t, SnapshotModeRootfsOnly, created.Mode)
 
 	got, err := client.GetSnapshot(context.Background(), "snap-1")
 	require.NoErrorf(t, err, "GetSnapshot")
 	require.Equal(t, SnapshotStateReady, got.Status.State)
+	// The GET response predates the mode field: it must read back as full.
+	require.Equal(t, SnapshotModeFull, got.Mode)
 
 	listed, err := client.ListSnapshots(context.Background(), ListSnapshotsOptions{
 		SandboxID: "sbx-1",
+		Name:      "toolchain:go@rev-1",
 		States:    []SnapshotState{SnapshotStateReady},
 		Page:      1,
 		PageSize:  10,
 	})
 	require.NoErrorf(t, err, "ListSnapshots")
 	require.Len(t, listed.Items, 1)
+	require.Equal(t, SnapshotModeFull, listed.Items[0].Mode)
 
 	err = client.DeleteSnapshot(context.Background(), "snap-1")
 	require.NoErrorf(t, err, "DeleteSnapshot")
+}
+
+func TestCreateSnapshotKeepsUnsetModeOffTheWire(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			assert.Fail(t, fmt.Sprintf("read body: %v", err))
+		}
+		if strings.Contains(string(body), "\"mode\"") {
+			assert.Fail(t, fmt.Sprintf("unset mode must stay off the wire, got %s", body))
+		}
+		jsonResponse(w, http.StatusAccepted, SnapshotInfo{
+			ID:        "snap-legacy",
+			SandboxID: "sbx-1",
+			Status:    SnapshotStatus{State: SnapshotStateCreating},
+			CreatedAt: now,
+		})
+	})
+
+	created, err := client.CreateSnapshot(context.Background(), "sbx-1", CreateSnapshotRequest{})
+	require.NoErrorf(t, err, "CreateSnapshot")
+	require.Equal(t, "snap-legacy", created.ID)
+	require.Equal(t, SnapshotModeFull, created.Mode)
 }
 
 func TestResumeSandbox(t *testing.T) {
@@ -605,10 +658,54 @@ func TestGetPolicy(t *testing.T) {
 	}
 }
 
-func TestPatchPolicy(t *testing.T) {
+// TestNetworkRule_PortScopedJSONRoundTrip guards the port-only wire shape:
+// marshaling a rule without a target must omit the key entirely (not send
+// ""), and decoding the sidecar's response shape ("target":"", since Go's
+// sidecar marshals target without omitempty) must not lose Ports.
+func TestNetworkRule_PortScopedJSONRoundTrip(t *testing.T) {
+	data, err := json.Marshal(NetworkRule{Action: "deny", Ports: []int{25}})
+	require.NoError(t, err)
+	require.Equal(t, `{"action":"deny","ports":[25]}`, string(data), "target must be omitted, not sent as an empty string")
+
+	var decoded NetworkRule
+	require.NoError(t, json.Unmarshal([]byte(`{"action":"deny","target":"","ports":[25]}`), &decoded))
+	require.Equal(t, "", decoded.Target)
+	require.Equal(t, []int{25}, decoded.Ports)
+
+	// An IP/CIDR target combined with ports must also round-trip.
+	data, err = json.Marshal(NetworkRule{Action: "allow", Target: "10.0.0.5", Ports: []int{22, 80}})
+	require.NoError(t, err)
+	require.Equal(t, `{"action":"allow","target":"10.0.0.5","ports":[22,80]}`, string(data))
+}
+
+func TestGetPolicy_PortOnlyRule(t *testing.T) {
 	want := PolicyStatusResponse{
 		Status: "active",
-		Mode:   "enforce",
+		Policy: &NetworkPolicy{
+			DefaultAction: "deny",
+			Egress: []NetworkRule{
+				{Action: "deny", Target: "", Ports: []int{25}},
+			},
+		},
+	}
+
+	_, client := newEgressServer(t, func(w http.ResponseWriter, r *http.Request) {
+		jsonResponse(w, http.StatusOK, want)
+	})
+
+	got, err := client.GetPolicy(context.Background())
+	require.NoErrorf(t, err, "GetPolicy")
+	require.NotNil(t, got.Policy)
+	require.Len(t, got.Policy.Egress, 1)
+	require.Equal(t, "", got.Policy.Egress[0].Target, "a port-only rule reads back with an empty target")
+	require.Equal(t, []int{25}, got.Policy.Egress[0].Ports)
+}
+
+func TestPatchPolicy(t *testing.T) {
+	want := PolicyStatusResponse{
+		Status:          "ok",
+		Mode:            "deny_all",
+		EnforcementMode: "dns+nft",
 		Policy: &NetworkPolicy{
 			DefaultAction: "deny",
 			Egress: []NetworkRule{
@@ -623,11 +720,12 @@ func TestPatchPolicy(t *testing.T) {
 			assert.Fail(t, fmt.Sprintf("expected PATCH, got %s", r.Method))
 		}
 
+		require.Equal(t, "/policy", r.URL.Path)
+		require.Equal(t, "test-egress-token", r.Header.Get(egressAuthHeader))
+
 		var rules []NetworkRule
-		json.NewDecoder(r.Body).Decode(&rules)
-		if len(rules) != 1 {
-			assert.Fail(t, fmt.Sprintf("expected 1 rule in request, got %d", len(rules)))
-		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&rules))
+		require.Equal(t, []NetworkRule{{Action: "allow", Target: "cdn.example.com"}}, rules)
 
 		jsonResponse(w, http.StatusOK, want)
 	})
@@ -636,14 +734,15 @@ func TestPatchPolicy(t *testing.T) {
 		{Action: "allow", Target: "cdn.example.com"},
 	})
 	require.NoErrorf(t, err, "PatchPolicy")
-	require.NotNil(t, got.Policy)
-	require.Len(t, got.Policy.Egress, 2)
+	require.NotNil(t, got)
+	require.Equal(t, want, *got)
 }
 
 func TestDeletePolicy(t *testing.T) {
 	want := PolicyStatusResponse{
-		Status: "ok",
-		Mode:   "deny_all",
+		Status:          "ok",
+		Mode:            "deny_all",
+		EnforcementMode: "dns+nft",
 		Policy: &NetworkPolicy{
 			DefaultAction: "deny",
 			Egress: []NetworkRule{
@@ -656,6 +755,9 @@ func TestDeletePolicy(t *testing.T) {
 		if r.Method != http.MethodDelete {
 			assert.Fail(t, fmt.Sprintf("expected DELETE, got %s", r.Method))
 		}
+
+		require.Equal(t, "/policy", r.URL.Path)
+		require.Equal(t, "test-egress-token", r.Header.Get(egressAuthHeader))
 
 		var targets []string
 		if err := json.NewDecoder(r.Body).Decode(&targets); err != nil {
@@ -676,9 +778,38 @@ func TestDeletePolicy(t *testing.T) {
 		"*.blocked.org",
 	})
 	require.NoErrorf(t, err, "DeletePolicy")
-	require.NotNil(t, got.Policy)
-	require.Len(t, got.Policy.Egress, 1)
-	require.Equal(t, "api.example.com", got.Policy.Egress[0].Target)
+	require.NotNil(t, got)
+	require.Equal(t, want, *got)
+}
+
+func TestPolicyMutationServiceUnavailable(t *testing.T) {
+	for _, method := range []string{http.MethodPatch, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			const message = "revision policy publication unavailable"
+			_, client := newEgressServer(t, func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, method, r.Method)
+				require.Equal(t, "/policy", r.URL.Path)
+				require.Equal(t, "test-egress-token", r.Header.Get(egressAuthHeader))
+				http.Error(w, message, http.StatusServiceUnavailable)
+			})
+
+			var got *PolicyStatusResponse
+			var err error
+			if method == http.MethodPatch {
+				got, err = client.PatchPolicy(context.Background(), []NetworkRule{
+					{Action: "allow", Target: "api.example.com"},
+				})
+			} else {
+				got, err = client.DeletePolicy(context.Background(), []string{"api.example.com"})
+			}
+			require.True(t, got == nil, "503 must not return a policy response")
+			var apiErr *APIError
+			require.ErrorAs(t, err, &apiErr)
+			require.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+			require.Equal(t, http.StatusText(http.StatusServiceUnavailable), apiErr.Response.Code)
+			require.Equal(t, message+"\n", apiErr.Response.Message)
+		})
+	}
 }
 
 func TestPing(t *testing.T) {
@@ -783,7 +914,6 @@ func TestGetFileInfo(t *testing.T) {
 }
 
 func TestUploadFile(t *testing.T) {
-	// Create a temp file to upload.
 	tmpFile, err := os.CreateTemp("", "opensandbox-test-*")
 	require.NoError(t, err)
 	defer os.Remove(tmpFile.Name())
@@ -801,7 +931,6 @@ func TestUploadFile(t *testing.T) {
 			assert.Fail(t, fmt.Sprintf("expected multipart content type, got %s", r.Header.Get("Content-Type")))
 		}
 
-		// Verify metadata file part exists.
 		r.ParseMultipartForm(1 << 20)
 		metaFile, _, mfErr := r.FormFile("metadata")
 		require.NoErrorf(t, mfErr, "expected metadata file part")
@@ -818,7 +947,6 @@ func TestUploadFile(t *testing.T) {
 			assert.Fail(t, fmt.Sprintf("metadata path = %q, want /sandbox/upload.txt", meta.Path))
 		}
 
-		// Verify file part exists.
 		file, _, fErr := r.FormFile("file")
 		if fErr != nil {
 			assert.Fail(t, fmt.Sprintf("expected file part: %v", fErr))
@@ -1125,10 +1253,6 @@ func TestExecdAuthHeader(t *testing.T) {
 	require.NoErrorf(t, err, "Ping")
 }
 
-// TestResolveExecdForwardsAllEndpointHeaders verifies that every header
-// returned by GetEndpoint (auth tokens, routing hints, sticky-session keys,
-// etc.) is forwarded as-is on subsequent execd requests, mirroring the
-// Python SDK behavior.
 func TestResolveExecdForwardsAllEndpointHeaders(t *testing.T) {
 	endpointHeaders := map[string]string{
 		"X-EXECD-ACCESS-TOKEN": "execd-tok",
@@ -1169,8 +1293,6 @@ func TestResolveExecdForwardsAllEndpointHeaders(t *testing.T) {
 	require.NoErrorf(t, sb.execd.Ping(context.Background()), "Ping")
 }
 
-// TestResolveEgressForwardsAllEndpointHeaders verifies the same forwarding
-// behavior for the egress sidecar client.
 func TestResolveEgressForwardsAllEndpointHeaders(t *testing.T) {
 	endpointHeaders := map[string]string{
 		"OPENSANDBOX-EGRESS-AUTH": "egress-tok",
@@ -1226,13 +1348,11 @@ func TestSandboxManager_ListFilter(t *testing.T) {
 		}
 
 		q := r.URL.Query()
-		// Verify state filter
 		states := q["state"]
 		if len(states) != 1 || states[0] != "Running" {
 			assert.Fail(t, fmt.Sprintf("expected state=[Running], got %v", states))
 		}
 
-		// Verify metadata filter
 		meta := q.Get("metadata")
 		if meta == "" {
 			assert.Fail(t, "expected metadata query param")
@@ -1241,7 +1361,6 @@ func TestSandboxManager_ListFilter(t *testing.T) {
 			assert.Fail(t, fmt.Sprintf("expected metadata to contain env=prod, got %q", meta))
 		}
 
-		// Verify pagination
 		if q.Get("page") != "1" {
 			assert.Fail(t, fmt.Sprintf("expected page=1, got %s", q.Get("page")))
 		}
@@ -1296,9 +1415,10 @@ func TestSandboxManager_ListMultipleStates(t *testing.T) {
 
 func TestSandboxManager_GetSandboxInfo(t *testing.T) {
 	want := SandboxInfo{
-		ID:        "sbx-get",
-		Status:    SandboxStatus{State: StateRunning},
-		CreatedAt: time.Now().UTC().Truncate(time.Second),
+		ID:         "sbx-get",
+		Status:     SandboxStatus{State: StateRunning},
+		Extensions: map[string]string{"opensandbox.extensions.custom-label": "中文数据"},
+		CreatedAt:  time.Now().UTC().Truncate(time.Second),
 	}
 
 	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1317,6 +1437,7 @@ func TestSandboxManager_GetSandboxInfo(t *testing.T) {
 	if got.ID != "sbx-get" {
 		assert.Fail(t, fmt.Sprintf("ID = %q, want %q", got.ID, "sbx-get"))
 	}
+	require.Equal(t, "中文数据", got.Extensions["opensandbox.extensions.custom-label"])
 }
 
 func TestSandboxManager_KillSandbox(t *testing.T) {
@@ -1531,6 +1652,74 @@ func TestSearchFiles(t *testing.T) {
 	}
 }
 
+func TestListDirectoryDefault(t *testing.T) {
+	want := []FileInfo{
+		{Path: "/sandbox/src", Type: "directory", Size: 0, Owner: "root", Group: "root", Mode: 755},
+		{Path: "/sandbox/README.md", Type: "file", Size: 256, Owner: "root", Group: "root", Mode: 644},
+	}
+
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			assert.Fail(t, fmt.Sprintf("expected GET, got %s", r.Method))
+		}
+		if r.URL.Path != "/directories/list" {
+			assert.Fail(t, fmt.Sprintf("expected /directories/list, got %s", r.URL.Path))
+		}
+		if r.URL.Query().Get("path") != "/sandbox" {
+			assert.Fail(t, fmt.Sprintf("expected path=/sandbox, got %s", r.URL.Query().Get("path")))
+		}
+		// ListDirectory should not pin a depth value; the server applies the
+		// default. Sending depth=... here would be a regression.
+		if _, ok := r.URL.Query()["depth"]; ok {
+			assert.Fail(t, fmt.Sprintf("expected depth to be omitted, got %q", r.URL.Query().Get("depth")))
+		}
+
+		jsonResponse(w, http.StatusOK, want)
+	})
+
+	got, err := client.ListDirectory(context.Background(), "/sandbox")
+	require.NoErrorf(t, err, "ListDirectory")
+	require.Len(t, got, 2)
+	require.Equal(t, "directory", got[0].Type)
+	require.Equal(t, "file", got[1].Type)
+}
+
+func TestListDirectoryWithDepth(t *testing.T) {
+	want := []FileInfo{
+		{Path: "/sandbox/src", Type: "directory", Size: 0, Owner: "root", Group: "root", Mode: 755},
+	}
+
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("depth") != "2" {
+			assert.Fail(t, fmt.Sprintf("expected depth=2, got %s", r.URL.Query().Get("depth")))
+		}
+
+		jsonResponse(w, http.StatusOK, want)
+	})
+
+	got, err := client.ListDirectoryWithDepth(context.Background(), "/sandbox", 2)
+	require.NoErrorf(t, err, "ListDirectoryWithDepth")
+	require.Len(t, got, 1)
+	require.Equal(t, "directory", got[0].Type)
+}
+
+func TestListDirectoryWithDepthZero(t *testing.T) {
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/directories/list" {
+			assert.Fail(t, fmt.Sprintf("expected /directories/list, got %s", r.URL.Path))
+		}
+		if r.URL.Query().Get("depth") != "0" {
+			assert.Fail(t, fmt.Sprintf("expected depth=0, got %s", r.URL.Query().Get("depth")))
+		}
+
+		jsonResponse(w, http.StatusOK, []FileInfo{})
+	})
+
+	got, err := client.ListDirectoryWithDepth(context.Background(), "/sandbox", 0)
+	require.NoErrorf(t, err, "ListDirectoryWithDepth")
+	require.Len(t, got, 0)
+}
+
 func TestSetPermissions(t *testing.T) {
 	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1590,6 +1779,34 @@ func TestReplaceInFiles(t *testing.T) {
 	require.NoErrorf(t, err, "ReplaceInFiles")
 }
 
+func TestReplaceInFilesDetailed(t *testing.T) {
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/files/replace" {
+			assert.Fail(t, fmt.Sprintf("expected /files/replace, got %s", r.URL.Path))
+		}
+		if r.URL.Query().Get("verbose") != "true" {
+			assert.Fail(t, "expected verbose=true query param")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(ReplaceResponse{
+			"/tmp/config.txt": {ReplacedCount: 1},
+		})
+	})
+
+	resp, err := client.ReplaceInFilesDetailed(context.Background(), ReplaceRequest{
+		"/tmp/config.txt": {Old: "localhost", New: "production.example.com"},
+	})
+	require.NoErrorf(t, err, "ReplaceInFilesDetailed")
+	if resp == nil {
+		assert.Fail(t, "expected non-nil response")
+	}
+	if resp["/tmp/config.txt"].ReplacedCount != 1 {
+		assert.Fail(t, fmt.Sprintf("expected replacedCount=1, got %d", resp["/tmp/config.txt"].ReplacedCount))
+	}
+}
+
 func TestDownloadFile(t *testing.T) {
 	fileContent := "hello from sandbox file"
 
@@ -1640,6 +1857,89 @@ func TestDownloadFile_Range(t *testing.T) {
 	require.NoErrorf(t, err, "ReadAll")
 	if string(data) != "hello" {
 		assert.Fail(t, fmt.Sprintf("content = %q, want %q", string(data), "hello"))
+	}
+}
+
+func TestDownloadFileResponse_RangeIgnored(t *testing.T) {
+	fileContent := "hello from sandbox file"
+
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "bytes=1024-" {
+			assert.Fail(t, fmt.Sprintf("Range = %q, want %q", rangeHeader, "bytes=1024-"))
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="output.txt"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(fileContent)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(fileContent))
+	})
+
+	resp, err := client.DownloadFileResponse(context.Background(), "/sandbox/output.txt", "bytes=1024-")
+	require.NoErrorf(t, err, "DownloadFileResponse")
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, false, resp.IsPartial())
+	if resp.ContentRange != nil {
+		assert.Fail(t, fmt.Sprintf("ContentRange = %+v, want nil", resp.ContentRange))
+	}
+	require.Equal(t, int64(len(fileContent)), resp.ContentLength)
+	require.Equal(t, int64(len(fileContent)), resp.TotalSize)
+	require.Equal(t, "application/octet-stream", resp.ContentType)
+	require.Equal(t, `attachment; filename="output.txt"`, resp.ContentDisposition)
+	data, err := io.ReadAll(resp.Body)
+	require.NoErrorf(t, err, "ReadAll")
+	require.Equal(t, fileContent, string(data))
+}
+
+func TestDownloadFileResponse_Range(t *testing.T) {
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "bytes=0-4" {
+			assert.Fail(t, fmt.Sprintf("Range = %q, want %q", rangeHeader, "bytes=0-4"))
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Range", "bytes 0-4/10")
+		w.Header().Set("Content-Length", "5")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("hello"))
+	})
+
+	resp, err := client.DownloadFileResponse(context.Background(), "/sandbox/big.bin", "bytes=0-4")
+	require.NoErrorf(t, err, "DownloadFileResponse range")
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusPartialContent, resp.StatusCode)
+	require.Equal(t, true, resp.IsPartial())
+	require.Equal(t, int64(5), resp.ContentLength)
+	require.Equal(t, int64(10), resp.TotalSize)
+	require.NotNil(t, resp.ContentRange)
+	require.Equal(t, ByteRange{Start: 0, End: 4, Total: 10, Raw: "bytes 0-4/10"}, *resp.ContentRange)
+}
+
+func TestDownloadFileResponse_UnknownTotal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want *ByteRange
+	}{
+		{name: "missing"},
+		{name: "malformed", raw: "garbage", want: &ByteRange{Start: -1, End: -1, Total: -1, Raw: "garbage"}},
+		{name: "unknown", raw: "bytes 5-9/*", want: &ByteRange{Start: 5, End: 9, Total: -1, Raw: "bytes 5-9/*"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Range", tc.raw)
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte("hello"))
+			})
+			resp, err := client.DownloadFileResponse(context.Background(), "/sandbox/big.bin", "bytes=5-")
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.True(t, resp.IsPartial())
+			require.Equal(t, tc.want, resp.ContentRange)
+			require.Equal(t, int64(-1), resp.TotalSize)
+		})
 	}
 }
 
@@ -2061,7 +2361,6 @@ func TestGetCommandLogs(t *testing.T) {
 			assert.Fail(t, fmt.Sprintf("expected /command/cmd-logs-1/logs, got %s", r.URL.Path))
 		}
 
-		// Verify Accept header
 		if r.Header.Get("Accept") != "text/plain" {
 			assert.Fail(t, fmt.Sprintf("Accept = %q, want text/plain", r.Header.Get("Accept")))
 		}
@@ -2102,6 +2401,23 @@ func TestGetCommandLogs_WithCursor(t *testing.T) {
 	}
 	if got.Cursor != 99 {
 		assert.Fail(t, fmt.Sprintf("Cursor = %d, want 99", got.Cursor))
+	}
+}
+
+func TestGetCommandLogs_RejectsNegativeCursorWithoutRequest(t *testing.T) {
+	client := NewExecdClient("http://unused.invalid", "token")
+	cursor := int64(-1)
+
+	got, err := client.GetCommandLogs(context.Background(), "cmd-logs", &cursor)
+
+	if got != nil {
+		assert.Fail(t, "GetCommandLogs returned a result for a negative cursor")
+	}
+	require.Error(t, err)
+	var invalid *InvalidArgumentError
+	require.ErrorAs(t, err, &invalid)
+	if invalid.Field != "cursor" {
+		assert.Fail(t, fmt.Sprintf("Field = %q, want cursor", invalid.Field))
 	}
 }
 
@@ -2180,7 +2496,6 @@ func TestWatchMetrics_SSE(t *testing.T) {
 		assert.Fail(t, fmt.Sprintf("event[0].Event = %q, want metrics", events[0].Event))
 	}
 
-	// Verify we can parse the metric data from events
 	var m Metrics
 	if err := json.Unmarshal([]byte(events[0].Data), &m); err != nil {
 		require.NoErrorf(t, err, "unmarshal metric")
@@ -2225,7 +2540,6 @@ func TestWatchMetrics_ContextCancel(t *testing.T) {
 		return nil
 	})
 
-	// Should get context cancelled error
 	if err == nil {
 		assert.Fail(t, "expected error from cancelled context")
 	}
@@ -2234,8 +2548,40 @@ func TestWatchMetrics_ContextCancel(t *testing.T) {
 	}
 }
 
+func TestExecution_Text(t *testing.T) {
+	tests := []struct {
+		name   string
+		stdout []string
+		want   string
+	}{
+		{name: "no events"},
+		{name: "terminated lines", stdout: []string{"a\n", "b\n"}, want: "a\nb\n"},
+		{name: "CRLF lines", stdout: []string{"a\r\n", "b\r\n"}, want: "a\r\nb\r\n"},
+		{name: "split CRLF boundaries", stdout: []string{"a\r", "\n", "b\r", "\n"}, want: "a\r\nb\r\n"},
+		{name: "CR lines", stdout: []string{"a\r", "b\r"}, want: "a\rb\r"},
+		{name: "mixed line endings", stdout: []string{"a\n", "b\r\n", "c\r", "d"}, want: "a\nb\r\nc\rd"},
+		{name: "blank lines", stdout: []string{"\n", "a\n", "\n", "b\n", "\n"}, want: "\na\n\nb\n\n"},
+		{name: "unterminated final fragment", stdout: []string{"a\n", "b"}, want: "a\nb"},
+		{name: "single terminated event", stdout: []string{"hello\n"}, want: "hello\n"},
+		{name: "single unterminated event", stdout: []string{"hello"}, want: "hello"},
+		{name: "single empty event", stdout: []string{""}},
+		{name: "legacy stripped lines", stdout: []string{"a", "b"}, want: "a\nb"},
+		{name: "legacy blank lines", stdout: []string{"", "a", "", "b", ""}, want: "\na\n\nb\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &Execution{}
+			for _, text := range tc.stdout {
+				exec.Stdout = append(exec.Stdout, OutputMessage{Text: text})
+			}
+			if got := exec.Text(); got != tc.want {
+				t.Errorf("Text() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestExecution_ProcessStreamEvents(t *testing.T) {
-	// Test the full Execution aggregation pipeline with all event types
 	exec := &Execution{}
 	events := []StreamEvent{
 		{Event: "init", Data: `{"type":"init","text":"exec-42","timestamp":100}`},
@@ -2295,6 +2641,117 @@ func TestExecution_ErrorEvent(t *testing.T) {
 	}
 	if len(exec.Error.Traceback) != 1 {
 		assert.Fail(t, fmt.Sprintf("Traceback len = %d, want 1", len(exec.Error.Traceback)))
+	}
+}
+
+func TestExecution_ErrorEventExitCode(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+	tests := []struct {
+		name          string
+		data          string
+		wantErrorCode *int
+		wantExitCode  *int
+		wantError     *ExecutionError
+	}{
+		{
+			name:          "exit_code is authoritative",
+			data:          `{"type":"error","error":{"ename":"CommandExecError","evalue":"3","traceback":["exit status 3"],"exit_code":3}}`,
+			wantErrorCode: intPtr(3),
+			wantExitCode:  intPtr(3),
+		},
+		{
+			name:          "signal kill reports -1",
+			data:          `{"type":"error","error":{"ename":"CommandExecError","evalue":"-1","traceback":["signal: terminated"],"exit_code":-1}}`,
+			wantErrorCode: intPtr(-1),
+			wantExitCode:  intPtr(-1),
+		},
+		{
+			name:          "timeout preserves signal exit status",
+			data:          `{"type":"error","timestamp":2,"error":{"ename":"CommandTimeout","evalue":"-1","traceback":["signal: terminated"],"exit_code":-1}}`,
+			wantErrorCode: intPtr(-1),
+			wantExitCode:  intPtr(-1),
+			wantError: &ExecutionError{Name: "CommandTimeout", Value: "-1", Timestamp: 2,
+				Traceback: []string{"signal: terminated"}, ExitCode: intPtr(-1)},
+		},
+		{
+			name:          "timeout preserves nonzero exit status",
+			data:          `{"type":"error","timestamp":2,"error":{"ename":"CommandTimeout","evalue":"137","traceback":["exit status 137"],"exit_code":137}}`,
+			wantErrorCode: intPtr(137),
+			wantExitCode:  intPtr(137),
+			wantError: &ExecutionError{Name: "CommandTimeout", Value: "137", Timestamp: 2,
+				Traceback: []string{"exit status 137"}, ExitCode: intPtr(137)},
+		},
+		{
+			name: "start failure has no exit code",
+			data: `{"type":"error","error":{"ename":"CommandExecError","evalue":"fork/exec /bin/sh: argument list too long"}}`,
+		},
+		{
+			name:         "older server falls back to evalue",
+			data:         `{"type":"error","error":{"ename":"CommandExecError","evalue":"7"}}`,
+			wantExitCode: intPtr(7),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &Execution{}
+			var handled *ExecutionError
+			handlers := &ExecutionHandlers{
+				OnError: func(e ExecutionError) error { handled = &e; return nil },
+			}
+			require.NoError(t, processStreamEvent(exec, StreamEvent{Event: "error", Data: tc.data}, handlers))
+
+			require.NotNil(t, exec.Error)
+			require.NotNil(t, handled)
+			require.Equal(t, exec.Error, handled)
+			if tc.wantError != nil {
+				require.Equal(t, tc.wantError, exec.Error)
+			}
+			require.Equal(t, tc.wantErrorCode, exec.Error.ExitCode)
+			require.Equal(t, tc.wantErrorCode, handled.ExitCode)
+			require.Equal(t, tc.wantExitCode, exec.ExitCode)
+			require.True(t, exec.Complete == nil, "error event must not mark the execution complete")
+		})
+	}
+}
+
+func TestExecution_CompleteEventExitCode(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+	tests := []struct {
+		name              string
+		data              string
+		wantCompleteCode  *int
+		wantExecutionCode *int
+	}{
+		{
+			name:              "wire exit_code is surfaced on complete and execution",
+			data:              `{"type":"execution_complete","timestamp":10,"execution_time":5,"exit_code":0}`,
+			wantCompleteCode:  intPtr(0),
+			wantExecutionCode: intPtr(0),
+		},
+		{
+			name:              "older server without exit_code still infers zero",
+			data:              `{"type":"execution_complete","timestamp":10,"execution_time":5}`,
+			wantCompleteCode:  nil,
+			wantExecutionCode: intPtr(0),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &Execution{}
+			var handled *ExecutionComplete
+			handlers := &ExecutionHandlers{
+				OnComplete: func(c ExecutionComplete) error { handled = &c; return nil },
+			}
+			require.NoError(t, processStreamEvent(exec, StreamEvent{Event: "execution_complete", Data: tc.data}, handlers))
+
+			require.NotNil(t, exec.Complete)
+			require.NotNil(t, handled)
+			require.Equal(t, tc.wantCompleteCode, exec.Complete.ExitCode)
+			require.Equal(t, tc.wantCompleteCode, handled.ExitCode)
+			require.Equal(t, tc.wantExecutionCode, exec.ExitCode)
+		})
 	}
 }
 
@@ -2389,33 +2846,30 @@ func TestStreamSSE_HandlerError(t *testing.T) {
 }
 
 func TestRunCommand_WithEnvs(t *testing.T) {
-	ssePayload := `{"type":"stdout","text":"bar","timestamp":1000}` + "\n\n" +
-		`{"type":"execution_complete","timestamp":1001,"execution_time":5}` + "\n\n"
+	for _, input := range []RunCommandRequest{{Command: "echo $FOO"}, {Argv: []string{"tool", "", "a b", "$HOME", "x'y"}}} {
+		input.Envs = map[string]string{"FOO": "bar", "BAZ": "qux"}
+		ssePayload := `{"type":"stdout","text":"bar","timestamp":1000}` + "\n\n" +
+			`{"type":"execution_complete","timestamp":1001,"execution_time":5}` + "\n\n"
 
-	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
-		var req RunCommandRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+			var req RunCommandRequest
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(body, &req))
+			require.Equal(t, input.Command != "", strings.Contains(string(body), `"command"`))
+			require.Equal(t, input.Command, req.Command)
+			require.Equal(t, input.Argv, req.Argv)
 
-		if req.Envs == nil {
-			require.FailNow(t, "expected Envs to be set")
-		}
-		if req.Envs["FOO"] != "bar" {
-			assert.Fail(t, fmt.Sprintf("Envs[FOO] = %q, want bar", req.Envs["FOO"]))
-		}
-		if req.Envs["BAZ"] != "qux" {
-			assert.Fail(t, fmt.Sprintf("Envs[BAZ] = %q, want qux", req.Envs["BAZ"]))
-		}
+			require.Equal(t, input.Envs, req.Envs)
 
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(ssePayload))
-	})
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(ssePayload))
+		})
 
-	err := client.RunCommand(context.Background(), RunCommandRequest{
-		Command: "echo $FOO",
-		Envs:    map[string]string{"FOO": "bar", "BAZ": "qux"},
-	}, func(event StreamEvent) error { return nil })
-	require.NoErrorf(t, err, "RunCommand with Envs")
+		err := client.RunCommand(context.Background(), input, func(event StreamEvent) error { return nil })
+		require.NoErrorf(t, err, "RunCommand with Envs")
+	}
 }
 
 func TestRunCommand_Background(t *testing.T) {
@@ -2445,28 +2899,6 @@ func TestRunCommand_Background(t *testing.T) {
 	})
 	require.NoErrorf(t, err, "RunCommand background")
 	require.Len(t, events, 2)
-}
-
-func TestAPIError_RequestID(t *testing.T) {
-	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Request-Id", "req-abc-123")
-		jsonResponse(w, http.StatusNotFound, ErrorResponse{
-			Code:    "SANDBOX_NOT_FOUND",
-			Message: "not found",
-		})
-	})
-
-	_, err := client.GetSandbox(context.Background(), "sbx-missing")
-	require.Error(t, err)
-
-	apiErr, ok := err.(*APIError)
-	require.True(t, ok, "expected *APIError, got %T", err)
-	if apiErr.RequestID != "req-abc-123" {
-		assert.Fail(t, fmt.Sprintf("RequestID = %q, want req-abc-123", apiErr.RequestID))
-	}
-	if !strings.Contains(apiErr.Error(), "req-abc-123") {
-		assert.Fail(t, fmt.Sprintf("Error() = %q, expected to contain request ID", apiErr.Error()))
-	}
 }
 
 func TestCreateSandbox_WithNetworkPolicy(t *testing.T) {
@@ -2567,4 +2999,178 @@ func TestCreateSandbox_WithVolumes(t *testing.T) {
 		},
 	})
 	require.NoErrorf(t, err, "CreateSandbox with Volumes")
+}
+
+func TestRunCommandBackgroundStopsAtComplete(t *testing.T) {
+	for _, callbackFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(callbackFails), func(t *testing.T) {
+			closed := make(chan struct{})
+			release := make(chan struct{})
+			defer close(release)
+			_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				fmt.Fprint(w, "data: {\"type\":\"execution_complete\"}\n\n")
+				w.(http.Flusher).Flush()
+				select { // No EOF: the client must close the response.
+				case <-r.Context().Done():
+					close(closed)
+				case <-release:
+				}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			callbackErr := fmt.Errorf("callback failed")
+			calls := 0
+			err := client.RunCommand(ctx, RunCommandRequest{Command: "sleep 30", Background: true}, func(StreamEvent) error {
+				calls++
+				if callbackFails {
+					return callbackErr
+				}
+				return nil
+			})
+			if callbackFails {
+				require.ErrorIs(t, err, callbackErr)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, 1, calls)
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("response was not closed")
+			}
+		})
+	}
+}
+
+func TestRunCommandForegroundDrainsTerminalStream(t *testing.T) {
+	for _, failure := range []bool{false, true} {
+		for _, late := range []bool{false, true} {
+			t.Run(fmt.Sprintf("failure=%v/late=%v", failure, late), func(t *testing.T) {
+				terminal := `{"type":"execution_complete"}`
+				if failure {
+					terminal = `{"type":"error","error":{"ename":"CommandExecError","evalue":"7"}}`
+				}
+				output := []string{`{"type":"stdout","text":"tail"}`, `{"type":"stderr","text":"error-tail"}`}
+				frames := append(append([]string{}, output...), terminal)
+				if late {
+					frames = append([]string{terminal}, output...)
+				}
+				_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+					for _, frame := range frames {
+						fmt.Fprint(w, "data: "+frame[:7])
+						w.(http.Flusher).Flush()
+						fmt.Fprint(w, frame[7:]+"\n\n")
+						w.(http.Flusher).Flush()
+					}
+				})
+				var got []string
+				err := client.RunCommand(context.Background(), RunCommandRequest{Command: "echo test"}, func(event StreamEvent) error {
+					got = append(got, event.Data)
+					return nil
+				})
+				require.NoError(t, err)
+				require.Equal(t, frames, got)
+			})
+		}
+	}
+}
+
+func TestSandboxBackgroundResultAcknowledgesStartup(t *testing.T) {
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "{\"type\":\"init\",\"text\":\"background-id\"}\n\n{\"type\":\"execution_complete\"}\n\n")
+	})
+	sandbox := &Sandbox{execd: client}
+	result, err := sandbox.RunCommandWithOpts(context.Background(), RunCommandRequest{Command: "sleep 30", Background: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, "background-id", result.ID)
+	require.NotNil(t, result.Complete)
+	require.True(t, result.ExitCode == nil, "startup does not establish a process exit code")
+}
+
+func TestCreateSession_SendsCwd(t *testing.T) {
+	var gotCwd string
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/session" {
+			assert.Fail(t, fmt.Sprintf("expected /session, got %s", r.URL.Path))
+		}
+		var req CreateSessionRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotCwd = req.Cwd
+		jsonResponse(w, http.StatusCreated, Session{ID: "sess-cwd"})
+	})
+
+	got, err := client.CreateSession(context.Background(), CreateSessionRequest{Cwd: "/workspace"})
+	require.NoErrorf(t, err, "CreateSession")
+	if got.ID != "sess-cwd" {
+		assert.Fail(t, fmt.Sprintf("ID = %q, want sess-cwd", got.ID))
+	}
+	if gotCwd != "/workspace" {
+		assert.Fail(t, fmt.Sprintf("cwd = %q, want /workspace (regression: request body was dropped)", gotCwd))
+	}
+}
+
+func TestUploadFiles_PreservesMultipartContentType(t *testing.T) {
+	for _, headerName := range []string{"Content-Type", "content-type"} {
+		t.Run(headerName, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseMultipartForm(1 << 20); err != nil {
+					t.Errorf("multipart request must retain its generated boundary: %v", err)
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				defer r.MultipartForm.RemoveAll()
+				if r.Header.Get("X-Test-Header") != "preserved" {
+					t.Errorf("custom header was lost")
+				}
+				files := r.MultipartForm.File["file"]
+				if len(files) != 2 || len(r.MultipartForm.File["metadata"]) != 2 {
+					t.Errorf("expected two file and metadata parts, got %+v", r.MultipartForm.File)
+				}
+				for i, part := range files {
+					file, err := part.Open()
+					if err != nil {
+						t.Error(err)
+						continue
+					}
+					data, err := io.ReadAll(file)
+					file.Close()
+					if err != nil || string(data) != fmt.Sprintf("file-%d", i) {
+						t.Errorf("part %d: data=%q err=%v", i, data, err)
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			client := NewExecdClient(srv.URL, "token", WithHeaders(map[string]string{
+				headerName: "application/json", "X-Test-Header": "preserved",
+			}))
+			entries := []UploadFileEntry{}
+			for i := 0; i < 2; i++ {
+				entries = append(entries, UploadFileEntry{File: strings.NewReader(fmt.Sprintf("file-%d", i)),
+					Options: UploadFileOptions{Metadata: FileMetadata{Path: fmt.Sprintf("/tmp/file-%d", i)}}})
+			}
+			if err := client.UploadFiles(context.Background(), entries); err != nil {
+				t.Fatalf("UploadFiles with a default JSON Content-Type: %v", err)
+			}
+		})
+	}
+}
+
+func TestDownloadFileResponse_LineReads(t *testing.T) {
+	for _, opts := range []DownloadFileOptions{{Offset: 2}, {Limit: 2}} {
+		t.Run(fmt.Sprintf("%+v", opts), func(t *testing.T) {
+			_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "5")
+				_, _ = w.Write([]byte("hello"))
+			})
+			resp, err := client.DownloadFileResponse(context.Background(), "/data.txt", "", opts)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Equal(t, false, resp.IsPartial())
+			require.Equal(t, int64(5), resp.ContentLength)
+			require.Equal(t, int64(-1), resp.TotalSize)
+		})
+	}
 }

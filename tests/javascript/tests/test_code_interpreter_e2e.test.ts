@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,15 +31,11 @@ import {
 let sandbox: Sandbox | null = null;
 let ci: CodeInterpreter | null = null;
 
-// ---------------------------------------------------------------------------
-// Helpers: sandbox lifecycle & retry
-// ---------------------------------------------------------------------------
-
 function sandboxCreateOptions() {
   return {
     connectionConfig: createConnectionConfig(),
     image: getSandboxImage(),
-    entrypoint: ["/opt/opensandbox/code-interpreter.sh"],
+    entrypoint: ["/opt/code-interpreter/code-interpreter.sh"],
     timeoutSeconds: 15 * 60,
     readyTimeoutSeconds: 60,
     metadata: { tag: "e2e-code-interpreter" },
@@ -135,9 +131,6 @@ async function withRetry<T>(
   throw new Error("unreachable");
 }
 
-// ---------------------------------------------------------------------------
-// Setup / teardown
-// ---------------------------------------------------------------------------
 
 beforeAll(async () => {
   await recreateSandbox();

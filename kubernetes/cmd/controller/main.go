@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -23,25 +24,30 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // Embed timezone data for snapshot image naming.
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/yaml"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/controller"
 	poolassign "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/controller/poolassign"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/telemetry"
 	cryptoutil "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/crypto"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/expectations"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
@@ -57,6 +63,8 @@ var (
 const (
 	defaultBatchSandboxConcurrency = 32
 	defaultPoolConcurrency         = 16
+	// telemetryShutdownTimeout bounds the final OTLP flush on shutdown.
+	telemetryShutdownTimeout = 5 * time.Second
 )
 
 type ConcurrencyConfig map[string]int
@@ -142,6 +150,7 @@ func main() {
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
 	var enableLeaderElection bool
+	var leaseDuration, renewDeadline, retryPeriod time.Duration
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
@@ -160,6 +169,9 @@ func main() {
 	var kubeClientQPS float64
 	var kubeClientBurst int
 
+	// Informer cache namespace scoping
+	var cacheNamespaces string
+
 	// Controller concurrency options
 	var concurrencyConfig ConcurrencyConfig
 
@@ -169,6 +181,14 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.DurationVar(&leaseDuration, "leader-elect-lease-duration", 15*time.Second,
+		"How long non-leader candidates wait after the last renewal before taking over the lease.")
+	flag.DurationVar(&renewDeadline, "leader-elect-renew-deadline", 10*time.Second,
+		"How long the leader keeps retrying to renew the lease before giving up leadership. "+
+			"Must be less than --leader-elect-lease-duration.")
+	flag.DurationVar(&retryPeriod, "leader-elect-retry-period", 2*time.Second,
+		"How long candidates wait between attempts to acquire or renew the lease. "+
+			"--leader-elect-renew-deadline must be more than 1.2 times this value.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -196,13 +216,18 @@ func main() {
 	flag.BoolVar(&logCompress, "log-compress", true, "Compress determines if the rotated log files should be compressed using gzip")
 	flag.Float64Var(&kubeClientQPS, "kube-client-qps", 100, "QPS for Kubernetes client rate limiter.")
 	flag.IntVar(&kubeClientBurst, "kube-client-burst", 200, "Burst for Kubernetes client rate limiter.")
+	flag.StringVar(&cacheNamespaces, "namespaces", "", "Comma-separated namespaces used to scope the informer cache. "+
+		"Empty watches the whole cluster.")
 	flag.Var(&concurrencyConfig, "concurrency", "Controller concurrency settings in format: controller1=N;controller2=M. "+
 		"Available controllers: batchsandbox, pool. "+
 		"Example: --concurrency='batchsandbox=32;pool=128'")
 
 	// Image committer
 	var imageCommitterImage string
-	flag.StringVar(&imageCommitterImage, "image-committer-image", "image-committer:dev", "The image used for commit operations (contains nerdctl tool).")
+	flag.StringVar(&imageCommitterImage, "image-committer-image", "image-committer:dev", "The image used for commit operations.")
+
+	var imageCommitterPodTemplateFile string
+	flag.StringVar(&imageCommitterPodTemplateFile, "image-committer-pod-template-file", "", "Path to a PodTemplateSpec overlay for image-committer commit Job Pods.")
 
 	var containerdSocketPath string
 	flag.StringVar(&containerdSocketPath, "containerd-socket-path", controller.ContainerdSocketPath, "Containerd socket path")
@@ -214,11 +239,17 @@ func main() {
 	var snapshotRegistry string
 	flag.StringVar(&snapshotRegistry, "snapshot-registry", "", "OCI registry for snapshot images (e.g., registry.example.com/snapshots).")
 
+	var snapshotImageURITemplateValue string
+	flag.StringVar(&snapshotImageURITemplateValue, "snapshot-image-uri-template", "", "Go named-field template for snapshot image URIs; empty uses "+controller.DefaultSnapshotImageURITemplate+".")
+
 	var snapshotRegistryInsecure bool
 	flag.BoolVar(&snapshotRegistryInsecure, "snapshot-registry-insecure", false, "Use insecure registry mode when pushing snapshot images.")
 
 	var snapshotPushSecret string
 	flag.StringVar(&snapshotPushSecret, "snapshot-push-secret", "", "K8s Secret name for pushing snapshots to registry.")
+
+	var imageCommitterPullSecret string
+	flag.StringVar(&imageCommitterPullSecret, "image-committer-pull-secret", "", "K8s Secret name for pulling the image-committer image in commit Jobs. Required when imageCommitterImage is in a private registry.")
 
 	var resumePullSecret string
 	flag.StringVar(&resumePullSecret, "resume-pull-secret", "", "K8s Secret name for pulling snapshot images during resume.")
@@ -244,6 +275,20 @@ func main() {
 	ctrl.SetLogger(logger)
 
 	setupLog.Info("Starting controller", "commitID", commitID, "buildDate", buildDate)
+
+	snapshotImageURITemplate, err := controller.ParseSnapshotImageURITemplate(snapshotImageURITemplateValue)
+	if err != nil {
+		setupLog.Error(err, "invalid snapshot image URI template")
+		os.Exit(1)
+	}
+
+	otelShutdown := setupTelemetry()
+
+	imageCommitterPodTemplate, err := loadImageCommitterPodTemplate(imageCommitterPodTemplateFile)
+	if err != nil {
+		setupLog.Error(err, "invalid image committer Pod template")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -392,6 +437,12 @@ func main() {
 		config.Burst = kubeClientBurst
 	}
 
+	cacheOpts := cache.Options{}
+	if defaultNamespaces := parseCacheNamespaces(cacheNamespaces); len(defaultNamespaces) > 0 {
+		cacheOpts.DefaultNamespaces = defaultNamespaces
+		setupLog.Info("scoping informer cache to namespaces", "namespaces", cacheNamespaces)
+	}
+
 	mgr, err := ctrl.NewManager(config, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
@@ -399,6 +450,10 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "2fa1c467.opensandbox.io",
+		LeaseDuration:          &leaseDuration,
+		RenewDeadline:          &renewDeadline,
+		RetryPeriod:            &retryPeriod,
+		Cache:                  cacheOpts,
 		// LeaderElectionReleaseOnCancel causes the leader to voluntarily release the lease
 		// when the Manager is stopped, allowing a new leader to acquire it without waiting
 		// for the full LeaseDuration. This is safe because main() exits immediately after
@@ -430,6 +485,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	featureConfig := controller.NewFeatureConfig()
+	if err := featureConfig.SetupWithManager(mgr, os.Getenv("POD_NAMESPACE")); err != nil {
+		setupLog.Error(err, "failed to setup feature config ConfigMap watch")
+		os.Exit(1)
+	}
+
+	poolAllocator := controller.NewDefaultAllocator(mgr.GetClient(), mgr.GetAPIReader())
+	if err := controller.SetupCapacityMetricsWithManager(mgr, poolAllocator); err != nil {
+		setupLog.Error(err, "unable to register capacity metrics")
+		os.Exit(1)
+	}
+
 	if err := (&controller.BatchSandboxReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
@@ -437,30 +504,36 @@ func main() {
 		ResumePullSecret:    resumePullSecret,
 		ProfileStore:        profileStore,
 		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
+		FeatureConfig:       featureConfig,
 	}).SetupWithManager(mgr, batchSandboxConcurrency); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BatchSandbox")
 		os.Exit(1)
 	}
 	if err := (&controller.PoolReconciler{
 		Client:     mgr.GetClient(),
+		APIReader:  mgr.GetAPIReader(),
 		Scheme:     mgr.GetScheme(),
 		Recorder:   mgr.GetEventRecorderFor("pool-controller"),
-		Allocator:  controller.NewDefaultAllocator(mgr.GetClient()),
+		Allocator:  poolAllocator,
 		RestConfig: mgr.GetConfig(),
 	}).SetupWithManager(mgr, poolConcurrency); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Pool")
 		os.Exit(1)
 	}
 	if err := (&controller.SandboxSnapshotReconciler{
-		Client:                   mgr.GetClient(),
-		Scheme:                   mgr.GetScheme(),
-		Recorder:                 mgr.GetEventRecorderFor("sandboxsnapshot-controller"),
-		ImageCommitterImage:      imageCommitterImage,
-		ContainerdSocketPath:     containerdSocketPath,
-		CommitJobTimeout:         commitJobTimeout,
-		SnapshotRegistry:         snapshotRegistry,
-		SnapshotRegistryInsecure: snapshotRegistryInsecure,
-		SnapshotPushSecret:       snapshotPushSecret,
+		Client:                    mgr.GetClient(),
+		APIReader:                 mgr.GetAPIReader(),
+		Scheme:                    mgr.GetScheme(),
+		Recorder:                  mgr.GetEventRecorderFor("sandboxsnapshot-controller"),
+		ImageCommitterImage:       imageCommitterImage,
+		ContainerdSocketPath:      containerdSocketPath,
+		CommitJobTimeout:          commitJobTimeout,
+		SnapshotRegistry:          snapshotRegistry,
+		SnapshotImageURITemplate:  snapshotImageURITemplate,
+		SnapshotRegistryInsecure:  snapshotRegistryInsecure,
+		SnapshotPushSecret:        snapshotPushSecret,
+		ImageCommitterPullSecret:  imageCommitterPullSecret,
+		ImageCommitterPodTemplate: imageCommitterPodTemplate,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SandboxSnapshot")
 		os.Exit(1)
@@ -493,8 +566,67 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
+	startErr := mgr.Start(ctrl.SetupSignalHandler())
+	// Final telemetry flush before exit.
+	flushCtx, cancel := context.WithTimeout(context.Background(), telemetryShutdownTimeout)
+	defer cancel()
+	if err := otelShutdown(flushCtx); err != nil {
+		setupLog.Error(err, "failed to flush OpenTelemetry data on shutdown")
+	}
+	if startErr != nil {
+		setupLog.Error(startErr, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// setupTelemetry initializes OTLP export from standard OTEL_* env vars;
+// failures degrade to the no-op provider.
+func setupTelemetry() func(context.Context) error {
+	enabled, shutdown, err := telemetry.Setup(context.Background())
+	if err != nil {
+		setupLog.Error(err, "failed to initialize OpenTelemetry export, continuing without it")
+		return func(context.Context) error { return nil }
+	}
+	if enabled {
+		endpoint := os.Getenv(telemetry.MetricsEndpointEnv)
+		if endpoint == "" {
+			endpoint = os.Getenv(telemetry.EndpointEnv)
+		}
+		setupLog.Info("OpenTelemetry export enabled", "endpoint", telemetry.SanitizeEndpoint(endpoint))
+	}
+	return shutdown
+}
+
+// parseCacheNamespaces converts a comma-separated namespace list into a
+// controller-runtime DefaultNamespaces map. An empty or separator-only input
+// returns nil so the cache stays cluster-wide.
+func parseCacheNamespaces(value string) map[string]cache.Config {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	namespaces := make(map[string]cache.Config)
+	for _, name := range strings.Split(value, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			namespaces[name] = cache.Config{}
+		}
+	}
+	if len(namespaces) == 0 {
+		return nil
+	}
+	return namespaces
+}
+
+func loadImageCommitterPodTemplate(path string) (*corev1.PodTemplateSpec, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read Pod template: %w", err)
+	}
+	var template corev1.PodTemplateSpec
+	if err := yaml.UnmarshalStrict(data, &template); err != nil {
+		return nil, fmt.Errorf("parse Pod template: %w", err)
+	}
+	return &template, nil
 }

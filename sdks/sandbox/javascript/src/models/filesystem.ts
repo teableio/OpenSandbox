@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,11 @@
  * - They are intentionally stable and JS-friendly.
  */
 
+export type FileEntryType = "file" | "directory" | "symlink" | "other";
+
 export interface FileInfo extends Record<string, unknown> {
   path: string;
+  type?: FileEntryType;
   size?: number;
   /**
    * Last modification time.
@@ -63,6 +66,36 @@ export type FilesInfoResponse = Record<string, FileInfo>;
 
 export type SearchFilesResponse = FileInfo[];
 
+export interface ByteRange {
+  /** Inclusive first byte offset, or -1 if parsing failed. */
+  start: number;
+  /** Inclusive last byte offset, or -1 if parsing failed. */
+  end: number;
+  /** Complete representation size from Content-Range, or -1 if unknown or invalid. */
+  total: number;
+  /** Original Content-Range header value. */
+  raw: string;
+}
+
+export interface ReadBytesResponse<TBody> {
+  body: TBody;
+  statusCode: number;
+  contentType?: string;
+  contentDisposition?: string;
+  /** Content-Length header in bytes, or -1 if unavailable. */
+  contentLength: number;
+  /** Complete file size, or -1 if unknown. */
+  totalSize: number;
+  contentRange?: ByteRange;
+  /** Whether the server returned 206 Partial Content. */
+  isPartial: boolean;
+}
+
+/** A single-use download body that can be closed without consuming it. */
+export interface ReadBytesStream extends AsyncIterable<Uint8Array> {
+  close(): Promise<void>;
+}
+
 // High-level filesystem facade models used by `sandbox.files`.
 export interface WriteEntry {
   path: string;
@@ -84,6 +117,11 @@ export interface SearchEntry {
   pattern?: string;
 }
 
+export interface DirectoryListEntry {
+  path: string;
+  depth?: number;
+}
+
 export interface MoveEntry {
   src: string;
   dest: string;
@@ -93,6 +131,11 @@ export interface ContentReplaceEntry {
   path: string;
   oldContent: string;
   newContent: string;
+}
+
+export interface ContentReplaceResult {
+  path: string;
+  replacedCount: number;
 }
 
 export interface SetPermissionEntry {

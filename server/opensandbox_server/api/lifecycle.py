@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,19 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-API routes for OpenSandbox Lifecycle API.
-
-This module defines FastAPI routes that map to the OpenAPI specification endpoints.
-All business logic is delegated to the service layer that backs each operation.
-"""
-
 from typing import List, Optional
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 from fastapi.responses import Response
 
-from opensandbox_server.extensions import validate_extensions
+from opensandbox_server.extensions import validate_extensions, validate_renew_policy_conflict
 from opensandbox_server.config import get_config
 from opensandbox_server.api.schema import (
     CreateSnapshotRequest,
@@ -45,21 +38,25 @@ from opensandbox_server.api.schema import (
     Snapshot,
     SnapshotFilter,
 )
-from opensandbox_server.services.constants import SandboxErrorCodes
+from opensandbox_server.services.constants import (
+    OPEN_SANDBOX_INGRESS_HEADER,
+    OPEN_SANDBOX_ORIGIN_HEADER,
+    SANDBOX_ORIGIN_TEMPLATE,
+    SandboxErrorCodes,
+)
 from opensandbox_server.services.factory import create_sandbox_service
+from opensandbox_server.services.snapshot_restore import resolve_sandbox_image_from_request
 from opensandbox_server.services.snapshot_service import create_snapshot_service
+from opensandbox_server.services.validators import normalize_network_policy_actions
 
-# Initialize router
 router = APIRouter(tags=["Sandboxes"])
 
-# Initialize service based on configuration from config.toml (defaults to docker)
 sandbox_service = create_sandbox_service()
 snapshot_service = create_snapshot_service(sandbox_service)
+# React to snapshot status changes so rows converge without waiting on reads
+snapshot_service.start_background_sync()
 
 
-# ============================================================================
-# Sandbox CRUD Operations
-# ============================================================================
 
 @router.post(
     "/sandboxes",
@@ -67,10 +64,21 @@ snapshot_service = create_snapshot_service(sandbox_service)
     response_model_exclude_none=True,
     status_code=status.HTTP_202_ACCEPTED,
     responses={
-        202: {"description": "Sandbox creation accepted for asynchronous provisioning"},
+        202: {"description": "Sandbox created and provisioned successfully"},
         400: {"model": ErrorResponse, "description": "The request was invalid or malformed"},
         401: {"model": ErrorResponse, "description": "Authentication credentials are missing or invalid"},
+        403: {"model": ErrorResponse, "description": "Namespace ResourceQuota exhausted — the sandbox was not admitted (KUBERNETES::QUOTA_EXCEEDED)"},
         409: {"model": ErrorResponse, "description": "The operation conflicts with the current state"},
+        429: {
+            "model": ErrorResponse,
+            "description": "Pool capacity remained unavailable before the acquisition timeout",
+            "headers": {
+                "Retry-After": {
+                    "description": "Suggested delay in seconds before retrying",
+                    "schema": {"type": "integer", "minimum": 1},
+                }
+            },
+        },
         500: {"model": ErrorResponse, "description": "An unexpected server error occurred"},
     },
 )
@@ -78,28 +86,17 @@ async def create_sandbox(
     request: CreateSandboxRequest,
     x_request_id: Optional[str] = Header(None, alias="X-Request-ID", description="Unique request identifier for tracing"),
 ) -> CreateSandboxResponse:
-    """
-    Create a sandbox from a container image.
-
-    Creates a new sandbox from a container image with optional resource limits,
-    environment variables, and metadata. Sandboxes are provisioned directly from
-    the specified image without requiring a pre-created template.
-
-    Args:
-        request: Sandbox creation request
-        x_request_id: Unique request identifier for tracing (optional; server generates if omitted).
-
-    Returns:
-        CreateSandboxResponse: Accepted sandbox creation request
-
-    Raises:
-        HTTPException: If sandbox creation scheduling fails
-    """
+    """Create a sandbox from an image, snapshot, template, or configured pool."""
     validate_extensions(request.extensions)
+    validate_renew_policy_conflict(request.lifecycle, request.extensions)
+    normalize_network_policy_actions(request.network_policy)
+    # Resolve snapshotId before backend routing: the owning backend recorded
+    # on the snapshot row selects the fsb vs pod backend for restores.
+    if not (request.template_id or "").strip():
+        request = await resolve_sandbox_image_from_request(request)
     return await sandbox_service.create_sandbox(request)
 
 
-# Search endpoint
 @router.get(
     "/sandboxes",
     response_model=ListSandboxesResponse,
@@ -123,23 +120,11 @@ def list_sandboxes(
 
     List all sandboxes with optional filtering and pagination using query parameters.
     All filter conditions use AND logic. Multiple `state` parameters use OR logic within states.
-
-    Args:
-        state: Filter by lifecycle state.
-        metadata: Arbitrary metadata key-value pairs for filtering.
-        page: Page number for pagination.
-        page_size: Number of items per page.
-        x_request_id: Unique request identifier for tracing (optional; server generates if omitted).
-
-    Returns:
-        ListSandboxesResponse: Paginated list of sandboxes
     """
-    # Parse metadata query string into dictionary
     metadata_dict = {}
     if metadata:
         from urllib.parse import parse_qsl
         try:
-            # Parse query string format: key=value&key2=value2
             # strict_parsing=True rejects malformed segments like "a=1&broken"
             parsed = parse_qsl(metadata, keep_blank_values=True, strict_parsing=True)
             metadata_dict = dict(parsed)
@@ -150,7 +135,6 @@ def list_sandboxes(
                 detail={"code": "INVALID_METADATA_FORMAT", "message": f"Invalid metadata format: {str(e)}"}
             )
 
-    # Construct request object
     request = ListSandboxesRequest(
         filter=SandboxFilter(state=state, metadata=metadata_dict if metadata_dict else None),
         pagination=PaginationRequest(page=page, pageSize=page_size)
@@ -158,9 +142,8 @@ def list_sandboxes(
 
     import logging
     logger = logging.getLogger(__name__)
-    logger.info("ListSandboxes: %s", request.filter)
+    logger.info(f"ListSandboxes: {request.filter}")
 
-    # Delegate to the service layer for filtering and pagination
     return sandbox_service.list_sandboxes(request)
 
 
@@ -185,18 +168,7 @@ def get_sandbox(
 
     Returns the complete sandbox information including image specification,
     status, metadata, and timestamps.
-
-    Args:
-        sandbox_id: Unique sandbox identifier
-        x_request_id: Unique request identifier for tracing (optional; server generates if omitted).
-
-    Returns:
-        Sandbox: Complete sandbox information
-
-    Raises:
-        HTTPException: If sandbox not found or access denied
     """
-    # Delegate to the service layer for sandbox lookup
     return sandbox_service.get_sandbox(sandbox_id)
 
 
@@ -222,7 +194,10 @@ def patch_sandbox_metadata(
     """
     Patch sandbox metadata via JSON Merge Patch (RFC 7396).
     Non-null adds/replaces, null deletes, absent keeps.
-    Read-modify-write without optimistic locking — concurrent PATCH may drop updates.
+    Docker: concurrent PATCH requests apply one after another, last write wins per key.
+    Kubernetes: a PATCH writes back the whole label set it read, with no resourceVersion check,
+    so a concurrent PATCH may revert a value another PATCH changed or resurrect a key it deleted;
+    a PATCH on an fsb sandbox sends only its own keys, fenced by the sandbox UID and generation.
     """
     return sandbox_service.patch_sandbox_metadata(sandbox_id, patch)
 
@@ -231,7 +206,7 @@ def patch_sandbox_metadata(
     "/sandboxes/{sandbox_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     responses={
-        204: {"description": "Sandbox successfully deleted"},
+        204: {"description": "Sandbox deletion accepted. Runtime cleanup may still be in progress."},
         401: {"model": ErrorResponse, "description": "Authentication credentials are missing or invalid"},
         403: {"model": ErrorResponse, "description": "The authenticated user lacks permission for this operation"},
         404: {"model": ErrorResponse, "description": "The requested resource does not exist"},
@@ -246,26 +221,21 @@ def delete_sandbox(
     """
     Delete a sandbox.
 
-    Terminates sandbox execution. The sandbox will transition through Stopping state to Terminated.
+    Request sandbox deletion. Runtime cleanup may continue after the response.
+    For Kubernetes BatchSandbox workloads, queries report Stopping during cleanup
+    and return 404 once the resource is removed.
 
-    Args:
-        sandbox_id: Unique sandbox identifier
-        x_request_id: Unique request identifier for tracing (optional; server generates if omitted).
-
-    Returns:
-        Response: 204 No Content
-
-    Raises:
-        HTTPException: If sandbox not found or deletion fails
+    A 204 response means deletion was accepted, not that the sandbox's runtime
+    execution has terminated: the control object can disappear (and queries
+    can start returning 404) while runtime cleanup is still in progress, so a
+    404 after deletion must not be read as confirmed termination. There is
+    currently no API operation that confirms execution termination; see
+    issue #2396.
     """
-    # Delegate to the service layer for deletion
     sandbox_service.delete_sandbox(sandbox_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# ============================================================================
-# Sandbox Lifecycle Operations
-# ============================================================================
 
 @router.post(
     "/sandboxes/{sandbox_id}/pause",
@@ -288,18 +258,7 @@ def pause_sandbox(
 
     Pauses a running sandbox while preserving its state.
     Poll GET /sandboxes/{sandboxId} to track state transition through Pausing and eventually Paused.
-
-    Args:
-        sandbox_id: Unique sandbox identifier
-        x_request_id: Unique request identifier for tracing (optional; server generates if omitted).
-
-    Returns:
-        Response: 202 Accepted
-
-    Raises:
-        HTTPException: If sandbox not found or cannot be paused
     """
-    # Delegate to the service layer for pause orchestration
     sandbox_service.pause_sandbox(sandbox_id)
     return Response(status_code=status.HTTP_202_ACCEPTED)
 
@@ -325,18 +284,7 @@ def resume_sandbox(
 
     Resumes execution of a paused sandbox.
     Poll GET /sandboxes/{sandboxId} to track state transition through Resuming and eventually Running.
-
-    Args:
-        sandbox_id: Unique sandbox identifier
-        x_request_id: Unique request identifier for tracing (optional; server generates if omitted).
-
-    Returns:
-        Response: 202 Accepted
-
-    Raises:
-        HTTPException: If sandbox not found or cannot be resumed
     """
-    # Delegate to the service layer for resume orchestration
     sandbox_service.resume_sandbox(sandbox_id)
     return Response(status_code=status.HTTP_202_ACCEPTED)
 
@@ -363,27 +311,13 @@ def renew_sandbox_expiration(
     """
     Renew sandbox expiration.
 
-    Renews the absolute expiration time of a sandbox.
-    The new expiration time must be in the future and after the current expiresAt time.
-
-    Args:
-        sandbox_id: Unique sandbox identifier
-        request: Renewal request with new expiration time
-        x_request_id: Unique request identifier for tracing (optional; server generates if omitted).
-
-    Returns:
-        RenewSandboxExpirationResponse: Updated expiration time
-
-    Raises:
-        HTTPException: If sandbox not found or renewal fails
+    Sets the absolute expiration time of a sandbox to the supplied future timestamp.
+    This may shorten, preserve, or extend the current expiration.
+    The creation-time limit server.max_sandbox_timeout_seconds does not apply.
     """
-    # Delegate to the service layer for expiration updates
     return sandbox_service.renew_expiration(sandbox_id, request)
 
 
-# ============================================================================
-# Snapshot Operations
-# ============================================================================
 
 @router.post(
     "/sandboxes/{sandbox_id}/snapshots",
@@ -431,6 +365,7 @@ def create_snapshot(
 )
 def list_snapshots(
     sandbox_id: Optional[str] = Query(None, alias="sandboxId", description="Filter snapshots by source sandbox identifier"),
+    name: Optional[str] = Query(None, description="Filter snapshots by exact snapshot name"),
     state: Optional[List[str]] = Query(None, description="Filter by snapshot lifecycle state. Pass multiple times for OR logic."),
     page: int = Query(1, ge=1, description="Page number for pagination"),
     page_size: int = Query(20, ge=1, le=200, alias="pageSize", description="Number of items per page"),
@@ -440,7 +375,7 @@ def list_snapshots(
     List snapshots with optional filtering and pagination.
     """
     request = ListSnapshotsRequest(
-        filter=SnapshotFilter(sandboxId=sandbox_id, state=state),
+        filter=SnapshotFilter(sandboxId=sandbox_id, name=name, state=state),
         pagination=PaginationRequest(page=page, pageSize=page_size),
     )
     return snapshot_service.list_snapshots(request)
@@ -495,9 +430,6 @@ def delete_snapshot(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# ============================================================================
-# Sandbox Endpoints
-# ============================================================================
 
 @router.get(
     "/sandboxes/{sandbox_id}/endpoints/{port}",
@@ -516,37 +448,29 @@ def get_sandbox_endpoint(
     request: Request,
     sandbox_id: str,
     port: int,
-    use_server_proxy: bool = Query(False, description="Whether to return a server-proxied URL"),
+    use_server_proxy: bool = Query(
+        False,
+        deprecated=True,
+        description=(
+            "Deprecated: the server-proxied data path is in maintenance mode "
+            "(security and bug fixes only); deploy the ingress gateway for "
+            "data-plane traffic. When true, returns a server-proxied URL."
+        ),
+    ),
     expires: Optional[int] = Query(None, description="Request a signed route token with this Unix epoch second expiration. Requires ingress gateway with secure_access configured."),
     x_request_id: Optional[str] = Header(None, alias="X-Request-ID", description="Unique request identifier for tracing"),
+    response: Response = None,  # type: ignore[assignment]
 ) -> Endpoint:
     """
-    Get sandbox access endpoint.
+    Get the public access endpoint URL for accessing a service running on a specific port
+    within the sandbox. The service must be listening on the specified port inside
+    the sandbox for the endpoint to be available.
 
-    Returns the public access endpoint URL for accessing a service running on a specific port
-    within the sandbox. The service must be listening on the specified port inside the sandbox
-    for the endpoint to be available.
-
-    When the ``expires`` query parameter is provided, the endpoint is wrapped in a
-    cryptographically signed route token (OSEP-0011) instead of returning a plain URL.
-    This requires the ingress gateway to be configured with secure_access signing keys.
-
-    Args:
-        request: FastAPI request object
-        sandbox_id: Unique sandbox identifier
-        port: Port number where the service is listening inside the sandbox (1-65535)
-        use_server_proxy: Whether to return a server-proxied URL
-        expires: Unix epoch seconds for signed route token expiration. Must be a
-            non-negative uint64 value. When omitted or invalid, a plain (unsigned)
-            endpoint is returned.
-        x_request_id: Unique request identifier for tracing (optional; server generates if omitted).
-
-    Returns:
-        Endpoint: Public endpoint URL
-
-    Raises:
-        HTTPException: If sandbox not found, endpoint not available, or signed
-            routes are not supported by the runtime/configuration (400).
+    When ``expires`` is provided, the endpoint uses a signed route token (OSEP-0011).
+    This requires an ingress gateway configured with secure_access signing keys.
+    Invalid or unsupported signed-route expirations are rejected rather than returning
+    an unsigned route. Omit ``expires`` for the unsigned/legacy response shape.
+    Endpoint resolution does not perform a service health check.
     """
     if use_server_proxy and expires is not None:
         raise HTTPException(
@@ -560,7 +484,6 @@ def get_sandbox_endpoint(
             },
         )
 
-    # Delegate to the service layer for endpoint resolution
     endpoint = sandbox_service.get_endpoint(sandbox_id, port, expires=expires)
 
     if use_server_proxy:
@@ -570,14 +493,20 @@ def get_sandbox_endpoint(
         if eip:
             base_url = eip
         else:
-            # Reflect how the client reached this API: same host AND same mount
-            # prefix (the API is served both bare and under /v1). Dropping the
-            # prefix pointed proxied traffic at whatever backend owns the root
-            # path on shared hosts (breaking HTTP with redirects and WebSocket
-            # handshakes outright).
+            # Preserve the mount prefix so shared hosts route proxy traffic to this API.
             mount_prefix = request.url.path.split("/sandboxes/", 1)[0]
             base_url = str(request.base_url).rstrip("/") + mount_prefix
         base_url = base_url.replace("https://", "").replace("http://", "")
         endpoint.endpoint = f"{base_url}/sandboxes/{sandbox_id}/proxy/{port}"
+        if endpoint.headers:
+            endpoint.headers = {
+                key: value
+                for key, value in endpoint.headers.items()
+                if key.lower() != OPEN_SANDBOX_INGRESS_HEADER.lower()
+            } or None
+
+    # Template origin makes clients route egress operations through the control plane.
+    if response is not None and sandbox_id.startswith("fsb-"):
+        response.headers[OPEN_SANDBOX_ORIGIN_HEADER] = SANDBOX_ORIGIN_TEMPLATE
 
     return endpoint

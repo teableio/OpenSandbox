@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ package runtime
 import (
 	"fmt"
 	"io"
-	"os"
 	"time"
 )
 
@@ -55,11 +54,10 @@ func (c *Controller) commandSnapshot(session string) *commandKernel {
 	return &cp
 }
 
-// GetCommandStatus returns the execution status for a command session.
 func (c *Controller) GetCommandStatus(session string) (*CommandStatus, error) {
 	kernel := c.commandSnapshot(session)
 	if kernel == nil {
-		return nil, fmt.Errorf("command not found: %s", session)
+		return nil, fmt.Errorf("%w: %s", ErrCommandNotFound, session)
 	}
 
 	status := &CommandStatus{
@@ -75,41 +73,67 @@ func (c *Controller) GetCommandStatus(session string) (*CommandStatus, error) {
 }
 
 // SeekBackgroundCommandOutput returns accumulated stdout/stderr and status for a session.
+//
+// The cursor is a byte offset into the combined output file. A cursor beyond
+// the current end of the file is clamped to the file size, so polling at (or
+// past) the tail returns empty output with the real end offset instead of
+// echoing back an offset that later writes would silently skip.
+//
+// At most maxBackgroundLogReadBytes are returned per call; the returned
+// cursor points past the bytes in this response, so clients page through
+// larger output by polling again with that cursor. When the cap splits a
+// UTF-8 sequence, the response ends at the sequence start and the cursor
+// stays there too, so each page decodes on its own.
 func (c *Controller) SeekBackgroundCommandOutput(session string, cursor int64) ([]byte, int64, error) {
 	kernel := c.commandSnapshot(session)
 	if kernel == nil {
-		return nil, -1, fmt.Errorf("command not found: %s", session)
+		return nil, -1, fmt.Errorf("%w: %s", ErrCommandNotFound, session)
 	}
 
 	if !kernel.isBackground {
 		return nil, -1, fmt.Errorf("command %s is not running in background", session)
 	}
 
-	file, err := os.Open(kernel.stdoutPath)
+	if cursor < 0 {
+		return nil, -1, fmt.Errorf("cursor cannot be negative")
+	}
+
+	file, err := openCommandOutputForRead(kernel.stdoutPath)
 	if err != nil {
 		return nil, -1, fmt.Errorf("error open combined output file for command %s: %w", session, err)
 	}
 	defer file.Close()
 
-	// Seek to the cursor position
+	info, err := file.Stat()
+	if err != nil {
+		return nil, -1, fmt.Errorf("error stat combined output file for command %s: %w", session, err)
+	}
+	if cursor > info.Size() {
+		cursor = info.Size()
+	}
+
+	readStart := cursor
+
 	_, err = file.Seek(cursor, 0)
 	if err != nil {
 		return nil, -1, fmt.Errorf("error seek file: %w", err)
 	}
 
-	// Read all content from cursor to end
-	data, err := io.ReadAll(file)
+	data, err := io.ReadAll(io.LimitReader(file, maxBackgroundLogReadBytes))
 	if err != nil {
 		return nil, -1, fmt.Errorf("error read file: %w", err)
 	}
 
-	// Get current file position (end of file)
-	currentPos, err := file.Seek(0, 1)
-	if err != nil {
-		return nil, -1, fmt.Errorf("error get current position: %w", err)
+	// The response is labeled charset=utf-8 and clients decode each page on
+	// its own, so a read that filled the cap must not end inside a UTF-8
+	// sequence; step back to the sequence start and leave those bytes for
+	// the next page. Reads below the cap stopped at EOF, not at a boundary
+	// of ours, so they are returned as-is.
+	if len(data) == maxBackgroundLogReadBytes {
+		data = data[:lastRuneBoundary(data)]
 	}
 
-	return data, currentPos, nil
+	return data, readStart + int64(len(data)), nil
 }
 
 // markCommandFinished updates bookkeeping when a command exits.

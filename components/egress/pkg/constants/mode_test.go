@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,4 +52,30 @@ func TestModeUsesNft(t *testing.T) {
 	require.False(t, ModeUsesNft(PolicyDnsOnly))
 	require.True(t, ModeUsesNft(PolicyDnsNft))
 	require.True(t, ModeUsesNft("  DNS+nft  "))
+}
+
+func TestIsForwardMode(t *testing.T) {
+	require.True(t, IsForwardMode("forward"))
+	require.True(t, IsForwardMode("  FORWARD "))
+	require.False(t, IsForwardMode(""))
+	require.False(t, IsForwardMode(PolicyDnsNft))
+	require.False(t, IsForwardMode("dns+forward"))
+
+	// The legacy parser never accepts forward, so it cannot be normalized
+	// into a dns-only fallback by callers that use ParseEgressMode.
+	_, err := ParseEgressMode("forward")
+	require.Error(t, err)
+}
+
+func TestContainsForwardToken(t *testing.T) {
+	require.True(t, ContainsForwardToken("forward"))
+	require.True(t, ContainsForwardToken("forward+nft"))
+	require.True(t, ContainsForwardToken("dns+forward"))
+	require.True(t, ContainsForwardToken("  DNS + FORWARD  "))
+	require.True(t, ContainsForwardToken("forward+"))
+	require.True(t, ContainsForwardToken("+forward"))
+	require.False(t, ContainsForwardToken(""))
+	require.False(t, ContainsForwardToken(PolicyDnsOnly))
+	require.False(t, ContainsForwardToken(PolicyDnsNft))
+	require.False(t, ContainsForwardToken("forwarded"))
 }

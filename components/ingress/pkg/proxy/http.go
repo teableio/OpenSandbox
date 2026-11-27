@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,45 +15,73 @@
 package proxy
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+
+	slogger "github.com/alibaba/opensandbox/internal/logger"
 )
 
-type HTTPProxy struct{}
+type HTTPProxy struct {
+	responseObservers []func(*http.Response)
+	errorObserver     func(error)
+	transport         http.RoundTripper
+}
 
-func NewHTTPProxy() *HTTPProxy {
-	return &HTTPProxy{}
+func NewHTTPProxy(observers ...func(*http.Response)) *HTTPProxy {
+	return &HTTPProxy{responseObservers: observers}
 }
 
 func (hp *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	targetURL := r.URL.String()
+	targetURL := *r.URL
 
-	proxy, err := hp.newReverseProxy(targetURL)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
+	proxy := hp.newReverseProxy(&targetURL)
 
 	proxy.ServeHTTP(w, r)
 }
 
-func (hp *HTTPProxy) newReverseProxy(targetHost string) (*httputil.ReverseProxy, error) {
-	url, err := url.Parse(targetHost)
-	if err != nil {
-		return nil, err
+func (hp *HTTPProxy) newReverseProxy(targetURL *url.URL) *httputil.ReverseProxy {
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	if hp.transport != nil {
+		proxy.Transport = hp.transport
 	}
-
-	proxy := httputil.NewSingleHostReverseProxy(url)
 	proxy.Director = func(req *http.Request) {
-		req.URL.Scheme = url.Scheme
-		req.URL.Host = url.Host
-		req.Host = url.Host
+		req.URL.Scheme = targetURL.Scheme
+		req.URL.Host = targetURL.Host
+		req.URL.Path = targetURL.Path
+		req.URL.RawPath = targetURL.RawPath
+		req.URL.RawQuery = targetURL.RawQuery
+		req.Host = targetURL.Host
 		req.Header.Del(SandboxIngress)
+		req.Header.Del(AccessRenew)
+		req.Header.Del(SkipActivity)
 	}
 	proxy.ModifyResponse = func(response *http.Response) error {
+		for _, observe := range hp.responseObservers {
+			if observe != nil {
+				observe(response)
+			}
+		}
 		response.Header.Add(ReverseProxyServerPowerBy, "OpenSandbox-ingress")
 		return nil
 	}
-	return proxy, nil
+	// Custom error handler: log the upstream error and return 502 only
+	// when the response headers have not yet been committed. If the
+	// response is already streaming (e.g. SSE), writing an error body
+	// would corrupt the stream, so we silently let the connection close.
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		Logger.With(
+			slogger.Field{Key: "error", Value: fmt.Sprintf("%v", err)},
+			slogger.Field{Key: "uri", Value: req.RequestURI},
+			slogger.Field{Key: "method", Value: req.Method},
+		).Errorf("ingress: reverse proxy upstream error")
+		if req.Context().Err() == nil && hp.errorObserver != nil {
+			hp.errorObserver(err)
+		}
+
+		// Attempt to set 502; this is a no-op if headers are already sent.
+		rw.WriteHeader(http.StatusBadGateway)
+	}
+	return proxy
 }

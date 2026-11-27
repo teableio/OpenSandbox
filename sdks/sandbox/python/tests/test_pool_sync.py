@@ -1,9 +1,24 @@
+# Copyright 2026 The OpenSandbox Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any, cast
 
 import httpx
@@ -13,40 +28,48 @@ from opensandbox._pool_reconciler import ReconcileState, run_reconcile_tick
 from opensandbox.config.connection_sync import ConnectionConfigSync
 from opensandbox.exceptions import (
     PoolAcquireFailedException,
+    PoolDestroyedException,
     PoolEmptyException,
     PoolNotRunningException,
 )
-from opensandbox.models.sandboxes import PlatformSpec
+from opensandbox.models.sandboxes import (
+    CredentialProxyConfig,
+    NetworkPolicy,
+    PlatformSpec,
+)
 from opensandbox.pool import (
     AcquirePolicy,
     InMemoryPoolStateStore,
     PoolConfig,
     PoolCreationSpec,
+    PooledSandboxCreateContext,
+    PooledSandboxCreateReason,
 )
+from opensandbox.pool_types import PoolLifecycleState
+from opensandbox.sync import pool as sync_pool_module
 from opensandbox.sync.pool import SandboxPoolSync
 
 
-def test_degraded_backoff_caps_at_one_day() -> None:
+def test_fixed_admission_disables_backoff_after_many_failures() -> None:
     state = ReconcileState(degraded_threshold=1)
 
     for _ in range(20):
         state.record_failure("boom")
 
     assert state.failure_count == 20
-    assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(hours=23))
-    assert not state.is_backoff_active(datetime.now(timezone.utc) + timedelta(hours=25))
+    assert not state.is_backoff_active()
 
 
-def test_degraded_backoff_starts_at_thirty_seconds() -> None:
+def test_fixed_admission_disables_backoff_after_degraded_transition() -> None:
     state = ReconcileState(degraded_threshold=1)
 
     state.record_failure("boom")
 
-    assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=29))
-    assert not state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=31))
+    assert state.state.value == "DEGRADED"
+    assert not state.is_backoff_active()
 
 
-def test_reconcile_batch_failures_only_advance_backoff_once() -> None:
+def test_reconcile_submits_at_most_warmup_create_qps_without_waiting() -> None:
     store = InMemoryPoolStateStore()
     config = PoolConfig(
         pool_name="pool",
@@ -57,24 +80,37 @@ def test_reconcile_batch_failures_only_advance_backoff_once() -> None:
         connection_config=ConnectionConfigSync(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
     )
-    state = ReconcileState(degraded_threshold=3)
+    submitted: list[int] = []
+    assert run_reconcile_tick(
+        config=config,
+        state_store=store,
+        on_discard_sandbox=lambda _sandbox_id: None,
+        warming_count=0,
+        submit_warmups=submitted.append,
+    )
+    assert submitted == [10]
 
-    def fail_create() -> str:
-        raise RuntimeError("boom")
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        run_reconcile_tick(
-            config=config,
-            state_store=store,
-            create_one=fail_create,
-            on_discard_sandbox=lambda _sandbox_id: None,
-            reconcile_state=state,
-            warmup_executor=executor,
-        )
-
-    assert state.failure_count == 10
-    assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=29))
-    assert not state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=31))
+def test_reconcile_accounts_for_warming_before_admission() -> None:
+    store = InMemoryPoolStateStore()
+    config = PoolConfig(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=2,
+        warmup_concurrency=2,
+        state_store=store,
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+    )
+    submitted: list[int] = []
+    run_reconcile_tick(
+        config=config,
+        state_store=store,
+        on_discard_sandbox=lambda _sandbox_id: None,
+        warming_count=1,
+        submit_warmups=submitted.append,
+    )
+    assert submitted == [1]
 
 
 def test_acquire_fail_fast_empty_raises_pool_empty() -> None:
@@ -86,6 +122,91 @@ def test_acquire_fail_fast_empty_raises_pool_empty() -> None:
         assert exc.value.error.code == "POOL_EMPTY"
     finally:
         pool.shutdown(False)
+
+
+def test_release_all_idle_bounds_kills_and_cleans_up_before_store_failure() -> None:
+    class FailingStore(InMemoryPoolStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.takes = 0
+
+        def try_take_idle(self, pool_name: str) -> str | None:
+            if self.takes == 55:
+                raise RuntimeError("injected store failure")
+            self.takes += 1
+            return super().try_take_idle(pool_name)
+
+    store = FailingStore()
+    for index in range(55):
+        store.put_idle("pool", f"idle-{index}")
+
+    class ConcurrentManager(FakeManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+            self.ready = threading.Event()
+
+        def kill_sandbox(self, sandbox_id: str) -> None:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                if self.active == 50:
+                    self.ready.set()
+            assert self.ready.wait(timeout=2)
+            with self.lock:
+                self.killed.append(sandbox_id)
+                self.active -= 1
+            if sandbox_id == "idle-0":
+                raise RuntimeError("injected kill failure")
+
+    manager = ConcurrentManager()
+    pool = _create_pool(max_idle=0, store=store, manager=manager)
+
+    with pytest.raises(RuntimeError, match="injected store failure"):
+        pool.release_all_idle_parallel()
+
+    assert manager.max_active == 50
+    assert len(manager.killed) == 55
+    assert store.snapshot_counters("pool").idle_count == 0
+    assert manager.closed
+
+
+def test_release_all_idle_preserves_serial_behavior() -> None:
+    store = InMemoryPoolStateStore()
+    for index in range(3):
+        store.put_idle("pool", f"idle-{index}")
+
+    class TrackingManager(FakeManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+
+        def kill_sandbox(self, sandbox_id: str) -> None:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            time.sleep(0.001)
+            self.killed.append(sandbox_id)
+            self.active -= 1
+
+    manager = TrackingManager()
+    pool = _create_pool(max_idle=0, store=store, manager=manager)
+
+    released = pool.release_all_idle()
+
+    assert released == 3
+    assert manager.max_active == 1
+    assert len(manager.killed) == 3
+    assert manager.closed
+
+
+def test_release_all_idle_parallel_rejects_nonpositive_workers() -> None:
+    pool = _create_pool(max_idle=0)
+
+    with pytest.raises(ValueError, match="max_workers must be positive"):
+        pool.release_all_idle_parallel(0)
 
 
 def test_acquire_fail_fast_stale_idle_raises_and_kills_candidate() -> None:
@@ -100,7 +221,9 @@ def test_acquire_fail_fast_stale_idle_raises_and_kills_candidate() -> None:
             pool.acquire(policy=AcquirePolicy.FAIL_FAST)
         assert exc.value.error.code == "POOL_ACQUIRE_FAILED"
         assert store.snapshot_counters("pool").idle_count == 0
-        assert manager.killed == ["stale-1"]
+        # Kill is now fire-and-forget on the warmup executor (retry loop must not block on
+        # slow DELETEs) so poll briefly for the background task to observe the kill.
+        _eventually(lambda: manager.killed == ["stale-1"])
     finally:
         pool.shutdown(False)
 
@@ -115,6 +238,100 @@ def test_acquire_direct_create_when_empty() -> None:
         fake_sandbox = cast(FakeSandbox, sandbox)
         assert sandbox.id == "created-1"
         assert fake_sandbox.renewed == [timedelta(minutes=5)]
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_does_not_direct_create_when_pool_namespace_is_destroying() -> None:
+    FakeSandbox.reset()
+    store = InMemoryPoolStateStore()
+    pool = _create_pool(max_idle=0, store=store)
+    pool.start()
+
+    try:
+        store.begin_destroy("pool", "destroyer")
+
+        with pytest.raises(PoolDestroyedException):
+            pool.acquire()
+        assert FakeSandbox.created_count == 0
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_idle_destroy_race_raises_pool_destroyed() -> None:
+    store = InMemoryPoolStateStore()
+    store.put_idle("pool", "id-1")
+    connected: list[FakeSandbox] = []
+
+    class FencingSandbox(FakeSandbox):
+        @classmethod
+        def connect(cls, sandbox_id: str, *args: Any, **kwargs: Any) -> FakeSandbox:
+            sandbox = cls(sandbox_id)
+            connected.append(sandbox)
+            store.begin_destroy("pool", "destroyer")
+            return sandbox
+
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=0,
+        state_store=store,
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=FencingSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        with pytest.raises(PoolDestroyedException):
+            pool.acquire(policy=AcquirePolicy.DIRECT_CREATE)
+        assert connected[0].killed
+        assert connected[0].closed
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_stopped_destroyed_pool_raises_pool_destroyed() -> None:
+    store = InMemoryPoolStateStore()
+    pool = _create_pool(max_idle=0, store=store)
+    pool.start()
+    store.begin_destroy("pool", "destroyer")
+    pool.shutdown(False)
+
+    with pytest.raises(PoolDestroyedException):
+        pool.acquire()
+
+
+def test_acquire_destroy_race_preserves_pool_destroyed_when_cleanup_fails() -> None:
+    store = InMemoryPoolStateStore()
+    store.put_idle("pool", "id-1")
+
+    class CleanupFailingSandbox(FakeSandbox):
+        @classmethod
+        def connect(cls, sandbox_id: str, *args: Any, **kwargs: Any) -> FakeSandbox:
+            store.begin_destroy("pool", "destroyer")
+            return cls(sandbox_id)
+
+        def kill(self) -> None:
+            raise RuntimeError("kill failed")
+
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=0,
+        state_store=store,
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=CleanupFailingSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        with pytest.raises(PoolDestroyedException):
+            pool.acquire(policy=AcquirePolicy.DIRECT_CREATE)
     finally:
         pool.shutdown(False)
 
@@ -150,6 +367,98 @@ def test_acquire_direct_create_forwards_pool_creation_platform() -> None:
         pool.shutdown(False)
 
 
+@pytest.mark.parametrize("warmup", [False, True], ids=["direct", "warmup"])
+@pytest.mark.parametrize(
+    "credential_proxy",
+    [None, CredentialProxyConfig(enabled=False), CredentialProxyConfig(enabled=True)],
+    ids=["omitted", "disabled", "enabled"],
+)
+def test_pool_creation_forwards_credential_proxy(
+    warmup: bool, credential_proxy: CredentialProxyConfig | None
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    class CapturingSandbox(FakeSandbox):
+        @classmethod
+        def create(cls, *args: Any, **kwargs: Any) -> CapturingSandbox:
+            captured_kwargs.update(kwargs)
+            return cls("created-with-credential-proxy")
+
+    network_policy = NetworkPolicy(defaultAction="deny")
+    spec_kwargs = {"credential_proxy": credential_proxy} if credential_proxy else {}
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        max_idle=1 if warmup else 0,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(
+            image="ubuntu:22.04", network_policy=network_policy, **spec_kwargs
+        ),
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=CapturingSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        if warmup:
+            _eventually(lambda: pool.snapshot().idle_count == 1)
+        else:
+            pool.acquire()
+
+        if credential_proxy is None:
+            assert "credential_proxy" not in captured_kwargs
+        else:
+            assert captured_kwargs["credential_proxy"] is credential_proxy
+        assert captured_kwargs["network_policy"] is network_policy
+    finally:
+        pool.shutdown(False)
+
+
+@pytest.mark.parametrize("warmup", [False, True], ids=["direct", "warmup"])
+def test_pool_creation_supports_legacy_factory(warmup: bool) -> None:
+    class LegacySandbox(FakeSandbox):
+        @classmethod
+        def create(
+            cls,
+            image: Any,
+            *,
+            timeout: Any,
+            ready_timeout: Any,
+            env: Any,
+            metadata: Any,
+            resource: Any,
+            network_policy: Any,
+            platform: Any,
+            extensions: Any,
+            secure_access: Any,
+            entrypoint: Any,
+            volumes: Any,
+            connection_config: Any,
+            health_check: Any,
+            health_check_polling_interval: Any,
+            skip_health_check: Any,
+        ) -> LegacySandbox:
+            return cls("legacy-factory-sandbox")
+
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        max_idle=1 if warmup else 0,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=LegacySandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        if warmup:
+            _eventually(lambda: pool.snapshot().idle_count == 1)
+        else:
+            sandbox = pool.acquire()
+            assert sandbox.id == "legacy-factory-sandbox"
+    finally:
+        pool.shutdown(False)
+
+
 def test_acquire_direct_create_kills_and_closes_when_renew_fails() -> None:
     FakeSandbox.reset()
     FakeSandbox.fail_renew = True
@@ -164,6 +473,66 @@ def test_acquire_direct_create_kills_and_closes_when_renew_fails() -> None:
         assert FakeSandbox.last_created.closed
     finally:
         FakeSandbox.fail_renew = False
+        pool.shutdown(False)
+
+
+def test_direct_create_failure_after_run_retired_is_pool_not_running() -> None:
+    pool = _create_pool(max_idle=0)
+    pool.start()
+
+    def fail_after_retire(*args: Any, **kwargs: Any) -> FakeSandbox:
+        pool._lifecycle_state = PoolLifecycleState.STOPPED
+        raise RuntimeError("transport closed during shutdown")
+
+    pool._direct_create = fail_after_retire  # type: ignore[method-assign]
+    try:
+        with pytest.raises(PoolNotRunningException) as raised:
+            pool.acquire()
+        assert isinstance(raised.value.__cause__, RuntimeError)
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_direct_create_uses_sandbox_creator() -> None:
+    contexts: list[PooledSandboxCreateContext] = []
+
+    def creator(context: PooledSandboxCreateContext) -> FakeSandbox:
+        contexts.append(context)
+        return FakeSandbox("created-by-hook")
+
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=0,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        idle_timeout=timedelta(minutes=10),
+        sandbox_creator=creator,
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=FakeSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        sandbox = pool.acquire(sandbox_timeout=timedelta(minutes=5))
+        fake_sandbox = cast(FakeSandbox, sandbox)
+
+        assert sandbox.id == "created-by-hook"
+        assert fake_sandbox.renewed == [timedelta(minutes=5)]
+        assert len(contexts) == 1
+        assert contexts[0].pool_name == "pool"
+        assert contexts[0].owner_id == "owner-1"
+        assert contexts[0].idle_timeout == timedelta(minutes=10)
+        assert contexts[0].reason is PooledSandboxCreateReason.DIRECT_CREATE
+        assert contexts[0].ready_timeout == pool._config.acquire_ready_timeout
+        assert (
+            contexts[0].health_check_polling_interval
+            == pool._config.acquire_health_check_polling_interval
+        )
+        assert contexts[0].skip_health_check is False
+        assert contexts[0].health_check is None
+        assert isinstance(contexts[0].connection_config, ConnectionConfigSync)
+    finally:
         pool.shutdown(False)
 
 
@@ -213,7 +582,6 @@ def test_resize_only_updates_target_without_immediate_reconcile_trigger() -> Non
         state_store=InMemoryPoolStateStore(),
         connection_config=ConnectionConfigSync(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-        reconcile_interval=timedelta(seconds=10),
         sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
         sandbox_factory=FakeSandbox,  # type: ignore[arg-type]
     )
@@ -252,7 +620,6 @@ def test_graceful_shutdown_waits_for_running_warmup_before_stop() -> None:
         state_store=InMemoryPoolStateStore(),
         connection_config=ConnectionConfigSync(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-        reconcile_interval=timedelta(milliseconds=20),
         primary_lock_ttl=timedelta(seconds=5),
         drain_timeout=timedelta(milliseconds=50),
         warmup_sandbox_preparer=blocking_preparer,  # type: ignore[arg-type]
@@ -278,6 +645,183 @@ def test_graceful_shutdown_waits_for_running_warmup_before_stop() -> None:
         assert pool.snapshot().lifecycle_state.value == "STOPPED"
     finally:
         release_preparer.set()
+        pool.shutdown(False)
+
+
+def test_forced_shutdown_cleans_create_that_finishes_after_warmup_loop_retired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_started = threading.Event()
+    release_create = threading.Event()
+    manager = FakeManager()
+
+    class SlowSandbox(FakeSandbox):
+        @classmethod
+        def create(cls, *args: Any, **kwargs: Any) -> SlowSandbox:
+            create_started.set()
+            assert release_create.wait(timeout=2)
+            sandbox = cls("late-create")
+            cls.last_created = sandbox
+            return sandbox
+
+    monkeypatch.setattr(
+        sync_pool_module, "_WARMUP_TERMINATION_TIMEOUT_SECONDS", 0.01
+    )
+    pool = SandboxPoolSync(
+        pool_name="late-create-pool",
+        owner_id="owner-1",
+        max_idle=1,
+        warmup_concurrency=1,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=lambda config: manager,  # type: ignore[arg-type,return-value]
+        sandbox_factory=SlowSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        assert create_started.wait(timeout=2)
+        pool.shutdown(False)
+        release_create.set()
+
+        _eventually(lambda: manager.killed == ["late-create"])
+        assert SlowSandbox.last_created is not None
+        assert SlowSandbox.last_created.closed
+    finally:
+        release_create.set()
+        pool.shutdown(False)
+
+
+def test_forced_shutdown_orphans_warmup_loop_until_stuck_stage_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for issue #2056: a warmup still in flight past the bounded
+    teardown wait must not get its event loop closed underneath it. The loop is
+    orphaned instead, the stuck warmup finishes and cleans up its uncommitted
+    sandbox, and the orphaned loop stops itself once nothing is left on it.
+    """
+    FakeSandbox.reset()
+    entered_preparer = threading.Event()
+    release_preparer = threading.Event()
+
+    def blocking_preparer(sandbox: FakeSandbox) -> None:
+        entered_preparer.set()
+        assert release_preparer.wait(timeout=5)
+
+    class StuckWarmupSandbox(FakeSandbox):
+        pass
+
+    monkeypatch.setattr(
+        sync_pool_module, "_WARMUP_TERMINATION_TIMEOUT_SECONDS", 0.05
+    )
+    pool = SandboxPoolSync(
+        pool_name="stuck-warmup-pool",
+        owner_id="owner-1",
+        max_idle=1,
+        warmup_concurrency=1,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        warmup_sandbox_preparer=blocking_preparer,  # type: ignore[arg-type]
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=StuckWarmupSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        assert entered_preparer.wait(timeout=2)
+        loop_thread = pool._warmup_loop_thread
+        loop = pool._warmup_loop
+        assert loop_thread is not None
+        assert loop is not None
+
+        started = time.monotonic()
+        pool.shutdown(graceful=False)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0
+        assert pool.snapshot().lifecycle_state.value == "STOPPED"
+        assert pool._warmup_loop is None
+        assert not loop.is_closed()
+        assert loop_thread.is_alive()
+
+        release_preparer.set()
+
+        assert StuckWarmupSandbox.last_created is not None
+        stuck_sandbox = StuckWarmupSandbox.last_created
+        _eventually(lambda: stuck_sandbox.killed and stuck_sandbox.closed)
+        _eventually(lambda: not loop_thread.is_alive())
+        loop_thread.join(timeout=2)
+        assert not loop_thread.is_alive()
+        assert not loop.is_running()
+    finally:
+        release_preparer.set()
+        pool.shutdown(False)
+
+
+def test_restart_after_stuck_warmup_shutdown_closes_new_loop_normally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A permanently stuck warmup from an earlier run must not poison later
+    runs: token bookkeeping is scoped to the run generation, so a later run
+    still gets its loop closed by shutdown() even though the stale token from
+    the orphaned run never drains.
+    """
+    FakeSandbox.reset()
+    entered_preparer = threading.Event()
+    release_first_preparer = threading.Event()
+    preparer_calls = 0
+
+    def preparer(sandbox: FakeSandbox) -> None:
+        nonlocal preparer_calls
+        preparer_calls += 1
+        if preparer_calls == 1:
+            entered_preparer.set()
+            # Block without a timeout so this preparer cannot raise: a raised
+            # error would be recorded as a reconcile failure and put the pool
+            # into backoff, starving run 2's warmups.
+            release_first_preparer.wait()
+
+    monkeypatch.setattr(
+        sync_pool_module, "_WARMUP_TERMINATION_TIMEOUT_SECONDS", 0.05
+    )
+    pool = SandboxPoolSync(
+        pool_name="restart-after-stuck-pool",
+        owner_id="owner-1",
+        max_idle=1,
+        warmup_concurrency=1,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        warmup_sandbox_preparer=preparer,  # type: ignore[arg-type]
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=FakeSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        assert entered_preparer.wait(timeout=2)
+        pool.shutdown(graceful=False)
+        assert pool._warmup_loop is None
+        # The stuck warmup keeps its token registered (its cleanup cannot run
+        # while the preparer holds the single warmup worker), so the restart
+        # below tears down a run whose generation owns no tokens of its own.
+        assert 1 in pool._warmup_tokens
+
+        pool.start()
+        loop_thread = pool._warmup_loop_thread
+        loop = pool._warmup_loop
+        assert loop_thread is not None
+        assert loop is not None
+
+        started = time.monotonic()
+        pool.shutdown(graceful=False)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0
+        loop_thread.join(timeout=5)
+        assert not loop_thread.is_alive()
+        assert loop.is_closed()
+    finally:
+        release_first_preparer.set()
         pool.shutdown(False)
 
 
@@ -336,11 +880,303 @@ def test_user_managed_transport_is_preserved_for_pool_resources() -> None:
         pool.shutdown(False)
 
 
+def test_default_warmup_owns_transport_while_manager_uses_shared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager_configs: list[ConnectionConfigSync] = []
+    sandbox_configs: list[ConnectionConfigSync] = []
+    transport_limits: dict[str, object] = {}
+    original_with_transport = ConnectionConfigSync.with_transport_if_missing
+
+    def capture_transport_limits(
+        config: ConnectionConfigSync, **kwargs: object
+    ) -> ConnectionConfigSync:
+        transport_limits.update(kwargs)
+        return original_with_transport(config, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        ConnectionConfigSync, "with_transport_if_missing", capture_transport_limits
+    )
+
+    class CapturingSandbox(FakeSandbox):
+        @classmethod
+        def create(cls, *args: Any, **kwargs: Any) -> CapturingSandbox:
+            sandbox_configs.append(kwargs["connection_config"])
+            return cls("created-with-shared-transport")
+
+    def manager_factory(config: ConnectionConfigSync) -> FakeManager:
+        manager_configs.append(config)
+        return FakeManager()
+
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=1,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=manager_factory,  # type: ignore[arg-type,return-value]
+        sandbox_factory=CapturingSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        _eventually(lambda: pool.snapshot().idle_count == 1)
+        assert manager_configs[0].transport is not None
+        assert transport_limits["max_connections"] is None
+        assert transport_limits["max_keepalive_connections"] == 128
+        assert sandbox_configs[0].transport is None
+        assert manager_configs[0]._owns_transport
+        assert sandbox_configs[0]._owns_transport
+        assert sandbox_configs[0].retry_policy.max_retries == 0
+        assert sandbox_configs[0].disable_metrics is True
+        another_warmup_config = pool._connection_for_warmup_create()
+        assert another_warmup_config is not sandbox_configs[0]
+        assert another_warmup_config.transport is None
+        assert another_warmup_config._owns_transport
+        assert another_warmup_config.disable_metrics is True
+    finally:
+        pool.shutdown(False)
+
+
+def test_warmup_connection_disables_metrics_with_shared_transport() -> None:
+    transport = _SyncTransport()
+    connection_config = ConnectionConfigSync(transport=transport)
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=0,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=connection_config,
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=FakeSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        warmup_config = pool._connection_for_warmup_create()
+        assert warmup_config is not connection_config
+        assert warmup_config.disable_metrics is True
+        assert warmup_config.transport is transport
+        assert connection_config.disable_metrics is False
+    finally:
+        pool.shutdown(False)
+
+
+def test_staged_warmup_runs_in_order() -> None:
+    events: list[str] = []
+
+    class StagedSandbox(FakeSandbox):
+        @classmethod
+        def create(cls, *args: Any, **kwargs: Any) -> StagedSandbox:
+            assert kwargs["skip_health_check"] is True
+            events.append("create")
+            return cls("staged-1")
+
+        def is_healthy(self) -> bool:
+            events.append("readiness")
+            return True
+
+        def renew(self, timeout: timedelta) -> None:
+            events.append("renew")
+            super().renew(timeout)
+
+    def prepare(sandbox: FakeSandbox) -> None:
+        events.append("prepare")
+
+    def post_prepare(sandbox: FakeSandbox) -> bool:
+        events.append("post-prepare")
+        return True
+
+    pool = SandboxPoolSync(
+        pool_name="staged",
+        max_idle=1,
+        warmup_create_qps=1,
+        warmup_concurrency=1,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        warmup_sandbox_preparer=prepare,  # type: ignore[arg-type]
+        warmup_post_prepare_health_check=post_prepare,  # type: ignore[arg-type]
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=StagedSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        _eventually(lambda: pool.snapshot().idle_count == 1)
+        assert events[:5] == [
+            "create",
+            "readiness",
+            "prepare",
+            "post-prepare",
+            "renew",
+        ]
+    finally:
+        pool.shutdown(False)
+
+
+def test_warmup_polling_delay_does_not_hold_concurrency_slot() -> None:
+    lock = threading.Lock()
+    created = 0
+    attempts: dict[str, int] = {}
+    first_round: list[str] = []
+
+    class PollingSandbox(FakeSandbox):
+        @classmethod
+        def create(cls, *args: Any, **kwargs: Any) -> PollingSandbox:
+            nonlocal created
+            with lock:
+                created += 1
+                sandbox_id = f"polling-{created}"
+            return cls(sandbox_id)
+
+    def health(sandbox: FakeSandbox) -> bool:
+        with lock:
+            attempts[sandbox.id] = attempts.get(sandbox.id, 0) + 1
+            if attempts[sandbox.id] == 1:
+                first_round.append(sandbox.id)
+            return attempts[sandbox.id] >= 2
+
+    pool = SandboxPoolSync(
+        pool_name="polling-slots",
+        max_idle=2,
+        warmup_create_qps=2,
+        warmup_concurrency=1,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        warmup_health_check=health,  # type: ignore[arg-type]
+        warmup_health_check_polling_interval=timedelta(milliseconds=100),
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=PollingSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        _eventually(lambda: pool.snapshot().idle_count == 2)
+        assert len(set(first_round[:2])) == 2
+    finally:
+        pool.shutdown(False)
+
+
+def test_primary_heartbeat_continues_while_preparer_is_blocked() -> None:
+    class CountingStore(InMemoryPoolStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.renew_calls = 0
+
+        def renew_primary_lock(
+            self, pool_name: str, owner_id: str, ttl: timedelta
+        ) -> bool:
+            self.renew_calls += 1
+            return super().renew_primary_lock(pool_name, owner_id, ttl)
+
+    store = CountingStore()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def prepare(sandbox: FakeSandbox) -> None:
+        entered.set()
+        release.wait(timeout=2)
+
+    pool = SandboxPoolSync(
+        pool_name="heartbeat",
+        owner_id="owner-1",
+        max_idle=1,
+        state_store=store,
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        primary_lock_ttl=timedelta(milliseconds=90),
+        warmup_sandbox_preparer=prepare,  # type: ignore[arg-type]
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=FakeSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        assert entered.wait(timeout=2)
+        time.sleep(0.2)
+        assert store.renew_calls >= 2
+        release.set()
+        _eventually(lambda: pool.snapshot().idle_count == 1)
+    finally:
+        release.set()
+        pool.shutdown(False)
+
+
+def test_retired_acquire_cannot_consume_restarted_run_idle() -> None:
+    store = InMemoryPoolStateStore()
+    store.put_idle("pool", "old-run")
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingFactory(FakeSandbox):
+        @classmethod
+        def connect(cls, sandbox_id: str, *args: Any, **kwargs: Any) -> FakeSandbox:
+            if sandbox_id == "old-run":
+                entered.set()
+                release.wait(timeout=2)
+                raise RuntimeError("old candidate failed")
+            return cls(sandbox_id)
+
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=0,
+        max_acquire_retries=2,
+        state_store=store,
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=lambda config: FakeManager(),  # type: ignore[arg-type,return-value]
+        sandbox_factory=BlockingFactory,  # type: ignore[arg-type]
+    )
+    pool.start()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        acquire = executor.submit(pool.acquire, None, AcquirePolicy.RETRY_NEXT_IDLE)
+        assert entered.wait(timeout=1)
+        pool.shutdown(False)
+        pool.start()
+        store.put_idle("pool", "new-run")
+        release.set()
+        with pytest.raises(PoolNotRunningException):
+            acquire.result(timeout=2)
+    assert store.snapshot_idle_entries("pool")[0].sandbox_id == "new-run"
+    pool.shutdown(False)
+
+
+def test_acquire_assertion_error_cleans_popped_idle() -> None:
+    store = InMemoryPoolStateStore()
+    store.put_idle("pool", "broken-check")
+    manager = FakeManager()
+
+    class AssertionFactory(FakeSandbox):
+        @classmethod
+        def connect(cls, sandbox_id: str, *args: Any, **kwargs: Any) -> FakeSandbox:
+            raise AssertionError("user health check failed")
+
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=0,
+        state_store=store,
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=lambda config: manager,  # type: ignore[arg-type,return-value]
+        sandbox_factory=AssertionFactory,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        with pytest.raises(AssertionError, match="user health check failed"):
+            pool.acquire(policy=AcquirePolicy.FAIL_FAST)
+        _eventually(lambda: manager.killed == ["broken-check"])
+        assert store.snapshot_counters("pool").idle_count == 0
+    finally:
+        pool.shutdown(False)
+
+
 def _create_pool(
     *,
     max_idle: int,
     store: InMemoryPoolStateStore | None = None,
     manager: FakeManager | None = None,
+    max_acquire_retries: int = 3,
 ) -> SandboxPoolSync:
     return SandboxPoolSync(
         pool_name="pool",
@@ -350,12 +1186,529 @@ def _create_pool(
         state_store=store or InMemoryPoolStateStore(),
         connection_config=ConnectionConfigSync(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-        reconcile_interval=timedelta(milliseconds=20),
         primary_lock_ttl=timedelta(seconds=5),
         drain_timeout=timedelta(milliseconds=50),
+        max_acquire_retries=max_acquire_retries,
         sandbox_manager_factory=lambda config: manager or FakeManager(),  # type: ignore[arg-type,return-value]
         sandbox_factory=FakeSandbox,  # type: ignore[arg-type]
     )
+
+
+def test_concurrent_shutdown_closes_warmup_loop_once() -> None:
+    """Regression for issue #2025: concurrent shutdown() calls must not race past
+    the lifecycle check and double-close the shared warmup event loop
+    (ValueError: Invalid file descriptor: -1 / 'NoneType' object has no
+    attribute 'close').
+    """
+    pool = _create_pool(max_idle=0)
+    pool.start()
+    loop = pool._warmup_loop
+    assert loop is not None
+    original_close = loop.close
+    close_threads: list[int] = []
+
+    def slow_close() -> None:
+        close_threads.append(threading.get_ident())
+        # Keep close() in flight so a racing teardown that captured the same
+        # loop would call close() on it concurrently before this one returns.
+        time.sleep(0.2)
+        original_close()
+
+    loop.close = slow_close  # type: ignore[method-assign]
+    barrier = threading.Barrier(4)
+    errors: list[Exception] = []
+
+    def worker(graceful: bool) -> None:
+        barrier.wait()
+        try:
+            pool.shutdown(graceful)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(index % 2 == 0,)) for index in range(4)
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == []
+        assert len(close_threads) == 1
+    finally:
+        pool.shutdown(False)
+
+
+def test_stop_reconcile_bounded_when_warmup_stage_blocks_on_lifecycle_lock() -> None:
+    """Regression: start()'s failure path calls _stop_reconcile() while holding
+    _lifecycle_lock. A warmup commit-stage worker blocked on that lock must not
+    deadlock an unbounded executor wait in teardown — every wait must be
+    bounded so the failing start() can release the lock again.
+    """
+    pool = _create_pool(max_idle=0)
+    pool.start()
+    worker_entered = threading.Event()
+    worker_released = threading.Event()
+    lock_held = threading.Event()
+    teardown_done = threading.Event()
+
+    def blocked_commit_stage() -> None:
+        worker_entered.set()
+        # Mimics the commit stage: _can_commit_locally takes _lifecycle_lock,
+        # which the failing-start thread below already holds, so this blocks.
+        pool._can_commit_locally(0, 0)
+        worker_released.set()
+
+    def failing_start_failure_path() -> None:
+        # Mirrors start()'s failure path: teardown runs while _lifecycle_lock
+        # is held by this same thread.
+        with pool._lifecycle_lock:
+            lock_held.set()
+            assert worker_entered.wait(timeout=10)
+            pool._stop_reconcile(wait_for_warmup=True)
+        teardown_done.set()
+
+    # Daemon so a deadlocked teardown (the regression under test) cannot hang
+    # the interpreter after this test has already failed.
+    teardown_thread = threading.Thread(target=failing_start_failure_path, daemon=True)
+    teardown_thread.start()
+    assert lock_held.wait(timeout=10)
+    assert pool._warmup_executor is not None
+    pool._warmup_executor.submit(blocked_commit_stage)
+    assert worker_entered.wait(timeout=10)
+    teardown_thread.join(timeout=40)
+    assert not teardown_thread.is_alive(), "teardown deadlocked on lifecycle lock"
+    assert teardown_done.is_set()
+    assert worker_released.wait(timeout=5)
+
+
+def test_concurrent_start_shutdown_interleaved_closes_every_loop_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: teardown must be mutually exclusive with start()'s resource
+    installation. Interleaved start()/shutdown() from multiple threads must
+    never capture a half-installed run and must close every created warmup
+    loop exactly once.
+    """
+    created: list[asyncio.AbstractEventLoop] = []
+    closed: set[int] = set()
+    original_new_event_loop = sync_pool_module.asyncio.new_event_loop
+
+    def tracking_new_event_loop() -> asyncio.AbstractEventLoop:
+        loop = original_new_event_loop()
+        created.append(loop)
+        original_close = loop.close
+
+        def tracking_close() -> None:
+            closed.add(id(loop))
+            original_close()
+
+        loop.close = tracking_close  # type: ignore[method-assign]
+        return loop
+
+    monkeypatch.setattr(
+        sync_pool_module.asyncio, "new_event_loop", tracking_new_event_loop
+    )
+    pool = _create_pool(max_idle=0)
+    errors: list[Exception] = []
+
+    def worker(worker_index: int) -> None:
+        for round_index in range(10):
+            try:
+                pool.start()
+                pool.shutdown(graceful=(round_index + worker_index) % 2 == 0)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+                return
+
+    threads = [
+        threading.Thread(target=worker, args=(index,)) for index in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(closed) == len(created)
+    assert pool._warmup_loop is None
+    assert pool.snapshot().lifecycle_state == PoolLifecycleState.STOPPED
+
+
+def test_acquire_retry_next_idle_empty_raises_pool_empty() -> None:
+    pool = _create_pool(max_idle=0)
+    pool.start()
+    try:
+        with pytest.raises(PoolEmptyException) as exc:
+            pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE)
+        # Message should mention the policy, not the legacy "FAIL_FAST" string.
+        assert "RETRY_NEXT_IDLE" in str(exc.value)
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_all_stale_bounds_retries_and_raises() -> None:
+    store = InMemoryPoolStateStore()
+    manager = FakeManager()
+    # 5 stale ids seeded; retry budget of 3 must attempt exactly 3 and leave 2 behind.
+    for i in range(5):
+        store.put_idle("pool", f"stale-{i}")
+    pool = _create_pool(max_idle=0, store=store, manager=manager, max_acquire_retries=3)
+    pool.start()
+    try:
+        with pytest.raises(PoolAcquireFailedException):
+            pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE)
+        assert store.snapshot_counters("pool").idle_count == 2
+        # Best-effort kill fires once per attempted stale id, fire-and-forget on the warmup
+        # executor. Poll for the background tasks to observe all three.
+        _eventually(lambda: sorted(manager.killed) == ["stale-0", "stale-1", "stale-2"])
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_drained_mid_loop_raises_pool_acquire_failed() -> None:
+    store = InMemoryPoolStateStore()
+    # Only 2 stale ids but budget is 5; loop must break early and still raise
+    # PoolAcquireFailedException (attempted_any=True) rather than PoolEmptyException.
+    store.put_idle("pool", "stale-a")
+    store.put_idle("pool", "stale-b")
+    pool = _create_pool(max_idle=0, store=store, max_acquire_retries=5)
+    pool.start()
+    try:
+        with pytest.raises(PoolAcquireFailedException) as exc:
+            pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE)
+        assert "drained" in str(exc.value)
+        assert store.snapshot_counters("pool").idle_count == 0
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_then_create_falls_through_after_exhaustion() -> None:
+    FakeSandbox.reset()
+    store = InMemoryPoolStateStore()
+    for i in range(3):
+        store.put_idle("pool", f"stale-{i}")
+    pool = _create_pool(max_idle=0, store=store, max_acquire_retries=3)
+    pool.start()
+    try:
+        sandbox = pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE_THEN_CREATE)
+        assert sandbox.id.startswith("created-")
+        assert store.snapshot_counters("pool").idle_count == 0
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_returns_first_healthy_candidate() -> None:
+    store = InMemoryPoolStateStore()
+    store.put_idle("pool", "stale-a")
+    store.put_idle("pool", "stale-b")
+    store.put_idle("pool", "healthy-x")
+    pool = _create_pool(max_idle=0, store=store, max_acquire_retries=5)
+    pool.start()
+    try:
+        sandbox = pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE)
+        assert sandbox.id == "healthy-x"
+        # Two stale entries removed; healthy one taken by acquire.
+        assert store.snapshot_counters("pool").idle_count == 0
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_then_create_empty_falls_through_immediately() -> None:
+    FakeSandbox.reset()
+    pool = _create_pool(max_idle=0)
+    pool.start()
+    try:
+        sandbox = pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE_THEN_CREATE)
+        assert sandbox.id.startswith("created-")
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_renew_failure_kills_remote_without_retrying() -> None:
+    """Regression: renew failure against a healthy connected sandbox must NOT trigger the
+    retry loop to drain more idle candidates (retrying another idle cannot fix a lifecycle-
+    API renew rejection). But the connected sandbox MUST be killed on the remote side,
+    since try_take_idle already popped its id out of the pool store — otherwise it leaks
+    alive-but-untracked until its server-side TTL expires.
+    """
+    connected: list[FakeSandbox] = []
+
+    class TrackingSandbox(FakeSandbox):
+        fail_renew_ids: bool = True  # class-level flag to survive reset()
+
+        @classmethod
+        def connect(cls, sandbox_id: str, *args: Any, **kwargs: Any) -> FakeSandbox:
+            sb = super().connect(sandbox_id, *args, **kwargs)
+            sb.fail_renew = True  # per-instance renew failure
+            connected.append(sb)
+            return sb
+
+    store = InMemoryPoolStateStore()
+    manager = FakeManager()
+    for i in range(3):
+        store.put_idle("pool", f"healthy-{i}")
+    pool = SandboxPoolSync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=0,
+        warmup_concurrency=2,
+        state_store=store,
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        primary_lock_ttl=timedelta(seconds=5),
+        drain_timeout=timedelta(milliseconds=50),
+        max_acquire_retries=5,
+        sandbox_manager_factory=lambda config: manager,  # type: ignore[arg-type,return-value]
+        sandbox_factory=TrackingSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        with pytest.raises(RuntimeError, match="renew failed"):
+            pool.acquire(
+                sandbox_timeout=timedelta(minutes=5),
+                policy=AcquirePolicy.RETRY_NEXT_IDLE,
+            )
+        # Only ONE candidate was connected — retry did NOT drain the other two healthy idles.
+        assert len(connected) == 1
+        assert store.snapshot_counters("pool").idle_count == 2
+        # The connected sandbox was killed best-effort via sandbox.kill() so the remote
+        # resource does not leak (try_take_idle already popped its id from the store).
+        # Kill is direct on the Sandbox, not routed through the pool's SandboxManager, so
+        # FakeManager.killed stays empty; assert on the sandbox instance instead.
+        assert manager.killed == []
+        assert connected[0].killed, (
+            "renew failure must trigger sandbox.kill() to release remote resources; "
+            "otherwise the sandbox leaks alive-but-untracked until server-side TTL expiry"
+        )
+        assert connected[0].closed
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_does_not_block_on_slow_stale_kill() -> None:
+    """Regression: stale-candidate kill must fire-and-forget on the warmup executor so a
+    slow lifecycle-API DELETE does not stall the retry loop between candidates. Verify by
+    injecting a manager whose kill_sandbox blocks for longer than would be tolerable in
+    the retry path, then asserting acquire returns quickly with the healthy candidate.
+    """
+    slow_kill_seconds = 2.0
+
+    class SlowKillManager(FakeManager):
+        def kill_sandbox(self, sandbox_id: str) -> None:
+            time.sleep(slow_kill_seconds)
+            super().kill_sandbox(sandbox_id)
+
+    store = InMemoryPoolStateStore()
+    # Two stale ids ahead of a healthy id; a blocking kill on stale would add 2 * 2s = 4s
+    # to acquire latency if kill were awaited inline.
+    store.put_idle("pool", "stale-a")
+    store.put_idle("pool", "stale-b")
+    store.put_idle("pool", "healthy-x")
+
+    manager = SlowKillManager()
+    pool = _create_pool(max_idle=0, store=store, manager=manager, max_acquire_retries=5)
+    pool.start()
+    try:
+        start = time.monotonic()
+        sandbox = pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE)
+        elapsed = time.monotonic() - start
+        assert sandbox.id == "healthy-x"
+        # Generous bound but well below the 2 * slow_kill_seconds a naive inline-kill loop
+        # would take (and far below the 30s lifecycle default request_timeout).
+        assert elapsed < slow_kill_seconds, (
+            f"acquire took {elapsed:.2f}s; expected retry loop to not block on the "
+            f"slow stale kill (each blocks {slow_kill_seconds:.2f}s)"
+        )
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_then_create_falls_through_on_state_store_outage() -> (
+    None
+):
+    """Regression: PoolStateStoreUnavailableException during try_take_idle must degrade to
+    direct-create under RETRY_NEXT_IDLE_THEN_CREATE (and DIRECT_CREATE), per OSEP-0005.
+    Previously the exception propagated and skipped the fallback branch, making the new
+    then-create policy strictly less available than documented during store outages.
+    """
+    from opensandbox.exceptions import PoolStateStoreUnavailableException
+
+    FakeSandbox.reset()
+
+    class OutageStore(InMemoryPoolStateStore):
+        def try_take_idle(self, pool_name: str) -> str | None:
+            raise PoolStateStoreUnavailableException(
+                "TryTakeIdle", RuntimeError("redis unavailable")
+            )
+
+        # Override the min-ttl variant too, since the pool prefers it when
+        # acquire_min_remaining_ttl > 0 (which is the default).
+        def try_take_idle_min_ttl(  # type: ignore[override]
+            self, pool_name: str, min_remaining_ttl: object
+        ) -> object:
+            raise PoolStateStoreUnavailableException(
+                "TryTakeIdleWithMinTTL", RuntimeError("redis unavailable")
+            )
+
+    store = OutageStore()
+    pool = _create_pool(max_idle=0, store=store)
+    pool.start()
+    try:
+        sandbox = pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE_THEN_CREATE)
+        # Fell through to direct create.
+        assert sandbox.id.startswith("created-")
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_raises_on_state_store_outage() -> None:
+    """Complement of the fallthrough test: RETRY_NEXT_IDLE (no _THEN_CREATE) must surface
+    the state store outage instead of silently direct-creating. Same guarantee applies to
+    FAIL_FAST — non-fallthrough policies never degrade to direct-create.
+    """
+    from opensandbox.exceptions import PoolStateStoreUnavailableException
+
+    class OutageStore(InMemoryPoolStateStore):
+        def try_take_idle(self, pool_name: str) -> str | None:
+            raise PoolStateStoreUnavailableException(
+                "TryTakeIdle", RuntimeError("redis unavailable")
+            )
+
+        def try_take_idle_min_ttl(  # type: ignore[override]
+            self, pool_name: str, min_remaining_ttl: object
+        ) -> object:
+            raise PoolStateStoreUnavailableException(
+                "TryTakeIdleWithMinTTL", RuntimeError("redis unavailable")
+            )
+
+    store = OutageStore()
+    pool = _create_pool(max_idle=0, store=store)
+    pool.start()
+    try:
+        with pytest.raises(PoolStateStoreUnavailableException):
+            pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE)
+    finally:
+        pool.shutdown(False)
+
+
+def test_acquire_then_create_falls_through_when_full_state_store_outage_also_fails_namespace_check() -> (
+    None
+):
+    """Regression for Codex round-5 P2: previously, when the full state store was down
+    (Redis outage affecting *all* methods, not just try_take_idle), acquire aborted at
+    the pre-loop `_ensure_pool_namespace_active` call before the fallthrough branch
+    could run. RETRY_NEXT_IDLE_THEN_CREATE is documented to degrade to direct-create
+    during store outages (OSEP-0005); this test proves the namespace check no longer
+    breaks that guarantee.
+    """
+    from opensandbox.exceptions import PoolStateStoreUnavailableException
+
+    FakeSandbox.reset()
+
+    class OutageStore(InMemoryPoolStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            # Only start raising after pool.start() completes so setup still works;
+            # this mirrors a real Redis instance that crashes after the pool warms.
+            self._outage = False
+
+        def try_take_idle(self, pool_name: str) -> str | None:
+            if self._outage:
+                raise PoolStateStoreUnavailableException(
+                    "TryTakeIdle", RuntimeError("redis unavailable")
+                )
+            return super().try_take_idle(pool_name)
+
+        def try_take_idle_min_ttl(  # type: ignore[override]
+            self, pool_name: str, min_remaining_ttl: object
+        ) -> object:
+            if self._outage:
+                raise PoolStateStoreUnavailableException(
+                    "TryTakeIdleWithMinTTL", RuntimeError("redis unavailable")
+                )
+            return super().try_take_idle_min_ttl(pool_name, min_remaining_ttl)  # type: ignore[arg-type]
+
+        def get_destroy_state(self, pool_name: str):  # type: ignore[override]
+            if self._outage:
+                raise PoolStateStoreUnavailableException(
+                    "GetDestroyState", RuntimeError("redis unavailable")
+                )
+            return super().get_destroy_state(pool_name)
+
+    store = OutageStore()
+    pool = _create_pool(max_idle=0, store=store)
+    pool.start()
+    store._outage = True
+    try:
+        sandbox = pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE_THEN_CREATE)
+        assert sandbox.id.startswith("created-")
+    finally:
+        store._outage = False
+        pool.shutdown(False)
+
+
+def test_acquire_retry_next_idle_raises_when_full_state_store_outage_also_fails_namespace_check() -> (
+    None
+):
+    """Non-fallthrough counterpart: full state-store outage under RETRY_NEXT_IDLE must
+    still surface PoolStateStoreUnavailableException (fail-closed)."""
+    from opensandbox.exceptions import PoolStateStoreUnavailableException
+
+    FakeSandbox.reset()
+
+    class OutageStore(InMemoryPoolStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self._outage = False
+
+        def try_take_idle(self, pool_name: str) -> str | None:
+            if self._outage:
+                raise PoolStateStoreUnavailableException(
+                    "TryTakeIdle", RuntimeError("redis unavailable")
+                )
+            return super().try_take_idle(pool_name)
+
+        def try_take_idle_min_ttl(  # type: ignore[override]
+            self, pool_name: str, min_remaining_ttl: object
+        ) -> object:
+            if self._outage:
+                raise PoolStateStoreUnavailableException(
+                    "TryTakeIdleWithMinTTL", RuntimeError("redis unavailable")
+                )
+            return super().try_take_idle_min_ttl(pool_name, min_remaining_ttl)  # type: ignore[arg-type]
+
+        def get_destroy_state(self, pool_name: str):  # type: ignore[override]
+            if self._outage:
+                raise PoolStateStoreUnavailableException(
+                    "GetDestroyState", RuntimeError("redis unavailable")
+                )
+            return super().get_destroy_state(pool_name)
+
+    store = OutageStore()
+    pool = _create_pool(max_idle=0, store=store)
+    pool.start()
+    store._outage = True
+    try:
+        with pytest.raises(PoolStateStoreUnavailableException):
+            pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE)
+    finally:
+        store._outage = False
+        pool.shutdown(False)
+
+
+def test_pool_config_rejects_max_acquire_retries_below_one() -> None:
+    with pytest.raises(ValueError, match="max_acquire_retries must be >= 1"):
+        PoolConfig(
+            pool_name="pool",
+            owner_id="owner-1",
+            max_idle=1,
+            state_store=InMemoryPoolStateStore(),
+            connection_config=ConnectionConfigSync(),
+            creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+            max_acquire_retries=0,
+        )
 
 
 def _eventually(condition: Any, timeout: float = 2.0) -> None:
@@ -413,6 +1766,9 @@ class FakeSandbox:
         if self.fail_renew:
             raise RuntimeError("renew failed")
         self.renewed.append(timeout)
+
+    def is_healthy(self) -> bool:
+        return True
 
     def kill(self) -> None:
         self.killed = True

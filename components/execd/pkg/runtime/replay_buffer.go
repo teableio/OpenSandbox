@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,11 +23,12 @@ const replayBufferSize = 1 << 20 // 1 MiB
 // Invariant: head == total % size (where size is the buffer capacity).
 // This means the byte at absolute offset o (o >= oldest) is stored at buf[o % size].
 type replayBuffer struct {
-	mu    sync.Mutex
-	buf   []byte
-	size  int   // == replayBufferSize (or smaller in tests)
-	head  int   // next write position; always == total % size
-	total int64 // monotonic byte counter (total bytes ever written)
+	mu      sync.Mutex
+	buf     []byte
+	size    int   // == replayBufferSize (or smaller in tests)
+	head    int   // next write position; always == total % size
+	total   int64 // monotonic byte counter (total bytes ever written)
+	changed chan struct{}
 }
 
 func newReplayBuffer() *replayBuffer {
@@ -37,8 +38,6 @@ func newReplayBuffer() *replayBuffer {
 	}
 }
 
-// write appends p to the buffer, evicting the oldest bytes when the buffer is full.
-// The invariant head == total % size is preserved on every call.
 func (r *replayBuffer) write(p []byte) {
 	if len(p) == 0 {
 		return
@@ -53,7 +52,6 @@ func (r *replayBuffer) write(p []byte) {
 		r.total += int64(skip)
 		r.head = (r.head + skip) % r.size
 		p = p[skip:]
-		// len(p) == r.size now
 	}
 
 	// len(p) <= r.size — split into at most two contiguous copies.
@@ -66,6 +64,14 @@ func (r *replayBuffer) write(p []byte) {
 		copy(r.buf[r.head:], rest)
 		r.head = (r.head + len(rest)) % r.size
 		r.total += int64(len(rest))
+	}
+
+	// Closing the current generation wakes every subscriber. Leave it nil until
+	// another subscriber arrives so sessions without viewers do not allocate a
+	// notification channel for every output chunk.
+	if r.changed != nil {
+		close(r.changed)
+		r.changed = nil
 	}
 }
 
@@ -86,11 +92,32 @@ func (r *replayBuffer) ReadFrom(offset int64) ([]byte, int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	return r.readFromLocked(offset)
+}
+
+// ReadFromAndSubscribe returns the same snapshot as ReadFrom plus a channel
+// that is closed after the next successful write. Every caller receives the
+// same generation channel, so one write wakes all current subscribers.
+func (r *replayBuffer) ReadFromAndSubscribe(offset int64) ([]byte, int64, <-chan struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	data, actualOffset := r.readFromLocked(offset)
+	r.ensureChangedLocked()
+	return data, actualOffset, r.changed
+}
+
+func (r *replayBuffer) ensureChangedLocked() {
+	if r.changed == nil {
+		r.changed = make(chan struct{})
+	}
+}
+
+func (r *replayBuffer) readFromLocked(offset int64) ([]byte, int64) {
 	if offset >= r.total {
 		return nil, r.total
 	}
 
-	// Oldest retained absolute offset.
 	oldest := r.total - int64(r.size)
 	if oldest < 0 {
 		oldest = 0
@@ -104,8 +131,6 @@ func (r *replayBuffer) ReadFrom(offset int64) ([]byte, int64) {
 		return nil, r.total
 	}
 
-	// Thanks to the invariant head == total % size, the byte at absolute offset o
-	// is stored at buf[o % size].  This holds whether or not the buffer has wrapped.
 	start := int(offset % int64(r.size))
 	end := start + count
 

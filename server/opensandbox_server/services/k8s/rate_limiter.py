@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,7 +41,6 @@ class TokenBucketRateLimiter:
         self._lock = threading.Lock()
 
     def acquire(self) -> None:
-        """Acquire one token, blocking until one is available."""
         while True:
             wait = self._try_acquire()
             if wait <= 0.0:
@@ -51,20 +50,11 @@ class TokenBucketRateLimiter:
             time.sleep(max(wait, 0.001))
 
     def try_acquire(self) -> bool:
-        """Try to acquire one token without blocking.
-
-        Returns:
-            ``True`` if a token was consumed, ``False`` if the bucket is empty.
-        """
+        """Try to acquire one token without blocking."""
         return self._try_acquire() <= 0.0
 
     def _try_acquire(self) -> float:
-        """Attempt to take a token.
-
-        Returns:
-            0.0 if a token was consumed successfully, otherwise the approximate
-            number of seconds to wait before retrying.
-        """
+        """Return 0.0 when a token was consumed, else the seconds to wait before retrying."""
         with self._lock:
             self._refill()
             if self._tokens >= 1.0:

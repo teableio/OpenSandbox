@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 from datetime import timedelta
 
@@ -36,6 +37,16 @@ async def _print_execution_logs(execution) -> None:
         print(f"[error] {execution.error.name}: {execution.error.value}")
 
 
+def _json_result(execution) -> dict:
+    """Parse the JSON object printed by `claude -p --output-format json`."""
+    stdout = "\n".join(msg.text for msg in execution.logs.stdout)
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        print(f"[warn] expected JSON output, got: {stdout[:200]!r}")
+        return {}
+
+
 async def main() -> None:
     domain = os.getenv("SANDBOX_DOMAIN", "localhost:8080")
     api_key = os.getenv("SANDBOX_API_KEY")
@@ -44,7 +55,7 @@ async def main() -> None:
     claude_model_name = os.getenv("ANTHROPIC_MODEL", "claude_sonnet4")
     image = os.getenv(
         "SANDBOX_IMAGE",
-        "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.0.2",
+        "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/code-interpreter:v1.1.0",
     )
 
     config = ConnectionConfig(
@@ -53,7 +64,6 @@ async def main() -> None:
         request_timeout=timedelta(seconds=60),
     )
 
-    # Inject Claude settings into container environment for CLI access
     env = {
         "ANTHROPIC_AUTH_TOKEN": claude_auth_token,
         "ANTHROPIC_BASE_URL": claude_base_url,
@@ -76,11 +86,32 @@ async def main() -> None:
         )
         await _print_execution_logs(install_exec)
 
-        # Use Claude CLI to send a message
         run_exec = await sandbox.commands.run(
             'claude "Compute 1+1=?."'
         )
         await _print_execution_logs(run_exec)
+
+        # Headless run: -p prints the reply and exits; --output-format json
+        # returns the reply, session_id, and usage metadata as one JSON object.
+        headless_exec = await sandbox.commands.run(
+            'claude -p "Remember this for later: my favorite sandbox number is 42." '
+            "--output-format json"
+        )
+        headless_result = _json_result(headless_exec)
+        print(f"[headless] result: {headless_result.get('result', '')}")
+        session_id = headless_result.get("session_id", "")
+        print(f"[headless] session_id: {session_id}")
+
+        # Resume the same conversation for a follow-up turn: --resume keeps
+        # the context of the previous turns, so the reply recalls "42".
+        if session_id:
+            resume_exec = await sandbox.commands.run(
+                'claude -p "What is my favorite sandbox number? '
+                f'Reply with just the number." --resume "{session_id}" '
+                "--output-format json"
+            )
+            resume_result = _json_result(resume_exec)
+            print(f"[resume] result: {resume_result.get('result', '')}")
 
         await sandbox.kill()
 

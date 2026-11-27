@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -36,10 +35,8 @@ func NewClient(baseURL string) *Client {
 		klog.Warning("baseURL is empty, client may not work properly")
 	}
 	return &Client{
-		baseURL: baseURL,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		baseURL:    baseURL,
+		httpClient: &http.Client{},
 	}
 }
 
@@ -54,13 +51,11 @@ func (c *Client) Set(ctx context.Context, task *Task) (*Task, error) {
 	var err error
 
 	if task == nil {
-		// Delete request - send nil to clear tasks
 		req, err = http.NewRequestWithContext(ctx, "POST", c.baseURL+"/setTasks", bytes.NewReader([]byte("[]")))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 	} else {
-		// Create/Update request
 		data, err := json.Marshal([]Task{*task})
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal task: %w", err)
@@ -73,11 +68,10 @@ func (c *Client) Set(ctx context.Context, task *Task) (*Task, error) {
 
 	req.Header.Set("Content-Type", "application/json")
 
-	// Send request with retry
 	var resp *http.Response
 	resp, err = c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("network error after retries: %w", err)
+		return nil, fmt.Errorf("network error: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -86,14 +80,12 @@ func (c *Client) Set(ctx context.Context, task *Task) (*Task, error) {
 		return nil, fmt.Errorf("server error: status=%d, body=%s", resp.StatusCode, string(body))
 	}
 
-	// Parse response - expect array of tasks
 	var tasks []Task
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	if task != nil && len(tasks) > 0 {
-		// Find the task we just set
 		for i := range tasks {
 			if tasks[i].Name == task.Name {
 				return &tasks[i], nil
@@ -102,7 +94,6 @@ func (c *Client) Set(ctx context.Context, task *Task) (*Task, error) {
 	}
 
 	if task == nil {
-		// Delete succeeded
 		return nil, nil
 	}
 
@@ -131,17 +122,15 @@ func (c *Client) Get(ctx context.Context) (*Task, error) {
 		return nil, fmt.Errorf("server error: status=%d, body=%s", resp.StatusCode, string(body))
 	}
 
-	// Parse response - expect array of tasks
 	var tasks []Task
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	// Return the first task (single task mode)
+	// The executor holds a single task; only the first entry is returned.
 	if len(tasks) > 0 {
 		return &tasks[0], nil
 	}
 
-	// No tasks
 	return nil, nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,24 +15,30 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 
 	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
 )
 
 func ValidateWorkingDir(cwd string) error {
+	return ValidateWorkingDirWithEnv(cwd, nil)
+}
+
+func ValidateWorkingDirWithEnv(cwd string, envOverrides map[string]string) error {
 	if cwd == "" {
 		return nil
 	}
-	resolvedCwd, err := pathutil.ExpandPath(cwd)
+	resolvedCwd, err := pathutil.ExpandPathWithEnv(cwd, envOverrides)
 	if err != nil {
 		return fmt.Errorf("cannot resolve working directory %q: %w", cwd, err)
 	}
 	fi, err := os.Stat(resolvedCwd)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("working directory does not exist: %s", cwd)
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("working directory does not exist: %s: %w", cwd, err)
 		}
 		return fmt.Errorf("cannot access working directory %q: %w", cwd, err)
 	}

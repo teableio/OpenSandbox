@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,13 +16,169 @@
 
 set -e
 
+EXECD_WATCHDOG_PID=""
+LIFECYCLE_STATUS_DIR=""
+LIFECYCLE_STATUS_FILE=""
+LIFECYCLE_WATCHDOG_TIMEOUT_FILE=""
+LIFECYCLE_WATCHDOG_READY_FILE=""
+
 _forward_signal() {
 	sig="$1"
 	pid="$2"
+	if [ -z "$pid" ]; then
+		return
+	fi
 	kill "-$sig" "$pid" 2>/dev/null || true
-	wait "$pid" 2>/dev/null || true
+}
+
+_process_state() {
+	if [ -r "/proc/$1/stat" ]; then
+		sed -e 's/^.*) //' -e 's/ .*$//' "/proc/$1/stat" 2>/dev/null || true
+	else
+		ps -o stat= -p "$1" 2>/dev/null \
+			| sed -n '1{s/^[[:space:]]*//; s/^\(.\).*$/\1/; p;}' \
+			|| true
+	fi
+}
+
+_stop_execd_watchdog() {
+	if [ -n "${EXECD_WATCHDOG_PID:-}" ]; then
+		if [ -n "${LIFECYCLE_WATCHDOG_READY_FILE:-}" ] \
+			&& [ ! -s "$LIFECYCLE_WATCHDOG_READY_FILE" ]; then
+			kill -KILL "$EXECD_WATCHDOG_PID" 2>/dev/null || true
+		else
+			kill -TERM "$EXECD_WATCHDOG_PID" 2>/dev/null || true
+		fi
+		wait "$EXECD_WATCHDOG_PID" 2>/dev/null || true
+		EXECD_WATCHDOG_PID=""
+	fi
+}
+
+_start_execd_watchdog() {
+	_watchdog_delay="$1"
+	_watchdog_message="$2"
+	_watchdog_mark_timeout="${3:-1}"
+	_watchdog_grace_delay="${4:-0}"
+	_watchdog_signal="${5-TERM}"
+	_watchdog_execd_pid="$EXECD_PID"
+	_watchdog_timeout_file="${LIFECYCLE_WATCHDOG_TIMEOUT_FILE:-}"
+	_watchdog_ready_file="${LIFECYCLE_WATCHDOG_READY_FILE:-}"
+	_stop_execd_watchdog
+	if [ "$_watchdog_mark_timeout" -eq 1 ] \
+		&& [ -n "$_watchdog_timeout_file" ] \
+		&& [ -s "$_watchdog_timeout_file" ]; then
+		return 1
+	fi
+	if [ -n "$_watchdog_ready_file" ] \
+		&& ! ( : > "$_watchdog_ready_file" ) 2>/dev/null; then
+		return 1
+	fi
+	(
+		# This child must never run the parent's cleanup or shutdown traps.
+		trap - EXIT TERM INT
+		_watchdog_cancelled=0
+		_watchdog_sleep_pid=""
+		_watchdog_spawning_sleep=0
+		trap '_watchdog_cancelled=1; if [ -n "${_watchdog_sleep_pid:-}" ]; then kill -KILL "$_watchdog_sleep_pid" 2>/dev/null || true; elif [ "${_watchdog_spawning_sleep:-0}" -eq 0 ]; then exit 0; fi' TERM INT
+		if [ -n "$_watchdog_ready_file" ] \
+			&& ! printf 'ready\n' > "$_watchdog_ready_file"; then
+			exit 1
+		fi
+		_watchdog_sleep() {
+			if [ "$_watchdog_cancelled" -ne 0 ]; then
+				return 1
+			fi
+			_watchdog_spawning_sleep=1
+			sleep "$1" &
+			_watchdog_sleep_pid=$!
+			_watchdog_spawning_sleep=0
+			if [ "$_watchdog_cancelled" -ne 0 ]; then
+				kill -KILL "$_watchdog_sleep_pid" 2>/dev/null || true
+			fi
+			wait "$_watchdog_sleep_pid" || true
+			_watchdog_sleep_pid=""
+			if [ "$_watchdog_cancelled" -ne 0 ]; then
+				return 1
+			fi
+		}
+		_watchdog_sleep "$_watchdog_delay" || exit 0
+		if [ "$_watchdog_grace_delay" != "0" ]; then
+			_watchdog_sleep "$_watchdog_grace_delay" || exit 0
+		fi
+		if [ "$_watchdog_cancelled" -ne 0 ]; then
+			exit 0
+		fi
+		if [ "$_watchdog_mark_timeout" -eq 1 ] && [ -n "$_watchdog_timeout_file" ]; then
+			if ! printf 'timed-out\n' > "$_watchdog_timeout_file"; then
+				_forward_signal KILL "$_watchdog_execd_pid"
+				echo "error: failed to record lifecycle startup watchdog timeout" >&2 || true
+				exit 1
+			fi
+		fi
+		if [ -n "$_watchdog_message" ]; then
+			echo "error: $_watchdog_message" >&2 || true
+		fi
+		if [ -n "$_watchdog_signal" ]; then
+			_forward_signal "$_watchdog_signal" "$_watchdog_execd_pid"
+		fi
+		_watchdog_sleep 10 || exit 0
+		_forward_signal KILL "$_watchdog_execd_pid"
+	) &
+	EXECD_WATCHDOG_PID=$!
+	if [ -n "$_watchdog_ready_file" ]; then
+		_watchdog_ready_attempts=0
+		_watchdog_ready_limit=100
+		_watchdog_ready_delay=0.1
+		while [ ! -s "$_watchdog_ready_file" ] && [ "$_watchdog_ready_attempts" -lt "$_watchdog_ready_limit" ]; do
+			_watchdog_state="$(_process_state "$EXECD_WATCHDOG_PID")"
+			if [ "$_watchdog_state" = "Z" ]; then
+				break
+			fi
+			if ! kill -0 "$EXECD_WATCHDOG_PID" 2>/dev/null; then
+				break
+			fi
+			if ! sleep "$_watchdog_ready_delay" 2>/dev/null; then
+				# POSIX sleep only requires integer operands. Keep the same
+				# ten-second total bound when fractional sleep is unavailable.
+				_watchdog_ready_delay=1
+				_watchdog_ready_limit=10
+				sleep 1
+			fi
+			_watchdog_ready_attempts=$((_watchdog_ready_attempts + 1))
+		done
+		if [ ! -s "$_watchdog_ready_file" ]; then
+			kill -KILL "$EXECD_WATCHDOG_PID" 2>/dev/null || true
+			wait "$EXECD_WATCHDOG_PID" 2>/dev/null || true
+			EXECD_WATCHDOG_PID=""
+			return 1
+		fi
+	fi
+}
+
+_shutdown_children() {
+	sig="$1"
+	_stop_execd_watchdog
+	_forward_signal "$sig" "${CMD_PID:-}"
+	_forward_signal "$sig" "${EXECD_PID:-}"
+	if [ -n "${EXECD_PID:-}" ] && [ -n "${LIFECYCLE_STATUS_FILE:-}" ]; then
+		# The signal was already forwarded above; this watchdog only bounds
+		# graceful shutdown before escalating to KILL.
+		if ! _start_execd_watchdog 0 "" 0 0 ""; then
+			_forward_signal KILL "$EXECD_PID"
+		fi
+	fi
+	if [ -n "${CMD_PID:-}" ]; then
+		wait "$CMD_PID" 2>/dev/null || true
+	fi
+	if [ -n "${EXECD_PID:-}" ]; then
+		wait "$EXECD_PID" 2>/dev/null || true
+	fi
+	_cleanup_lifecycle_status
 	exit 0
 }
+
+trap '_shutdown_children TERM' TERM
+trap '_shutdown_children INT' INT
 
 # Returns 0 if the value looks like a boolean "true" (1, true, yes, on).
 is_truthy() {
@@ -31,6 +187,43 @@ is_truthy() {
 	*) return 1 ;;
 	esac
 }
+
+has_lifecycle_config() {
+	# Keep this in sync with pkg/lifecycle/config.go's transport env, explicit
+	# path env, and default persisted path.
+	if [ -n "$(printf '%s' "${OPENSANDBOX_LIFECYCLE:-}" | tr -d '[:space:]')" ]; then
+		return 0
+	fi
+	if [ -n "${EXECD_LIFECYCLE_CONFIG:-}" ]; then
+		return 0
+	fi
+	if [ -n "${HOME:-}" ] && [ -e "$HOME/.execd/lifecycle.toml" ]; then
+		return 0
+	fi
+	return 1
+}
+
+_cleanup_lifecycle_status() {
+	_stop_execd_watchdog
+	if [ -n "${LIFECYCLE_STATUS_FILE:-}" ]; then
+		rm -f "$LIFECYCLE_STATUS_FILE"
+		LIFECYCLE_STATUS_FILE=""
+	fi
+	if [ -n "${LIFECYCLE_WATCHDOG_TIMEOUT_FILE:-}" ]; then
+		rm -f "$LIFECYCLE_WATCHDOG_TIMEOUT_FILE"
+		LIFECYCLE_WATCHDOG_TIMEOUT_FILE=""
+	fi
+	if [ -n "${LIFECYCLE_WATCHDOG_READY_FILE:-}" ]; then
+		rm -f "$LIFECYCLE_WATCHDOG_READY_FILE"
+		LIFECYCLE_WATCHDOG_READY_FILE=""
+	fi
+	if [ -n "${LIFECYCLE_STATUS_DIR:-}" ]; then
+		rmdir "$LIFECYCLE_STATUS_DIR" 2>/dev/null || true
+		LIFECYCLE_STATUS_DIR=""
+	fi
+}
+
+trap '_cleanup_lifecycle_status' EXIT
 
 _sudo() {
 	if [ "$(id -u)" -eq 0 ]; then
@@ -49,19 +242,26 @@ _sudo() {
 OPENSANDBOX_MERGED_CA=""
 trust_mitm_ca() {
 	cert="$1"
-	merged="/opt/opensandbox/merged-ca-certificates.pem"
+	merged="${OPENSANDBOX_MERGED_CA_PATH:-/opt/opensandbox/merged-ca-certificates.pem}"
+	# A failed update invocation is transient (watch_mitm_ca retries it);
+	# missing tooling is a permanent image property and only warns.
+	_trust_failed=""
 
 	# 1) Try to install into the system trust store (best-effort).
 	if command -v update-ca-certificates >/dev/null 2>&1; then
-		_sudo mkdir -p /usr/local/share/ca-certificates \
+		if ! { _sudo mkdir -p /usr/local/share/ca-certificates \
 			&& _sudo cp "$cert" /usr/local/share/ca-certificates/opensandbox-mitmproxy-ca.crt \
-			&& _sudo update-ca-certificates \
-			|| echo "warning: update-ca-certificates failed; system trust store may not include mitm CA" >&2
+			&& _sudo update-ca-certificates; }; then
+			echo "warning: update-ca-certificates failed; system trust store may not include mitm CA" >&2
+			_trust_failed=1
+		fi
 	elif command -v update-ca-trust >/dev/null 2>&1; then
-		_sudo mkdir -p /etc/pki/ca-trust/source/anchors \
+		if ! { _sudo mkdir -p /etc/pki/ca-trust/source/anchors \
 			&& _sudo cp "$cert" /etc/pki/ca-trust/source/anchors/opensandbox-mitmproxy-ca.pem \
-			&& { _sudo update-ca-trust extract || _sudo update-ca-trust; } \
-			|| echo "warning: update-ca-trust failed; system trust store may not include mitm CA" >&2
+			&& { _sudo update-ca-trust extract || _sudo update-ca-trust; }; }; then
+			echo "warning: update-ca-trust failed; system trust store may not include mitm CA" >&2
+			_trust_failed=1
+		fi
 	else
 		echo "warning: no system trust-store tooling found (need update-ca-certificates or update-ca-trust)" >&2
 	fi
@@ -83,13 +283,28 @@ trust_mitm_ca() {
 		/etc/ssl/cert.pem \
 		/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem; do
 		if [ -n "$candidate" ] && [ -f "$candidate" ] && [ -s "$candidate" ]; then
-			cat "$candidate" "$cert" > "$merged"
-			OPENSANDBOX_MERGED_CA="$merged"
-			return 0
+			mkdir -p "$(dirname "$merged")" 2>/dev/null || true
+			# Atomic replace: clients read this path concurrently via
+			# REQUESTS_CA_BUNDLE/SSL_CERT_FILE and must never see a
+			# truncated bundle.
+			_merged_tmp="$merged.tmp.$$"
+			if cat "$candidate" "$cert" > "$_merged_tmp" && mv "$_merged_tmp" "$merged"; then
+				OPENSANDBOX_MERGED_CA="$merged"
+				if [ -n "$_trust_failed" ]; then
+					return 1
+				fi
+				return 0
+			fi
+			rm -f "$_merged_tmp" 2>/dev/null || true
+			echo "warning: failed to write merged CA bundle at $merged" >&2
+			_trust_failed=1
 		fi
 	done
 
 	echo "warning: could not locate any CA bundle to merge with mitm CA" >&2
+	if [ -n "$_trust_failed" ]; then
+		return 1
+	fi
 	return 0
 }
 
@@ -98,13 +313,16 @@ trust_mitm_ca() {
 # Requires certutil (e.g. Alpine: nss-tools, Debian/Ubuntu: libnss3-tools).
 trust_mitm_ca_nss() {
 	cert="$1"
+	_MITM_CA_NSS_FAILED=0
 	[ -f "$cert" ] || return 0
-	[ -n "${HOME:-}" ] && [ -d "$HOME" ] || return 0
 	if ! command -v certutil >/dev/null 2>&1; then
+		echo "warning: certutil not found; Chromium/Chrome may not trust the mitm CA in NSS (install nss-tools on Alpine or libnss3-tools on Debian/Ubuntu)" >&2
 		return 0
 	fi
+	[ -n "${HOME:-}" ] && [ -d "$HOME" ] || return 0
 	pki="${HOME}/.pki/nssdb"
 	if ! mkdir -p "$pki" 2>/dev/null; then
+		_MITM_CA_NSS_FAILED=1
 		return 0
 	fi
 	if [ -f "$pki/cert9.db" ]; then
@@ -114,51 +332,529 @@ trust_mitm_ca_nss() {
 	else
 		nssdb="sql:$pki"
 		if ! certutil -N -d "$nssdb" --empty-password 2>/dev/null; then
-			[ -f "$pki/cert9.db" ] || return 0
+			if [ ! -f "$pki/cert9.db" ]; then
+				_MITM_CA_NSS_FAILED=1
+				return 0
+			fi
 		fi
 	fi
 	nick="opensandbox-mitmproxy"
 	certutil -D -d "$nssdb" -n "$nick" 2>/dev/null || true
 	if ! certutil -A -d "$nssdb" -n "$nick" -t "C,," -i "$cert"; then
 		echo "warning: failed to import mitm CA into NSS at $pki (Chrome may still distrust); need certutil" >&2
+		_MITM_CA_NSS_FAILED=1
 		return 0
 	fi
 	return 0
 }
 
-MITM_CA="/opt/opensandbox/mitmproxy-ca-cert.pem"
-if is_truthy "${OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT:-}"; then
-	i=0
-	while [ "$i" -lt 300 ]; do
-		if [ -f "$MITM_CA" ] && [ -s "$MITM_CA" ]; then
-			break
-		fi
-		sleep 1
-		i=$((i + 1))
-	done
-	if [ ! -f "$MITM_CA" ] || [ ! -s "$MITM_CA" ]; then
-		echo "warning: timed out after 300s waiting for $MITM_CA (egress mitm CA export); continuing without system CA trust" >&2
+# Import the mitm CA into every JDK trust store found on the system so that Java
+# tooling (Maven, Gradle, HttpClient) trusts the credential-proxy MITM cert.
+# Best-effort: missing keytool or import failure only warns, never blocks.
+_jdk_import_ca() {
+	jh="$1"
+	cert="$2"
+	kt="$jh/bin/keytool"
+	[ -x "$kt" ] || return 0
+
+	alias_name="opensandbox-mitmproxy"
+
+	# Locate the cacerts keystore — JDK 9+ supports -cacerts flag,
+	# JDK 8 and some vendors require an explicit -keystore path.
+	ks=""
+	if [ -f "$jh/lib/security/cacerts" ]; then
+		ks="$jh/lib/security/cacerts"
+	elif [ -f "$jh/jre/lib/security/cacerts" ]; then
+		ks="$jh/jre/lib/security/cacerts"
 	else
-		echo "mitm CA ready at $MITM_CA after ${i}s"
-		if ! trust_mitm_ca "$MITM_CA"; then
+		return 0
+	fi
+
+	# Different JDK installations can link to the same system trust store.
+	# Bound the walk so a symlink cycle cannot hang bootstrap.
+	link_depth=0
+	while :; do
+		ks_dir="$(cd "$(dirname "$ks")" 2>/dev/null && pwd -P)" || return 0
+		ks="$ks_dir/$(basename "$ks")"
+		[ -L "$ks" ] || break
+		[ "$link_depth" -lt 40 ] || break
+		link_depth=$((link_depth + 1))
+		link_target="$(readlink "$ks" 2>/dev/null)" || break
+		case "$link_target" in
+		/*) ks="$link_target" ;;
+		*) ks="$ks_dir/$link_target" ;;
+		esac
+	done
+	case "
+${_SEEN_JDK_STORES:-}" in
+	*"
+$ks
+"*) return 0 ;;
+	esac
+
+	# Compare certificate content, not just the alias: a rotated CA must replace
+	# the old certificate. PEM normalization avoids an openssl dependency.
+	if current_cert="$("$kt" -exportcert -rfc -alias "$alias_name" -keystore "$ks" -storepass changeit 2>/dev/null)"; then
+		current_cert="$(printf '%s\n' "$current_cert" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | tr -d '[:space:]')"
+		incoming_cert="$(sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$cert" | tr -d '[:space:]')"
+		if [ -n "$incoming_cert" ] && [ "$current_cert" = "$incoming_cert" ]; then
+			_SEEN_JDK_STORES="${_SEEN_JDK_STORES:-}$ks
+"
+			return 0
+		fi
+		_sudo "$kt" -delete -alias "$alias_name" -keystore "$ks" -storepass changeit >/dev/null 2>&1
+	elif "$kt" -list -alias "$alias_name" -keystore "$ks" -storepass changeit >/dev/null 2>&1; then
+		# An alias can exist without an exportable certificate (e.g. SecretKeyEntry).
+		_sudo "$kt" -delete -alias "$alias_name" -keystore "$ks" -storepass changeit >/dev/null 2>&1
+	fi
+
+	if _sudo "$kt" -importcert -noprompt -trustcacerts \
+		-alias "$alias_name" \
+		-file "$cert" \
+		-keystore "$ks" \
+		-storepass changeit >/dev/null 2>&1; then
+		echo "imported mitm CA into JDK trust store at $ks"
+		_SEEN_JDK_STORES="${_SEEN_JDK_STORES:-}$ks
+"
+	else
+		echo "warning: failed to import mitm CA into $ks" >&2
+		_MITM_CA_JDK_FAILED=1
+	fi
+}
+
+_SEEN_JDKS=""
+_try_jdk() {
+	candidate="$1"
+	cert="$2"
+	[ -d "$candidate" ] || return 0
+	# Resolve to real path for dedup (POSIX: cd + pwd -P).
+	real="$(cd "$candidate" 2>/dev/null && pwd -P)" || return 0
+	case " $_SEEN_JDKS " in
+	*" $real "*) return 0 ;;
+	esac
+	_SEEN_JDKS="$_SEEN_JDKS $real"
+	_jdk_import_ca "$real" "$cert"
+}
+
+trust_mitm_ca_jdk() {
+	cert="$1"
+	_MITM_CA_JDK_FAILED=0
+	[ -f "$cert" ] || return 0
+	_SEEN_JDKS=""
+	_SEEN_JDK_STORES=""
+
+	# 1) $JAVA_HOME if set.
+	if [ -n "${JAVA_HOME:-}" ]; then
+		_try_jdk "$JAVA_HOME" "$cert"
+	fi
+
+	# 2) Scan well-known JDK directories.
+	for search_dir in /usr/lib/jvm /usr/java /opt/java; do
+		if [ -d "$search_dir" ]; then
+			for d in "$search_dir"/*/; do
+				[ -d "$d" ] && _try_jdk "${d%/}" "$cert"
+			done
+		fi
+	done
+	# Standalone tarball installs (e.g. /opt/jdk, /opt/jdk-21).
+	for d in /opt/jdk*; do
+		[ -d "$d" ] && _try_jdk "$d" "$cert"
+	done
+
+	# 3) Fallback: resolve `java` on PATH to its JAVA_HOME.
+	if command -v java >/dev/null 2>&1; then
+		java_bin="$(command -v java)"
+		# Follow symlinks (POSIX-portable loop).
+		while [ -L "$java_bin" ]; do
+			link_target="$(ls -l "$java_bin" 2>/dev/null | sed 's/.* -> //')"
+			case "$link_target" in
+			/*) java_bin="$link_target" ;;
+			*) java_bin="$(dirname "$java_bin")/$link_target" ;;
+			esac
+		done
+		# java_bin is now e.g. /usr/lib/jvm/java-17/bin/java → JAVA_HOME = grandparent
+		jh_candidate="$(dirname "$(dirname "$java_bin")")"
+		_try_jdk "$jh_candidate" "$cert"
+	fi
+
+	_SEEN_JDKS=""
+	_SEEN_JDK_STORES=""
+	return 0
+}
+
+# Content fingerprint for CA-rotation detection (sha256sum -> md5sum -> cksum).
+# Empty output on failure; never errors under inherited set -e/pipefail.
+_ca_fingerprint() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		{ sha256sum "$1" 2>/dev/null || true; } | awk '{print $1}'
+	elif command -v md5sum >/dev/null 2>&1; then
+		{ md5sum "$1" 2>/dev/null || true; } | awk '{print $1}'
+	else
+		{ cksum "$1" 2>/dev/null || true; } | awk '{print $1 "-" $2}'
+	fi
+	return 0
+}
+
+# Persist and validate the installed MITM CA trust state on the rootfs (not the
+# shared /opt/opensandbox volume) so a recreated container on the same Pod
+# always reinstalls, while a Firecracker RootfsOnly cold boot skips redundant
+# trust-store rebuilds only when the CA, merged bundle, system trust anchor,
+# NSS store, and every discovered JDK cacerts store all match the last install.
+_mitm_ca_marker_path() {
+	printf '%s\n' "${OPENSANDBOX_MITM_CA_STATE_FILE:-/var/lib/opensandbox/mitm-ca-installed.fp}"
+}
+
+_resolve_jdk_cacerts() {
+	_jh="$1"
+	[ -d "$_jh" ] || return 0
+	_real="$(cd "$_jh" 2>/dev/null && pwd -P)" || return 0
+	[ -x "$_real/bin/keytool" ] || return 0
+	_ks=""
+	if [ -f "$_real/lib/security/cacerts" ]; then
+		_ks="$_real/lib/security/cacerts"
+	elif [ -f "$_real/jre/lib/security/cacerts" ]; then
+		_ks="$_real/jre/lib/security/cacerts"
+	else
+		return 0
+	fi
+	_depth=0
+	while :; do
+		_ks_dir="$(cd "$(dirname "$_ks")" 2>/dev/null && pwd -P)" || return 0
+		_ks="$_ks_dir/$(basename "$_ks")"
+		[ -L "$_ks" ] || break
+		[ "$_depth" -lt 40 ] || break
+		_depth=$((_depth + 1))
+		_target="$(readlink "$_ks" 2>/dev/null)" || break
+		case "$_target" in
+		/*) _ks="$_target" ;;
+		*) _ks="$_ks_dir/$_target" ;;
+		esac
+	done
+	printf '%s\n' "$_ks"
+}
+
+_discover_jdk_cacerts() {
+	{
+		if [ -n "${JAVA_HOME:-}" ]; then
+			_resolve_jdk_cacerts "$JAVA_HOME"
+		fi
+		for _search_dir in /usr/lib/jvm /usr/java /opt/java; do
+			if [ -d "$_search_dir" ]; then
+				for _d in "$_search_dir"/*/; do
+					[ -d "$_d" ] && _resolve_jdk_cacerts "${_d%/}"
+				done
+			fi
+		done
+		for _d in /opt/jdk*; do
+			[ -d "$_d" ] && _resolve_jdk_cacerts "$_d"
+		done
+		if command -v java >/dev/null 2>&1; then
+			_java_bin="$(command -v java)"
+			while [ -L "$_java_bin" ]; do
+				_link_target="$(ls -l "$_java_bin" 2>/dev/null | sed 's/.* -> //')"
+				case "$_link_target" in
+				/*) _java_bin="$_link_target" ;;
+				*) _java_bin="$(dirname "$_java_bin")/$_link_target" ;;
+				esac
+			done
+			_resolve_jdk_cacerts "$(dirname "$(dirname "$_java_bin")")"
+		fi
+	} | sort -u
+}
+
+_mitm_ca_nss_state() {
+	_cert="$1"
+	if ! command -v certutil >/dev/null 2>&1; then
+		printf 'none\n'
+		return 0
+	fi
+	if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+		printf 'nohome\n'
+		return 0
+	fi
+	_pki="${HOME}/.pki/nssdb"
+	if [ -f "$_pki/cert9.db" ]; then
+		_nssdb="sql:$_pki"
+	elif [ -f "$_pki/cert8.db" ]; then
+		_nssdb="dbm:$_pki"
+	else
+		printf 'missing:%s\n' "$_pki"
+		return 0
+	fi
+	_exported="$(certutil -L -d "$_nssdb" -n "opensandbox-mitmproxy" -a 2>/dev/null || true)"
+	_exported_pem="$(printf '%s\n' "$_exported" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | tr -d '[:space:]')"
+	_incoming_pem="$(sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$_cert" 2>/dev/null | tr -d '[:space:]')"
+	if [ -n "$_incoming_pem" ] && [ "$_exported_pem" = "$_incoming_pem" ]; then
+		printf 'ok:%s\n' "$_nssdb"
+	else
+		printf 'missing:%s\n' "$_nssdb"
+	fi
+}
+
+_mitm_ca_trust_state() {
+	_cert="$1"
+	_ca_fp="$2"
+	_merged_file="${OPENSANDBOX_MERGED_CA_PATH:-/opt/opensandbox/merged-ca-certificates.pem}"
+	_merged_fp=""
+	if [ -f "$_merged_file" ] && [ -s "$_merged_file" ]; then
+		_merged_fp="$(_ca_fingerprint "$_merged_file")"
+	fi
+	_sys_tool="none"
+	_sys_anchor=""
+	if command -v update-ca-certificates >/dev/null 2>&1; then
+		_sys_tool="update-ca-certificates"
+		_sys_anchor="/usr/local/share/ca-certificates/opensandbox-mitmproxy-ca.crt"
+	elif command -v update-ca-trust >/dev/null 2>&1; then
+		_sys_tool="update-ca-trust"
+		_sys_anchor="/etc/pki/ca-trust/source/anchors/opensandbox-mitmproxy-ca.pem"
+	fi
+	_sys_fp="absent"
+	if [ -n "$_sys_anchor" ] && [ -f "$_sys_anchor" ] && [ -s "$_sys_anchor" ]; then
+		_sys_fp="$(_ca_fingerprint "$_sys_anchor")"
+	fi
+	printf 'ca=%s\n' "$_ca_fp"
+	printf 'merged=%s\n' "${_merged_fp:-absent}"
+	printf 'sys=%s:%s\n' "$_sys_tool" "$_sys_fp"
+	printf 'nss=%s\n' "$(_mitm_ca_nss_state "$_cert")"
+	_discover_jdk_cacerts | while IFS= read -r _ks_path; do
+		[ -n "$_ks_path" ] || continue
+		printf 'jdk=%s:%s\n' "$_ks_path" "$(_ca_fingerprint "$_ks_path")"
+	done
+}
+
+_write_mitm_ca_marker() {
+	_cert="$1"
+	_marker_fp="$2"
+	[ -n "$_marker_fp" ] || return 0
+	_marker_file="$(_mitm_ca_marker_path)"
+	_marker_dir="$(dirname "$_marker_file")"
+	_marker_state="$(_mitm_ca_trust_state "$_cert" "$_marker_fp")"
+	if ( mkdir -p "$_marker_dir" && printf '%s\n' "$_marker_state" > "$_marker_file.tmp.$$" && mv "$_marker_file.tmp.$$" "$_marker_file" ) 2>/dev/null; then
+		return 0
+	fi
+	if _sudo mkdir -p "$_marker_dir" 2>/dev/null; then
+		printf '%s\n' "$_marker_state" | _sudo tee "$_marker_file" >/dev/null 2>&1 || true
+	fi
+	return 0
+}
+
+_clear_mitm_ca_marker() {
+	_marker_file="$(_mitm_ca_marker_path)"
+	rm -f "$_marker_file" 2>/dev/null || _sudo rm -f "$_marker_file" 2>/dev/null || true
+	return 0
+}
+
+_mitm_ca_already_installed() {
+	_cert="$1"
+	_expected_fp="$2"
+	_merged_file="${OPENSANDBOX_MERGED_CA_PATH:-/opt/opensandbox/merged-ca-certificates.pem}"
+	_marker_file="$(_mitm_ca_marker_path)"
+	[ -n "$_expected_fp" ] || return 1
+	[ -f "$_merged_file" ] && [ -s "$_merged_file" ] || return 1
+	[ -r "$_marker_file" ] || return 1
+	_current_state="$(_mitm_ca_trust_state "$_cert" "$_expected_fp")"
+	case "$_current_state" in
+	*"nss=missing:"*) return 1 ;;
+	esac
+	_recorded_state="$(cat "$_marker_file" 2>/dev/null || true)"
+	[ "$_recorded_state" = "$_current_state" ]
+}
+
+# Wait until the exported mitm CA is safe to trust. Egress purges and
+# re-exports this file on every restart (issue #1370), so a file present when
+# polling starts may be stale from a previous generation: it is trusted only
+# after an observed purge or content change, or after surviving a full
+# unchanged stabilization window. A file seen absent at least once is fresh on
+# (re)appearance and trusted immediately. Setting MITM_CA_STABILIZE_WINDOW=0
+# disables the stabilization delay (for statically baked VM CAs that never
+# undergo sidecar purge/re-export). An egress starting later than the window
+# can still win the race; watch_mitm_ca heals that. Tunables:
+# MITM_CA_WAIT_TIMEOUT (300s), MITM_CA_STABILIZE_WINDOW (15s),
+# MITM_CA_POLL_INTERVAL (0.5s). Sets MITM_CA_WAIT_SECONDS; 1 on timeout.
+wait_for_trustworthy_mitm_ca() {
+	ca="$1"
+	_wait_timeout="${MITM_CA_WAIT_TIMEOUT:-300}"
+	_stabilize="${MITM_CA_STABILIZE_WINDOW:-15}"
+	_poll="${MITM_CA_POLL_INTERVAL:-0.5}"
+	_start="$(date +%s)"
+	_deadline=$((_start + _wait_timeout))
+	MITM_CA_WAIT_SECONDS=0
+
+	_purge_seen=""
+	_wait_baseline_fp=""
+	while :; do
+		_now="$(date +%s)"
+		if [ "$_now" -ge "$_deadline" ]; then
+			return 1
+		fi
+		if [ -f "$ca" ] && [ -s "$ca" ]; then
+			if [ "$_stabilize" -le 0 ] 2>/dev/null; then
+				# stabilization disabled (e.g. statically baked VM CA)
+				break
+			fi
+			_fp="$(_ca_fingerprint "$ca")"
+			[ -n "$_fp" ] || _fp="<unfingerprintable>"
+			if [ -n "$_purge_seen" ]; then
+				# (re)appearance after a purge: fresh export
+				break
+			elif [ -z "$_wait_baseline_fp" ]; then
+				# first sighting: start the stabilization window
+				_wait_baseline_fp="$_fp"
+				_baseline_since="$_now"
+			elif [ "$_fp" != "$_wait_baseline_fp" ]; then
+				# replaced in place: treat as fresh
+				break
+			elif [ $((_now - _baseline_since)) -ge "$_stabilize" ]; then
+				# unchanged for the whole window: trust it
+				break
+			fi
+		else
+			_purge_seen=1
+			_wait_baseline_fp=""
+		fi
+		sleep "$_poll" 2>/dev/null || sleep 1
+	done
+	MITM_CA_WAIT_SECONDS=$(( $(date +%s) - _start ))
+	return 0
+}
+
+# Self-heal for independent egress restarts: the CA rotates while bootstrap
+# never re-runs. Reinstall system/merged/NSS/JDK trust whenever the exported
+# CA changes (MITM_CA_WATCH_INTERVAL, 30s; <= 0 disables watching). The env
+# vars bootstrap exported point at refreshed files, so new processes heal
+# without re-exec; processes with in-memory trust (e.g. JVM cacerts) still
+# need a restart, which the change log line calls out. $2 is the fingerprint
+# of the already-installed generation (empty = nothing installed yet, so the
+# first export installs); a failed install pass is retried on the next poll,
+# up to three attempts per generation — permanent failures (e.g. read-only
+# trust store on a non-root image) stop the churn until the next rotation.
+watch_mitm_ca() {
+	ca="$1"
+	# Empty $2 means nothing trusted yet: the first export seen installs it.
+	_prev="${2:-}"
+	_interval="${MITM_CA_WATCH_INTERVAL:-30}"
+	if [ "$_interval" -le 0 ] 2>/dev/null; then
+		echo "mitm CA rotation watcher disabled (MITM_CA_WATCH_INTERVAL=${_interval})" >&2
+		return 0
+	fi
+	_watch_attempts=0
+	echo "watching mitm CA at $ca for rotation (interval ${_interval}s)" >&2
+	while :; do
+		sleep "$_interval" 2>/dev/null || sleep 1
+		_cur="$(_ca_fingerprint "$ca")"
+		if [ -z "$_cur" ]; then
+			# purged by a restarting egress; wait for the new export
+			continue
+		fi
+		if [ "$_cur" != "$_prev" ]; then
+			if [ "$_watch_attempts" -eq 0 ]; then
+				echo "mitm CA changed (egress restarted?); reinstalling trust stores; restart long-running processes that cached the old CA" >&2
+			fi
+			_watch_attempts=$((_watch_attempts + 1))
+			_install_failed=0
+			trust_mitm_ca "$ca" || _install_failed=1
+			trust_mitm_ca_nss "$ca" || true
+			trust_mitm_ca_jdk "$ca" || true
+			# NSS and JDK imports delete the previous alias first, so a
+			# failed one leaves that store trusting no generation: retry it
+			# like a failed system install.
+			if [ "${_MITM_CA_NSS_FAILED:-0}" -ne 0 ] || [ "${_MITM_CA_JDK_FAILED:-0}" -ne 0 ]; then
+				_install_failed=1
+			fi
+			if [ "$_install_failed" -eq 0 ]; then
+				if command -v _write_mitm_ca_marker >/dev/null 2>&1; then
+					_write_mitm_ca_marker "$ca" "$_cur"
+				fi
+				_prev="$_cur"
+				_watch_attempts=0
+			else
+				if command -v _clear_mitm_ca_marker >/dev/null 2>&1; then
+					_clear_mitm_ca_marker
+				fi
+				if [ "$_watch_attempts" -ge 3 ]; then
+					echo "warning: mitm CA install failed 3 times; giving up until the next rotation" >&2
+					_prev="$_cur"
+					_watch_attempts=0
+				else
+					echo "warning: mitm CA reinstall failed; retrying on the next poll" >&2
+				fi
+			fi
+		fi
+	done
+}
+
+MITM_CA="${OPENSANDBOX_MITM_CA:-/opt/opensandbox/mitmproxy-ca-cert.pem}"
+if is_truthy "${OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT:-}"; then
+	_baseline_fp=""
+	_mitm_already_installed=0
+	if wait_for_trustworthy_mitm_ca "$MITM_CA"; then
+		echo "mitm CA ready at $MITM_CA after ${MITM_CA_WAIT_SECONDS}s"
+		# Baseline for the rotation watcher: what we are about to trust. If
+		# egress swaps the file during the install pass below, the watcher
+		# sees the drift and reinstalls. A failed install leaves the
+		# baseline empty, so the watcher installs (and retries) on its
+		# first poll.
+		_baseline_fp="$(_ca_fingerprint "$MITM_CA")"
+		if _mitm_ca_already_installed "$MITM_CA" "$_baseline_fp"; then
+			OPENSANDBOX_MERGED_CA="${OPENSANDBOX_MERGED_CA_PATH:-/opt/opensandbox/merged-ca-certificates.pem}"
+			_mitm_already_installed=1
+			echo "mitm CA already installed in trust stores; skipping reinstall"
+		elif ! trust_mitm_ca "$MITM_CA"; then
 			echo "warning: failed to install mitm CA into system trust store; TLS interception may not work for system libraries" >&2
+			_baseline_fp=""
+		fi
+	else
+		echo "warning: timed out after ${MITM_CA_WAIT_TIMEOUT:-300}s waiting for $MITM_CA (egress mitm CA export); continuing without system CA trust" >&2
+		# Nothing was trusted; the watcher must install the first export it
+		# sees, never seed from whatever state the wait left behind.
+		_baseline_fp=""
+	fi
+
+	if [ "$_mitm_already_installed" -eq 0 ] && [ -f "$MITM_CA" ] && [ -s "$MITM_CA" ]; then
+		trust_mitm_ca_nss "$MITM_CA" || true
+		trust_mitm_ca_jdk "$MITM_CA" || true
+		if [ -n "$_baseline_fp" ] && [ "${_MITM_CA_NSS_FAILED:-0}" -eq 0 ] && [ "${_MITM_CA_JDK_FAILED:-0}" -eq 0 ]; then
+			_write_mitm_ca_marker "$MITM_CA" "$_baseline_fp"
+		else
+			_clear_mitm_ca_marker
+			# Let the watcher retry a failed NSS or JDK import on its first
+			# poll, as it does after a failed system install.
+			_baseline_fp=""
 		fi
 	fi
 
-	if [ -f "$MITM_CA" ] && [ -s "$MITM_CA" ]; then
-		trust_mitm_ca_nss "$MITM_CA" || true
-		export NODE_EXTRA_CA_CERTS="$MITM_CA"  # additive — Node appends to built-in roots
+	# Seed env paths unconditionally: they are stable across rotations, and
+	# clients started after the watcher (re)builds the files pick up the
+	# current CA even when the export was absent or purged at bootstrap
+	# time. (REQUESTS_CA_BUNDLE and SSL_CERT_FILE replace the default
+	# bundle, so they point at the merged roots, not the bare mitm CA.)
+	export NODE_EXTRA_CA_CERTS="$MITM_CA"
+	if [ -n "$OPENSANDBOX_MERGED_CA" ]; then
+		# Merged bundle built: point at the stable merged path.
+		export REQUESTS_CA_BUNDLE="${OPENSANDBOX_MERGED_CA_PATH:-/opt/opensandbox/merged-ca-certificates.pem}"
+		export SSL_CERT_FILE="$REQUESTS_CA_BUNDLE"
+	elif [ -f "$MITM_CA" ]; then
+		# Minimal image with no root bundle to merge: fall back to the bare
+		# mitm CA so transparent-MITM HTTPS still verifies.
+		echo "warning: merged CA bundle unavailable; REQUESTS_CA_BUNDLE/SSL_CERT_FILE will only contain the mitm CA" >&2
+		export REQUESTS_CA_BUNDLE="$MITM_CA"
+		export SSL_CERT_FILE="$MITM_CA"
+	else
+		# No export yet (wait timeout): the watcher builds the merged bundle
+		# on its first install, so seed the path it will appear at.
+		export REQUESTS_CA_BUNDLE="${OPENSANDBOX_MERGED_CA_PATH:-/opt/opensandbox/merged-ca-certificates.pem}"
+		export SSL_CERT_FILE="$REQUESTS_CA_BUNDLE"
+	fi
 
-		# REQUESTS_CA_BUNDLE and SSL_CERT_FILE replace the default bundle,
-		# so use merged roots (certifi/system CA + mitm CA).
-		if [ -n "$OPENSANDBOX_MERGED_CA" ] && [ -f "$OPENSANDBOX_MERGED_CA" ]; then
-			export REQUESTS_CA_BUNDLE="$OPENSANDBOX_MERGED_CA"
-			export SSL_CERT_FILE="$OPENSANDBOX_MERGED_CA"
-		else
-			echo "warning: merged CA bundle not available; REQUESTS_CA_BUNDLE/SSL_CERT_FILE will only contain the mitm CA" >&2
-			export REQUESTS_CA_BUNDLE="$MITM_CA"
-			export SSL_CERT_FILE="$MITM_CA"
-		fi
+	# Arm regardless of the export's current presence: it covers a purge or
+	# re-export racing the trust pass above, and a first export after a
+	# wait timeout (empty baseline installs the first thing that shows up).
+	# Setting MITM_CA_WATCH_INTERVAL<=0 disables the background watcher (e.g.
+	# for statically baked VM CAs).
+	if [ "${MITM_CA_WATCH_INTERVAL:-30}" -le 0 ] 2>/dev/null; then
+		echo "mitm CA rotation watcher disabled (MITM_CA_WATCH_INTERVAL=${MITM_CA_WATCH_INTERVAL})" >&2
+	else
+		watch_mitm_ca "$MITM_CA" "$_baseline_fp" &
 	fi
 fi
 
@@ -197,7 +893,6 @@ if [ -n "${EXECD_BOOTSTRAP_PRE_SCRIPT:-}" ]; then
 fi
 
 echo "starting OpenSandbox Execd daemon at $EXECD."
-$EXECD &
 
 # Allow chained shell commands (e.g., /test1.sh && /test2.sh)
 # Usage:
@@ -223,18 +918,168 @@ if [ -z "$SHELL_BIN" ]; then
 	fi
 fi
 
+# Resolve the user command into a concrete argv shared by both branches.
 if [ "$CMD" != "" ]; then
-	"$SHELL_BIN" -c "$CMD" &
-	CMD_PID=$!
+	set -- "$SHELL_BIN" -c "$CMD"
 elif [ $# -eq 0 ]; then
-	"$SHELL_BIN" &
-	CMD_PID=$!
-else
-	"$@" &
-	CMD_PID=$!
+	set -- "$SHELL_BIN"
 fi
 
-trap '_forward_signal TERM "$CMD_PID"' TERM
+# Init mode (OSEP-0018): exec into execd so it becomes PID 1 and supervises
+# the user command. The shell must exec, never background, or execd runs as a
+# subreaper without the kernel signal shield.
+if is_truthy "${EXECD_INIT:-}"; then
+	exec "$EXECD" --init -- "$@"
+fi
 
+if has_lifecycle_config; then
+	if ! LIFECYCLE_STATUS_DIR="$(
+		umask 077
+		mktemp -d "${TMPDIR:-/tmp}/execd-lifecycle.XXXXXX" 2>/dev/null \
+			|| mktemp -d /tmp/execd-lifecycle.XXXXXX 2>/dev/null
+	)"; then
+		echo "error: failed to create lifecycle startup status directory" >&2
+		exit 1
+	fi
+	LIFECYCLE_STATUS_FILE="${LIFECYCLE_STATUS_DIR}/status"
+	LIFECYCLE_WATCHDOG_TIMEOUT_FILE="${LIFECYCLE_STATUS_DIR}/watchdog-timeout"
+	LIFECYCLE_WATCHDOG_READY_FILE="${LIFECYCLE_STATUS_DIR}/watchdog-ready"
+	if ! (
+		umask 077 \
+			&& : > "$LIFECYCLE_STATUS_FILE" \
+			&& : > "$LIFECYCLE_WATCHDOG_TIMEOUT_FILE" \
+			&& : > "$LIFECYCLE_WATCHDOG_READY_FILE"
+	); then
+		echo "error: failed to create lifecycle startup synchronization files" >&2
+		exit 1
+	fi
+	"$EXECD" --lifecycle-startup-status-file "$LIFECYCLE_STATUS_FILE" &
+else
+	"$EXECD" &
+fi
+EXECD_PID=$!
+
+# The same long-running execd starts serving HTTP, executes preStart, then
+# reports the result through this private bootstrap synchronization file.
+if [ -n "$LIFECYCLE_STATUS_FILE" ]; then
+	if ! _start_execd_watchdog 10 "execd did not report lifecycle startup within 10 seconds"; then
+		echo "error: failed to arm the lifecycle startup watchdog" >&2
+		_forward_signal TERM "$EXECD_PID"
+		_forward_signal KILL "$EXECD_PID"
+		wait "$EXECD_PID" 2>/dev/null || true
+		EXECD_PID=""
+		exit 1
+	fi
+	_lifecycle_running_seen=0
+	_lifecycle_done=0
+	_prestart_status=""
+	while [ "$_lifecycle_done" -eq 0 ]; do
+		_lifecycle_status=""
+		if [ ! -r "$LIFECYCLE_STATUS_FILE" ]; then
+			echo "error: lifecycle startup status file is missing or unreadable" >&2
+			_lifecycle_done=1
+			_prestart_status=1
+		elif ! {
+			while IFS= read -r _lifecycle_status_line; do
+				_lifecycle_status="$_lifecycle_status_line"
+			done < "$LIFECYCLE_STATUS_FILE"
+		} 2>/dev/null; then
+			echo "error: lifecycle startup status file is missing or unreadable" >&2
+			_lifecycle_done=1
+			_prestart_status=1
+		fi
+		case "$_lifecycle_status" in
+		"running "*)
+			if [ "$_lifecycle_running_seen" -eq 0 ]; then
+				_prestart_timeout="${_lifecycle_status#running }"
+				# execd reports a validated positive timeout of at most ten digits.
+				# Treat any other value as corrupt before passing it to sleep.
+				case "$_prestart_timeout" in
+				"" | *[!0-9]* | 0* | ???????????*) _lifecycle_done=1; _prestart_status=1 ;;
+				*)
+					_lifecycle_running_seen=1
+					if ! _start_execd_watchdog \
+						"$_prestart_timeout" \
+						"lifecycle preStart did not report completion after its timeout and 10-second grace" \
+						1 10; then
+						_lifecycle_done=1
+						_prestart_status=1
+					fi
+					;;
+				esac
+			fi
+			;;
+		"done "*)
+			_prestart_status="${_lifecycle_status#done }"
+			_lifecycle_done=1
+			;;
+		"") ;;
+		*) _lifecycle_done=1; _prestart_status=1 ;;
+		esac
+		if [ "$_lifecycle_done" -ne 0 ]; then
+			break
+		fi
+		_execd_state="$(_process_state "$EXECD_PID")"
+		if ! kill -0 "$EXECD_PID" 2>/dev/null || [ "$_execd_state" = "Z" ]; then
+			_stop_execd_watchdog
+			set +e
+			wait "$EXECD_PID"
+			_execd_status=$?
+			set -e
+			EXECD_PID=""
+			_cleanup_lifecycle_status
+			if [ "$_execd_status" -eq 0 ]; then
+				_execd_status=1
+			fi
+			exit "$_execd_status"
+		fi
+		# Execd reports the effective hook timeout before running preStart. The
+		# external watchdog also bounds a hung daemon that never reports a result.
+		sleep 0.1 2>/dev/null || sleep 1
+	done
+	_stop_execd_watchdog
+	if [ -n "${LIFECYCLE_WATCHDOG_TIMEOUT_FILE:-}" ] \
+		&& [ -s "$LIFECYCLE_WATCHDOG_TIMEOUT_FILE" ]; then
+		_prestart_status=1
+	fi
+	case "${_prestart_status:-}" in
+	0 | [1-9] | [1-9][0-9] | [1-9][0-9][0-9])
+		if [ "$_prestart_status" -gt 255 ]; then
+			_prestart_status=1
+		fi
+		;;
+	*) _prestart_status=1 ;;
+	esac
+	if [ "$_prestart_status" -ne 0 ]; then
+		if ! _start_execd_watchdog 0 "" 0; then
+			echo "error: failed to start execd shutdown watchdog" >&2
+			# Failing to arm the bounded escalation path must not leave execd
+			# running or turn this failure path into an unbounded wait.
+			_forward_signal TERM "$EXECD_PID"
+			_forward_signal KILL "$EXECD_PID"
+		fi
+		set +e
+		wait "$EXECD_PID"
+		_execd_status=$?
+		_stop_execd_watchdog
+		set -e
+		EXECD_PID=""
+		_cleanup_lifecycle_status
+		echo "error: lifecycle preStart failed (status $_prestart_status, execd exit $_execd_status)" >&2
+		exit "$_prestart_status"
+	fi
+	_cleanup_lifecycle_status
+	unset _prestart_status _execd_status
+fi
+
+unset OPENSANDBOX_LIFECYCLE EXECD_LIFECYCLE_CONFIG
+"$@" &
+CMD_PID=$!
+
+set +e
 wait "$CMD_PID" 2>/dev/null
-exit $?
+CMD_STATUS=$?
+set -e
+_forward_signal TERM "$EXECD_PID"
+wait "$EXECD_PID" 2>/dev/null || true
+exit "$CMD_STATUS"

@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,14 @@
 package com.alibaba.opensandbox.sandbox.infrastructure.adapters.service
 
 import com.alibaba.opensandbox.sandbox.HttpClientProvider
+import com.alibaba.opensandbox.sandbox.api.execd.CommandApi
+import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ClientException
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
 import com.alibaba.opensandbox.sandbox.domain.exceptions.InvalidArgumentException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxInternalException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxRateLimitException
 import com.alibaba.opensandbox.sandbox.domain.models.execd.SECURE_ACCESS_HEADER
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.ExecutionHandlers
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunCommandRequest
@@ -29,17 +34,22 @@ import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toComma
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTimeoutPreemptively
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import java.io.File
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -74,6 +84,78 @@ class CommandsAdapterTest {
     fun tearDown() {
         mockWebServer.shutdown()
         httpClientProvider.close()
+    }
+
+    @Test
+    fun `background returns before EOF for shell and argv commands`() {
+        val complete = """data: {"timestamp":1,"type":"execution_complete","execution_time":1}""" + "\n\n"
+        for (argv in listOf(false, true)) {
+            mockWebServer.enqueue(
+                MockResponse().setBody(complete + "unread tail")
+                    .throttleBody(complete.toByteArray().size.toLong(), 3, TimeUnit.SECONDS),
+            )
+            val request = RunCommandRequest.builder().background(true)
+            if (argv) request.argv(listOf("sleep", "30")) else request.command("sleep 30")
+            assertTimeoutPreemptively(Duration.ofSeconds(2)) {
+                val result = commandsAdapter.run(request.build())
+                assertTrue(result.complete != null)
+                assertEquals(null, result.exitCode)
+            }
+            val pool = httpClientProvider.sseClient.connectionPool
+            assertEquals(pool.idleConnectionCount(), pool.connectionCount(), "response still holds a connection")
+        }
+    }
+
+    @Test
+    fun `foreground rejects EOF without a terminal event`() {
+        mockWebServer.enqueue(MockResponse().setBody("""data: {"type":"stdout","text":"partial","timestamp":1}""" + "\n\n"))
+
+        val error =
+            assertThrows<SandboxException> {
+                commandsAdapter.run(RunCommandRequest.builder().command("echo test").build())
+            }
+
+        assertEquals("COMMAND_STREAM_INCOMPLETE", error.error.code)
+    }
+
+    @Test
+    fun `foreground drains immediate EOF and output after terminal`() {
+        for (failure in listOf(false, true)) {
+            for (late in listOf(false, true)) {
+                val terminal =
+                    if (failure) {
+                        """data: {"timestamp":1,"type":"error","error":{"ename":"CommandExecError","evalue":"7"}}"""
+                    } else {
+                        """data: {"timestamp":1,"type":"execution_complete","execution_time":1}"""
+                    }
+                val output =
+                    listOf(
+                        """data: {"timestamp":1,"type":"stdout","text":"tail"}""",
+                        """data: {"timestamp":1,"type":"stderr","text":"error-tail"}""",
+                    )
+                val frames = if (late) listOf(terminal) + output else output + terminal
+                mockWebServer.enqueue(MockResponse().setChunkedBody(frames.joinToString("\n\n") + "\n\n", 7))
+                val result = commandsAdapter.run(RunCommandRequest.builder().command("echo test").build())
+                assertEquals(listOf("tail"), result.logs.stdout.map { it.text })
+                assertEquals(listOf("error-tail"), result.logs.stderr.map { it.text })
+                assertEquals(if (failure) 7 else 0, result.exitCode)
+            }
+        }
+    }
+
+    @Test
+    fun `native argv preserves arguments and omits shell command`() {
+        val argv = listOf("tool", "", "a b", "$" + "HOME", "x'y")
+        mockWebServer.enqueue(
+            MockResponse().setResponseCode(200).setBody("""{"type":"execution_complete","execution_time":1,"timestamp":1}""" + "\n"),
+        )
+        commandsAdapter.run(RunCommandRequest.builder().argv(argv).workingDirectory("$" + "DIR").build())
+        val body = Json.parseToJsonElement(mockWebServer.takeRequest().body.readUtf8()).jsonObject
+        assertTrue("command" !in body)
+        assertEquals(argv, body["argv"]?.jsonArray?.map { it.jsonPrimitive.content })
+        assertThrows<IllegalArgumentException> { RunCommandRequest.builder().command("echo").argv(argv).build() }
+        assertThrows<IllegalArgumentException> { RunCommandRequest.builder().argv(emptyList()).build() }
+        assertEquals("$" + "DIR", body["cwd"]?.jsonPrimitive?.content)
     }
 
     @Test
@@ -126,6 +208,7 @@ class CommandsAdapterTest {
         assertEquals("POST", recordedRequest.method)
         val requestBodyJson = Json.parseToJsonElement(recordedRequest.body.readUtf8()).jsonObject
         assertEquals("echo Hello", requestBodyJson["command"]?.jsonPrimitive?.content)
+        assertTrue("argv" !in requestBodyJson)
         assertEquals(1000, requestBodyJson["uid"]?.jsonPrimitive?.intOrNull)
         assertEquals(1000, requestBodyJson["gid"]?.jsonPrimitive?.intOrNull)
         val envs = requestBodyJson["envs"]?.jsonObject
@@ -133,6 +216,71 @@ class CommandsAdapterTest {
         assertEquals("debug", envs?.get("LOG_LEVEL")?.jsonPrimitive?.content)
         // Builder defaults background to false; request body always includes it
         assertEquals(false, requestBodyJson["background"]?.jsonPrimitive?.booleanOrNull)
+    }
+
+    @Test
+    fun `run should surface a handler failure`() {
+        val stdout = """data: {"type":"stdout","text":"first","timestamp":1}"""
+        val complete = """data: {"type":"execution_complete","execution_time":10,"timestamp":2}"""
+        mockWebServer.enqueue(MockResponse().setBody("$stdout\n\n$complete\n\n"))
+
+        val failure = IllegalStateException("stdout handler failed")
+        val receivedOutput = mutableListOf<String>()
+        var completed = false
+        val handlers =
+            ExecutionHandlers.builder()
+                .onStdout {
+                    receivedOutput.add(it.text)
+                    throw failure
+                }
+                .onExecutionComplete { completed = true }
+                .build()
+        val request = RunCommandRequest.builder().command("echo first").handlers(handlers).build()
+
+        val exception = assertThrows<SandboxInternalException> { commandsAdapter.run(request) }
+
+        assertSame(failure, exception.cause)
+        assertEquals(listOf("first"), receivedOutput)
+        assertEquals(false, completed)
+    }
+
+    @Test
+    fun `runInSession should surface a handler failure`() {
+        val complete = """data: {"type":"execution_complete","execution_time":10,"timestamp":1}"""
+        val stdout = """data: {"type":"stdout","text":"late","timestamp":2}"""
+        mockWebServer.enqueue(MockResponse().setBody("$complete\n\n$stdout\n\n"))
+
+        val failure = IllegalStateException("completion handler failed")
+        val receivedOutput = mutableListOf<String>()
+        val handlers =
+            ExecutionHandlers.builder()
+                .onExecutionComplete { throw failure }
+                .onStdout { receivedOutput.add(it.text) }
+                .build()
+        val request = RunInSessionRequest.builder().command("echo late").handlers(handlers).build()
+
+        val exception = assertThrows<SandboxInternalException> { commandsAdapter.runInSession("sess-123", request) }
+
+        assertSame(failure, exception.cause)
+        assertTrue(receivedOutput.isEmpty())
+    }
+
+    @Test
+    fun `run should keep the first event after a leading UTF-8 BOM`() {
+        val init = """data: {"type":"init","text":"cmd-1","timestamp":1}"""
+        val stdout = """data: {"type":"stdout","text":"hi","timestamp":2}"""
+        val complete = """data: {"type":"execution_complete","execution_time":3,"timestamp":3}"""
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("\uFEFF$init\n\n$stdout\n\n$complete\n\n"),
+        )
+
+        val execution = commandsAdapter.run(RunCommandRequest.builder().command("echo hi").build())
+
+        assertEquals("cmd-1", execution.id)
+        assertEquals("hi", execution.logs.stdout.single().text)
+        assertEquals(0, execution.exitCode)
     }
 
     @Test
@@ -190,29 +338,38 @@ class CommandsAdapterTest {
 
     @Test
     fun `run should infer non-zero exit code from command error event`() {
-        val initEvent = """{"type":"init","text":"cmd-123","timestamp":1672531200000}"""
-        val errorEvent =
-            """{"type":"error","error":{"ename":"CommandExecError",""" +
-                """"evalue":"7","traceback":["exit status 7"]},"timestamp":1672531201000}"""
+        for ((name, exitCode, traceback) in listOf(
+            Triple("CommandExecError", 7, "exit status 7"),
+            Triple("CommandTimeout", -1, "signal: terminated"),
+            Triple("CommandTimeout", 137, "exit status 137"),
+        )) {
+            val wireExitCode = if (name == "CommandTimeout") ",\"exit_code\":$exitCode" else ""
+            val initEvent = """{"type":"init","text":"cmd-123","timestamp":1672531200000}"""
+            val errorEvent =
+                """{"type":"error","error":{"ename":"$name",""" +
+                    """"evalue":"$exitCode","traceback":["$traceback"]$wireExitCode},"timestamp":1672531201000}"""
 
-        mockWebServer.enqueue(
-            MockResponse()
-                .setResponseCode(200)
-                .setBody("$initEvent\n$errorEvent\n"),
-        )
-
-        val execution =
-            commandsAdapter.run(
-                RunCommandRequest.builder()
-                    .command("exit 7")
-                    .build(),
+            mockWebServer.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody("$initEvent\n$errorEvent\n"),
             )
 
-        assertEquals("cmd-123", execution.id)
-        assertEquals(7, execution.exitCode)
-        assertEquals("CommandExecError", execution.error?.name)
-        assertEquals("7", execution.error?.value)
-        assertEquals(null, execution.complete)
+            val execution =
+                commandsAdapter.run(
+                    RunCommandRequest.builder()
+                        .command("exit 7")
+                        .build(),
+                )
+
+            assertEquals("cmd-123", execution.id)
+            assertEquals(exitCode, execution.exitCode)
+            assertEquals(if (name == "CommandTimeout") exitCode else null, execution.error?.exitCode)
+            assertEquals(name, execution.error?.name)
+            assertEquals(exitCode.toString(), execution.error?.value)
+            assertEquals(listOf(traceback), execution.error?.traceback)
+            assertEquals(null, execution.complete)
+        }
     }
 
     @Test
@@ -279,11 +436,12 @@ class CommandsAdapterTest {
 
     @Test
     fun `run should expose request id on api exception`() {
+        val responseBody = """{"code":"INTERNAL_ERROR","message":"boom"}"""
         mockWebServer.enqueue(
             MockResponse()
                 .setResponseCode(500)
                 .addHeader("X-Request-ID", "req-kotlin-123")
-                .setBody("""{"code":"INTERNAL_ERROR","message":"boom"}"""),
+                .setBody(responseBody),
         )
 
         val request = RunCommandRequest.builder().command("echo Hello").build()
@@ -291,6 +449,68 @@ class CommandsAdapterTest {
 
         assertEquals(500, ex.statusCode)
         assertEquals("req-kotlin-123", ex.requestId)
+        assertEquals(responseBody, ex.responseBody)
+    }
+
+    @Test
+    fun `run should map unstructured rate limit response metadata`() {
+        val responseBody = "slow down"
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(429)
+                .addHeader("X-Request-ID", "req-rate-limit")
+                .addHeader("Retry-After", "2")
+                .setBody(responseBody),
+        )
+
+        val request = RunCommandRequest.builder().command("echo Hello").build()
+        val ex = assertThrows(SandboxRateLimitException::class.java) { commandsAdapter.run(request) }
+
+        assertEquals(429, ex.statusCode)
+        assertEquals("RATE_LIMIT", ex.error.code)
+        assertEquals("req-rate-limit", ex.requestId)
+        assertEquals(Duration.ofSeconds(2), ex.retryAfter)
+        assertEquals(responseBody, ex.responseBody)
+        assertTrue(ex.isRetryable)
+    }
+
+    @Test
+    fun `getBackgroundCommandLogs should include response body in client error`() {
+        val responseBody = """{"code":"INVALID_ARGUMENT","message":"cursor must be positive"}"""
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(400)
+                .setBody(responseBody),
+        )
+
+        val ex =
+            assertThrows(SandboxApiException::class.java) {
+                commandsAdapter.getBackgroundCommandLogs("exec-1")
+            }
+
+        assertEquals(400, ex.statusCode)
+        assertTrue(ex.message!!.contains(responseBody))
+        assertEquals(responseBody, ex.responseBody)
+    }
+
+    @Test
+    fun `generated client error message should include response body`() {
+        val responseBody = """{"code":"QUOTA_EXCEEDED","message":"sandbox quota exceeded"}"""
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(400)
+                .setBody(responseBody),
+        )
+
+        val api =
+            CommandApi(
+                "http://${mockWebServer.hostName}:${mockWebServer.port}",
+                httpClientProvider.httpClient,
+            )
+
+        val ex = assertThrows(ClientException::class.java) { api.getCommandStatus("exec-1") }
+
+        assertTrue(ex.message!!.contains(responseBody))
     }
 
     @Test
@@ -356,6 +576,7 @@ data: {"type":"execution_complete","execution_time":100,"timestamp":167253120100
         assertEquals("POST", recordedRequest.method)
         val requestBodyJson = Json.parseToJsonElement(recordedRequest.body.readUtf8()).jsonObject
         assertEquals("echo Hello", requestBodyJson["command"]?.jsonPrimitive?.content)
+        assertTrue("argv" !in requestBodyJson)
         assertEquals("/workspace", requestBodyJson["cwd"]?.jsonPrimitive?.content)
         assertEquals(5000L, requestBodyJson["timeout"]?.jsonPrimitive?.content?.toLong())
     }
@@ -367,6 +588,34 @@ data: {"type":"execution_complete","execution_time":100,"timestamp":167253120100
                 Duration.ofSeconds(Long.MAX_VALUE).toCommandTimeoutMillis()
             }
         assertTrue(exception.message!!.contains("too large to represent in milliseconds"))
+    }
+
+    @Test
+    fun `run should not send a positive sub-millisecond timeout as zero`() {
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"type":"execution_complete","execution_time":1,"timestamp":1}""" + "\n"),
+        )
+
+        commandsAdapter.run(
+            RunCommandRequest.builder()
+                .command("sleep 10")
+                .timeout(Duration.ofNanos(500_000))
+                .build(),
+        )
+
+        val requestBodyJson = Json.parseToJsonElement(mockWebServer.takeRequest().body.readUtf8()).jsonObject
+        assertEquals(1L, requestBodyJson["timeout"]?.jsonPrimitive?.content?.toLong())
+    }
+
+    @Test
+    fun `command timeout conversion should round partial milliseconds up`() {
+        assertEquals(0L, Duration.ZERO.toCommandTimeoutMillis())
+        assertEquals(1L, Duration.ofNanos(1).toCommandTimeoutMillis())
+        assertEquals(1L, Duration.ofMillis(1).toCommandTimeoutMillis())
+        assertEquals(2L, Duration.ofNanos(1_000_001).toCommandTimeoutMillis())
+        assertEquals(5000L, Duration.ofSeconds(5).toCommandTimeoutMillis())
     }
 
     @Test
@@ -421,5 +670,102 @@ data: {"type":"execution_complete","execution_time":100,"timestamp":167253120100
     fun `deleteSession should reject blank session id`() {
         val ex = assertThrows(InvalidArgumentException::class.java) { commandsAdapter.deleteSession(" ") }
         assertEquals("session_id cannot be empty", ex.message)
+    }
+
+    // Round-trip cases: key/value to the exact line the snippet must append.
+    // Expected lines are hand-written literals.
+    private val roundTripCases =
+        listOf(
+            Triple("MY_TOKEN", "value", "MY_TOKEN='value'"),
+            Triple("MY_VAR", "line1\nline2 $" + "HOME \\path", "MY_VAR='line1\nline2 $" + "HOME \\path'"),
+            Triple("KV", "a=b=c", "KV='a=b=c'"),
+            Triple("EMPTY", "", "EMPTY=''"),
+            Triple("GREETING", "it's fine \"quoted\"\ttab", "GREETING=\"it's fine \\\"quoted\\\"\\ttab\""),
+            Triple("PATHY", "it's\nC:\\path", "PATHY=\"it's\\nC:\\\\path\""),
+        )
+
+    private fun runSetEnvSnippet(command: String): String {
+        Assumptions.assumeTrue(File("/bin/sh").exists(), "/bin/sh exists for POSIX round-trip test")
+        val envFile = File.createTempFile("opensandbox-setenv", ".env")
+        try {
+            val builder = ProcessBuilder("/bin/sh", "-c", command)
+            builder.environment()["EXECD_ENVS"] = envFile.absolutePath
+            builder.redirectErrorStream(true)
+            val process = builder.start()
+            val output = process.inputStream.readBytes().decodeToString()
+            check(process.waitFor(10, TimeUnit.SECONDS)) { "snippet timed out" }
+            check(process.exitValue() == 0) { "snippet failed: $output" }
+            return envFile.readText()
+        } finally {
+            envFile.delete()
+        }
+    }
+
+    @Test
+    fun `setEnv should append the env entry via the sandbox env file`() {
+        mockWebServer.enqueue(
+            MockResponse().setResponseCode(200).setBody("""{"type":"execution_complete","execution_time":1,"timestamp":1}""" + "\n"),
+        )
+
+        commandsAdapter.setEnv("MY_TOKEN", "value")
+
+        val body = Json.parseToJsonElement(mockWebServer.takeRequest().body.readUtf8()).jsonObject
+        // Hand-written golden literal (not derived from the implementation).
+        val expected =
+            "if [ -z \"\${EXECD_ENVS:-}\" ]; then printf '%s\\n' " +
+                "'EXECD_ENVS is not set; cannot persist environment variable MY_TOKEN' >&2; exit 1; fi\n" +
+                "mkdir -p \"\$(dirname \"\$EXECD_ENVS\")\"\n" +
+                "printf '%s\\n' 'MY_TOKEN='\\''value'\\''' >> \"\$EXECD_ENVS\""
+        assertEquals(expected, body["command"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `setEnv snippet should append well-formed lines round-tripped through sh`() {
+        for ((key, value, expectedLine) in roundTripCases) {
+            mockWebServer.enqueue(
+                MockResponse().setResponseCode(200).setBody("""{"type":"execution_complete","execution_time":1,"timestamp":1}""" + "\n"),
+            )
+            commandsAdapter.setEnv(key, value)
+            val command = Json.parseToJsonElement(mockWebServer.takeRequest().body.readUtf8()).jsonObject["command"]?.jsonPrimitive?.content
+            assertEquals(expectedLine + "\n", runSetEnvSnippet(command!!), "round-trip failed for $key")
+        }
+    }
+
+    @Test
+    fun `setEnv should reject invalid keys before any transport call`() {
+        for (key in listOf("", "1ABC", "MY-TOKEN", "MY TOKEN", "A=B", "A.B", "A\n")) {
+            val ex = assertThrows(InvalidArgumentException::class.java) { commandsAdapter.setEnv(key, "value") }
+            assertTrue(ex.message!!.contains("setEnv key must match"))
+        }
+        assertEquals(0, mockWebServer.requestCount)
+    }
+
+    @Test
+    fun `setEnv should throw with stderr when the append command fails`() {
+        val initEvent = """data: {"type":"init","text":"cmd-1","timestamp":1672531200000}"""
+        val stderrEvent =
+            """data: {"type":"stderr","text":"EXECD_ENVS is not set; cannot persist environment variable MY_TOKEN",""" +
+                """"timestamp":1672531200001}"""
+        val errorEvent =
+            """data: {"type":"error","error":{"ename":"CommandExecError","evalue":"1",""" +
+                """"traceback":["exit status 1"]},"timestamp":1672531200002}"""
+        mockWebServer.enqueue(
+            MockResponse().setResponseCode(200).setBody("$initEvent\n\n$stderrEvent\n\n$errorEvent\n\n"),
+        )
+
+        val ex = assertThrows(SandboxInternalException::class.java) { commandsAdapter.setEnv("MY_TOKEN", "value") }
+        assertTrue(ex.message!!.contains("commands.setEnv failed for 'MY_TOKEN'"))
+        assertTrue(ex.message!!.contains("EXECD_ENVS is not set"))
+    }
+
+    @Test
+    fun `setEnv should treat a dropped stream without completion as failure`() {
+        // Stream ends after init only: no execution_complete and no error
+        // event, so the append was never confirmed and must not report success.
+        mockWebServer.enqueue(
+            MockResponse().setResponseCode(200).setBody("""data: {"type":"init","text":"cmd-1","timestamp":1}""" + "\n\n"),
+        )
+
+        assertThrows(SandboxInternalException::class.java) { commandsAdapter.setEnv("MY_TOKEN", "value") }
     }
 }

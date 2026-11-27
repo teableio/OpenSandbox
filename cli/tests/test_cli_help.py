@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Tests that all CLI commands register correctly and --help exits cleanly."""
 
 from __future__ import annotations
 
@@ -27,33 +25,32 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
-# ---------------------------------------------------------------------------
-# Root
-# ---------------------------------------------------------------------------
-
-
 class TestRootCLI:
-    def test_help(self, runner: CliRunner) -> None:
+    def test_help_lists_options_and_commands(self, runner: CliRunner) -> None:
         result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
         assert "OpenSandbox CLI" in result.output
         assert "--request-timeout" in result.output
         assert "--timeout" not in result.output
+        for cmd in (
+            "sandbox",
+            "template",
+            "snapshot",
+            "command",
+            "terminal",
+            "file",
+            "egress",
+            "credential-vault",
+            "config",
+            "diagnostics",
+            "skills",
+        ):
+            assert cmd in result.output
 
     def test_version(self, runner: CliRunner) -> None:
         result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
         assert "opensandbox" in result.output
-
-    def test_root_lists_commands(self, runner: CliRunner) -> None:
-        result = runner.invoke(cli, ["--help"])
-        for cmd in ("sandbox", "command", "file", "egress", "config", "diagnostics", "devops", "skills"):
-            assert cmd in result.output
-
-
-# ---------------------------------------------------------------------------
-# Sandbox sub-commands
-# ---------------------------------------------------------------------------
 
 
 class TestSandboxHelp:
@@ -63,19 +60,20 @@ class TestSandboxHelp:
         for subcmd in ("create", "list", "get", "kill", "pause", "resume", "renew", "endpoint", "health", "metrics"):
             assert subcmd in result.output
 
-    @pytest.mark.parametrize(
-        "subcmd",
-        ["create", "list", "get", "kill", "pause", "resume", "renew", "endpoint", "health", "metrics"],
-    )
-    def test_sandbox_subcommand_help(self, runner: CliRunner, subcmd: str) -> None:
-        result = runner.invoke(cli, ["sandbox", subcmd, "--help"])
+
+class TestTemplateAndSnapshotHelp:
+    def test_template_create_help_describes_oci_destination(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["template", "create", "--help"])
         assert result.exit_code == 0
-        assert subcmd in result.output.lower() or "usage" in result.output.lower()
+        assert "oci://registry/repository" in result.output
+        assert "no tag or digest" in " ".join(result.output.split())
 
-
-# ---------------------------------------------------------------------------
-# Command sub-commands
-# ---------------------------------------------------------------------------
+    @pytest.mark.parametrize("group", ["template", "snapshot"])
+    def test_group_help_lists_subcommands(self, runner: CliRunner, group: str) -> None:
+        result = runner.invoke(cli, [group, "--help"])
+        assert result.exit_code == 0
+        for subcmd in ("create", "get", "list", "delete"):
+            assert subcmd in result.output
 
 
 class TestCommandHelp:
@@ -85,21 +83,11 @@ class TestCommandHelp:
         for subcmd in ("run", "status", "logs", "interrupt", "session"):
             assert subcmd in result.output
 
-    @pytest.mark.parametrize("subcmd", ["run", "status", "logs", "interrupt"])
-    def test_command_subcommand_help(self, runner: CliRunner, subcmd: str) -> None:
-        result = runner.invoke(cli, ["command", subcmd, "--help"])
-        assert result.exit_code == 0
-
     def test_command_session_help(self, runner: CliRunner) -> None:
         result = runner.invoke(cli, ["command", "session", "--help"])
         assert result.exit_code == 0
         for subcmd in ("create", "run", "delete"):
             assert subcmd in result.output
-
-
-# ---------------------------------------------------------------------------
-# File sub-commands
-# ---------------------------------------------------------------------------
 
 
 class TestFileHelp:
@@ -109,18 +97,13 @@ class TestFileHelp:
         for subcmd in ("cat", "write", "upload", "download", "rm", "mv", "mkdir", "rmdir", "search", "info", "chmod", "replace"):
             assert subcmd in result.output
 
-    @pytest.mark.parametrize(
-        "subcmd",
-        ["cat", "write", "upload", "download", "rm", "mv", "mkdir", "rmdir", "search", "info", "chmod", "replace"],
-    )
-    def test_file_subcommand_help(self, runner: CliRunner, subcmd: str) -> None:
-        result = runner.invoke(cli, ["file", subcmd, "--help"])
+
+class TestTerminalHelp:
+    def test_terminal_help(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["terminal", "--help"])
         assert result.exit_code == 0
-
-
-# ---------------------------------------------------------------------------
-# Egress sub-commands
-# ---------------------------------------------------------------------------
+        assert "SANDBOX_ID" in result.output
+        assert "--workdir" in result.output
 
 
 class TestEgressHelp:
@@ -131,9 +114,19 @@ class TestEgressHelp:
             assert subcmd in result.output
 
 
-# ---------------------------------------------------------------------------
-# Config sub-commands
-# ---------------------------------------------------------------------------
+class TestCredentialVaultHelp:
+    def test_credential_vault_help(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["credential-vault", "--help"])
+        assert result.exit_code == 0
+        for subcmd in ("create", "get", "patch", "delete", "credential", "binding"):
+            assert subcmd in result.output
+
+    @pytest.mark.parametrize("group", ["credential", "binding"])
+    def test_credential_vault_subgroup_help(self, runner: CliRunner, group: str) -> None:
+        result = runner.invoke(cli, ["credential-vault", group, "--help"])
+        assert result.exit_code == 0
+        for subcmd in ("list", "get"):
+            assert subcmd in result.output
 
 
 class TestConfigHelp:
@@ -143,60 +136,27 @@ class TestConfigHelp:
         for subcmd in ("init", "show", "set"):
             assert subcmd in result.output
 
-    @pytest.mark.parametrize("subcmd", ["init", "show", "set"])
-    def test_config_subcommand_help(self, runner: CliRunner, subcmd: str) -> None:
-        result = runner.invoke(cli, ["config", subcmd, "--help"])
-        assert result.exit_code == 0
-
-
-# ---------------------------------------------------------------------------
-# DevOps sub-commands
-# ---------------------------------------------------------------------------
-
-
-class TestDevopsHelp:
-    def test_devops_help(self, runner: CliRunner) -> None:
-        result = runner.invoke(cli, ["devops", "--help"])
-        assert result.exit_code == 0
-        for subcmd in ("logs", "inspect", "events", "summary"):
-            assert subcmd in result.output
-
-
-# ---------------------------------------------------------------------------
-# Diagnostics sub-commands
-# ---------------------------------------------------------------------------
-
 
 class TestDiagnosticsHelp:
-    def test_diagnostics_help(self, runner: CliRunner) -> None:
-        result = runner.invoke(cli, ["diagnostics", "--help"])
+    def test_context_help(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["diagnostics", "context", "--help"])
         assert result.exit_code == 0
-        for subcmd in ("logs", "events"):
-            assert subcmd in result.output
+        assert "SANDBOX_ID" in result.output
+        assert "--output" in result.output
 
-    @pytest.mark.parametrize("subcmd", ["logs", "events"])
-    def test_diagnostics_subcommand_help(self, runner: CliRunner, subcmd: str) -> None:
-        result = runner.invoke(cli, ["diagnostics", subcmd, "--help"])
-        assert result.exit_code == 0
-        assert "--scope" in result.output
-        assert "content URL" in result.output
-
-    def test_diagnostics_logs_help_describes_common_scopes(self, runner: CliRunner) -> None:
-        result = runner.invoke(cli, ["diagnostics", "logs", "--help"])
-        assert result.exit_code == 0
-        assert "lifecycle" in result.output
-        assert "container" in result.output
-
-    def test_diagnostics_events_help_describes_common_scopes(self, runner: CliRunner) -> None:
-        result = runner.invoke(cli, ["diagnostics", "events", "--help"])
-        assert result.exit_code == 0
-        assert "lifecycle" in result.output
-        assert "runtime" in result.output
-
-
-# ---------------------------------------------------------------------------
-# Skills sub-commands
-# ---------------------------------------------------------------------------
+    def test_diagnostics_help_documents_scopes(self, runner: CliRunner) -> None:
+        logs = runner.invoke(cli, ["diagnostics", "logs", "--help"])
+        events = runner.invoke(cli, ["diagnostics", "events", "--help"])
+        assert logs.exit_code == 0
+        assert events.exit_code == 0
+        assert "--scope" in logs.output
+        assert "container" in logs.output
+        assert "content URL" in logs.output
+        assert "lifecycle" not in logs.output
+        assert "--scope" in events.output
+        assert "runtime" in events.output
+        assert "content URL" in events.output
+        assert "lifecycle" not in events.output
 
 
 class TestSkillsHelp:

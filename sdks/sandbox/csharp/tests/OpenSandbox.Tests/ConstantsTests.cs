@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -87,5 +87,13 @@ public class ConstantsTests
     public void RequestIdHeader_ShouldBeCorrect()
     {
         Constants.RequestIdHeader.Should().Be("x-request-id");
+    }
+
+    // Regression: the User-Agent version is hand-maintained and must be bumped
+    // together with the package version. Update this expectation when releasing.
+    [Fact]
+    public void DefaultUserAgent_ShouldMatchPackageVersion()
+    {
+        Constants.DefaultUserAgent.Should().Be("OpenSandbox-CSharp-SDK/1.2.1");
     }
 }

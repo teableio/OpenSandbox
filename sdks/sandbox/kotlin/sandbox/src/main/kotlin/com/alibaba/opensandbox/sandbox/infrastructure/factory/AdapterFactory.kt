@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,12 @@ package com.alibaba.opensandbox.sandbox.infrastructure.factory
 import com.alibaba.opensandbox.sandbox.HttpClientProvider
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
 import com.alibaba.opensandbox.sandbox.domain.services.Commands
+import com.alibaba.opensandbox.sandbox.domain.services.CredentialVault
 import com.alibaba.opensandbox.sandbox.domain.services.Diagnostics
 import com.alibaba.opensandbox.sandbox.domain.services.Egress
 import com.alibaba.opensandbox.sandbox.domain.services.Filesystem
 import com.alibaba.opensandbox.sandbox.domain.services.Health
+import com.alibaba.opensandbox.sandbox.domain.services.IsolationService
 import com.alibaba.opensandbox.sandbox.domain.services.Metrics
 import com.alibaba.opensandbox.sandbox.domain.services.Sandboxes
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.CommandsAdapter
@@ -30,7 +32,9 @@ import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.Diagnosti
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.EgressAdapter
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.FilesystemAdapter
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.HealthAdapter
+import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.IsolatedSessionsAdapter
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.MetricsAdapter
+import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.NetworkPolicyAdapter
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.SandboxesAdapter
 
 /**
@@ -42,6 +46,11 @@ import com.alibaba.opensandbox.sandbox.infrastructure.adapters.service.Sandboxes
 internal class AdapterFactory(
     private val httpClientProvider: HttpClientProvider,
 ) {
+    data class EgressStack(
+        val egress: Egress,
+        val credentialVault: CredentialVault,
+    )
+
     fun createSandboxes(): Sandboxes {
         return SandboxesAdapter(httpClientProvider)
     }
@@ -58,8 +67,24 @@ internal class AdapterFactory(
         return CommandsAdapter(httpClientProvider, endpoint)
     }
 
-    fun createEgress(endpoint: SandboxEndpoint): Egress {
-        return EgressAdapter(httpClientProvider, endpoint)
+    fun createEgressStack(endpoint: SandboxEndpoint): EgressStack {
+        val adapter = EgressAdapter(httpClientProvider, endpoint)
+        return EgressStack(
+            egress = adapter,
+            credentialVault = adapter,
+        )
+    }
+
+    /**
+     * Builds an egress stack backed by the lifecycle control plane for
+     * template-backed sandboxes, which have no sandbox-side egress sidecar.
+     */
+    fun createNetworkPolicyStack(sandboxId: String): EgressStack {
+        val adapter = NetworkPolicyAdapter(httpClientProvider, sandboxId)
+        return EgressStack(
+            egress = adapter,
+            credentialVault = adapter,
+        )
     }
 
     fun createMetrics(endpoint: SandboxEndpoint): Metrics {
@@ -68,5 +93,9 @@ internal class AdapterFactory(
 
     fun createHealth(endpoint: SandboxEndpoint): Health {
         return HealthAdapter(httpClientProvider, endpoint)
+    }
+
+    fun createIsolatedSessions(endpoint: SandboxEndpoint): IsolationService {
+        return IsolatedSessionsAdapter(httpClientProvider, endpoint)
     }
 }

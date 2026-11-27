@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ package runtime
 import (
 	"errors"
 	"io"
+	"time"
 )
 
 // ptySession is an opaque stub on Windows (real type in pty_session.go, !windows).
@@ -32,6 +33,9 @@ type ptySession struct{}
 type PTYSession interface {
 	LockWS() bool
 	UnlockWS()
+	TakeoverWS(timeout time.Duration) bool
+	SetEvictHandler(fn func()) uint64
+	ClearEvictHandler(gen uint64)
 	IsRunning() bool
 	IsPTY() bool
 	ExitCode() int
@@ -41,20 +45,20 @@ type PTYSession interface {
 	WriteStdin(p []byte) (int, error)
 	AttachOutput() (io.Reader, io.Reader, func())
 	AttachOutputWithSnapshot(since int64) (io.Reader, io.Reader, func(), []byte, int64)
+	ReadOutput(since int64) ([]byte, int64, <-chan struct{})
 	SendSignal(name string)
 	ResizePTY(cols, rows uint16) error
 }
 
 var errPTYSessionNotSupported = errors.New("pty session is not supported on windows")
 
-// IsPTYSessionSupported reports whether PTY sessions are supported on this platform.
 func IsPTYSessionSupported() bool { return false }
 
 // NewPTYSessionID returns a new unique session ID (Windows stub).
 func NewPTYSessionID() string { return "" }
 
 // CreatePTYSession is not supported on Windows.
-func (c *Controller) CreatePTYSession(id, cwd string) (PTYSession, error) { return nil, nil } //nolint:revive
+func (c *Controller) CreatePTYSession(id, cwd, command string) (PTYSession, error) { return nil, nil } //nolint:revive
 
 // GetPTYSession is not supported on Windows.
 func (c *Controller) GetPTYSession(id string) PTYSession { return nil } //nolint:revive
@@ -73,10 +77,14 @@ func (c *Controller) GetPTYSessionStatus(id string) (bool, int64, error) { //nol
 
 func (s *ptySession) LockWS() bool                                 { return false }
 func (s *ptySession) UnlockWS()                                    {}
+func (s *ptySession) TakeoverWS(_ time.Duration) bool              { return false }
+func (s *ptySession) SetEvictHandler(_ func()) uint64              { return 0 }
+func (s *ptySession) ClearEvictHandler(_ uint64)                   {}
 func (s *ptySession) IsRunning() bool                              { return false }
 func (s *ptySession) IsPTY() bool                                  { return false }
 func (s *ptySession) ExitCode() int                                { return -1 }
 func (s *ptySession) Done() <-chan struct{}                        { return nil }
+func (s *ptySession) OutputDone() <-chan struct{}                  { return nil }
 func (s *ptySession) ReplayBuffer() *replayBuffer                  { return nil }
 func (s *ptySession) StartPTY() error                              { return errPTYSessionNotSupported }
 func (s *ptySession) StartPipe() error                             { return errPTYSessionNotSupported }
@@ -84,6 +92,9 @@ func (s *ptySession) WriteStdin(_ []byte) (int, error)             { return 0, e
 func (s *ptySession) AttachOutput() (io.Reader, io.Reader, func()) { return nil, nil, func() {} }
 func (s *ptySession) AttachOutputWithSnapshot(_ int64) (io.Reader, io.Reader, func(), []byte, int64) {
 	return nil, nil, func() {}, nil, 0
+}
+func (s *ptySession) ReadOutput(_ int64) ([]byte, int64, <-chan struct{}) {
+	return nil, 0, nil
 }
 func (s *ptySession) SendSignal(_ string)         {}
 func (s *ptySession) ResizePTY(_, _ uint16) error { return nil }

@@ -1,0 +1,208 @@
+# Copyright 2026 The OpenSandbox Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{- include "opensandbox-ingress-gateway.secureAccess.validate" . }}
+{{/* 兼容旧 values 缺少此节点，并按键回退以保留显式 0。 */}}
+{{- $httpPool := .Values.gateway.httpConnectionPool | default dict }}
+{{- $maxIdleConns := dig "maxIdleConns" 100 $httpPool }}
+{{- $maxIdleConnsPerHost := dig "maxIdleConnsPerHost" 2 $httpPool }}
+{{- $idleConnTimeout := dig "idleConnTimeout" "90s" $httpPool }}
+{{- if kindIs "invalid" $maxIdleConns }}
+{{- $maxIdleConns = 100 }}
+{{- end }}
+{{- if kindIs "invalid" $maxIdleConnsPerHost }}
+{{- $maxIdleConnsPerHost = 2 }}
+{{- end }}
+{{- if kindIs "invalid" $idleConnTimeout }}
+{{- $idleConnTimeout = "90s" }}
+{{- end }}
+{{/* 仅规范整数浮点数以避免科学计数法；非法输入保留给 flag 解析器拒绝。 */}}
+{{- if and (kindIs "float64" $maxIdleConns) (eq $maxIdleConns (floor $maxIdleConns)) }}
+{{- $maxIdleConns = int $maxIdleConns }}
+{{- end }}
+{{- if and (kindIs "float64" $maxIdleConnsPerHost) (eq $maxIdleConnsPerHost (floor $maxIdleConnsPerHost)) }}
+{{- $maxIdleConnsPerHost = int $maxIdleConnsPerHost }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "opensandbox-ingress-gateway.fullname" . }}
+  namespace: {{ include "opensandbox-ingress-gateway.namespace" . }}
+  labels:
+    {{- include "opensandbox-ingress-gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "opensandbox-ingress-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "opensandbox-ingress-gateway.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ingress-gateway
+        app.kubernetes.io/part-of: opensandbox
+        {{- with .Values.gateway.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.gateway.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "opensandbox-ingress-gateway.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.gateway.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: main
+          image: {{ include "opensandbox-ingress-gateway.image" . }}
+          {{- with .Values.gateway.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          args:
+            - "--namespace={{ .Values.gateway.dataplaneNamespace }}"
+            - "--port={{ .Values.gateway.port }}"
+            - "--provider-type={{ .Values.gateway.providerType }}"
+            - "--mode={{ .Values.gateway.gatewayRouteMode }}"
+            - "--log-level={{ .Values.gateway.logLevel }}"
+            {{/* 默认发布镜像尚不支持新参数；仅传入偏离默认值的配置，显式 0 仍保留。 */}}
+            {{- if ne (toString $maxIdleConns) "100" }}
+            - "--http-max-idle-conns={{ $maxIdleConns }}"
+            {{- end }}
+            {{- if ne (toString $maxIdleConnsPerHost) "2" }}
+            - "--http-max-idle-conns-per-host={{ $maxIdleConnsPerHost }}"
+            {{- end }}
+            {{- if ne (toString $idleConnTimeout) "90s" }}
+            - "--http-idle-conn-timeout={{ $idleConnTimeout }}"
+            {{- end }}
+            {{- if .Values.gateway.fastpathEndpoint }}
+            # FastPath gRPC endpoint for the fast-sandbox provider.
+            - "--fastpath-endpoint={{ .Values.gateway.fastpathEndpoint }}"
+            {{- end }}
+            {{- if .Values.gateway.fastSandboxNamespace }}
+            - {{ printf "--fast-sandbox-namespace=%s" .Values.gateway.fastSandboxNamespace | quote }}
+            {{- end }}
+            {{- $fastpathAuth := (.Values.gateway).fastpathAuth | default dict }}
+            {{- if or .Values.gateway.fastpathEndpoint (eq .Values.gateway.providerType "fast-sandbox") }}
+            {{- if $fastpathAuth.enabled }}
+            - "--fastpath-auth-enabled=true"
+            {{- with $fastpathAuth.serverName }}
+            - "--fastpath-tls-server-name={{ . }}"
+            {{- end }}
+            {{- if $fastpathAuth.caConfigMap }}
+            - "--fastpath-tls-ca-file=/etc/opensandbox/fastpath-ca/ca.crt"
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.gateway.activity.enabled }}
+            # OSEP-0024 activity tracking (same Redis as the server's [automation.idle_pause]).
+            - "--activity-enabled=true"
+            - "--activity-redis-dsn={{ .Values.gateway.activity.redisDsn }}"
+            - "--activity-min-interval={{ .Values.gateway.activity.minInterval }}"
+            - "--activity-ttl-seconds={{ .Values.gateway.activity.ttlSeconds }}"
+            {{- end }}
+            {{- if .Values.gateway.wake.enabled }}
+            # OSEP-0024 wake-on-access. Requires the policy-read RBAC below
+            # and a Fast Sandbox provider.
+            - "--wake-enabled=true"
+            - "--wake-park-budget={{ .Values.gateway.wake.parkBudget }}"
+            - "--wake-park-max={{ .Values.gateway.wake.parkMax }}"
+            - "--wake-restore-max={{ .Values.gateway.wake.restoreMax }}"
+            - "--wake-max-flight-lifetime={{ .Values.gateway.wake.maxFlightLifetime }}"
+            - "--wake-retry-interval={{ .Values.gateway.wake.retryInterval }}"
+            - "--wake-retry-factor={{ .Values.gateway.wake.retryFactor }}"
+            - "--wake-retry-jitter={{ .Values.gateway.wake.retryJitter }}"
+            {{- end }}
+{{- if .Values.gateway.secureAccess.keys }}
+            - "--secure-access-keys={{- range $i, $k := .Values.gateway.secureAccess.keys }}{{ if $i }},{{ end }}{{ $k.key_id }}={{ $k.key }}{{- end }}"
+{{- else if .Values.gateway.secureAccess.existingSecret }}
+            # Kubelet expands $(...) from the env below, so the key ring
+            # reaches the arg only at container start, never via the pod spec.
+            - "--secure-access-keys=$(OPENSANDBOX_SECURE_ACCESS_KEYS)"
+{{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.gateway.port }}
+              protocol: TCP
+          {{- if or .Values.gateway.env .Values.gateway.secureAccess.existingSecret }}
+          env:
+            {{- if .Values.gateway.secureAccess.existingSecret }}
+            - name: OPENSANDBOX_SECURE_ACCESS_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gateway.secureAccess.existingSecret | quote }}
+                  key: keys
+            {{- end }}
+            {{- with .Values.gateway.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /status.ok
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /status.ok
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          {{- if and $fastpathAuth.enabled $fastpathAuth.caConfigMap }}
+          volumeMounts:
+            - name: fastpath-ca
+              mountPath: /etc/opensandbox/fastpath-ca
+              readOnly: true
+          {{- end }}
+      {{- if and $fastpathAuth.enabled $fastpathAuth.caConfigMap }}
+      volumes:
+        - name: fastpath-ca
+          configMap:
+            name: {{ $fastpathAuth.caConfigMap }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+      {{- end }}

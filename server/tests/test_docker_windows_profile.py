@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -149,5 +149,24 @@ def test_validate_windows_resource_limits_rejects_values_below_minimum(
         validate_windows_resource_limits(resource_limits)
     assert exc_info.value.status_code == 400
     assert expected_message_fragment in exc_info.value.detail["message"]
+
+
+def test_validate_windows_resource_limits_rejects_mebibytes_under_the_minimum():
+    # ceil(3073/1024) is 4, so checking the rounded dockur env value accepts ~3Gi.
+    with pytest.raises(HTTPException) as exc_info:
+        validate_windows_resource_limits({"memory": "3073Mi"})
+    assert exc_info.value.status_code == 400
+    assert "resourceLimits.memory >= 4G" in exc_info.value.detail["message"]
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_windows_resource_limits({"disk": "65535Mi"})
+    assert exc_info.value.status_code == 400
+    assert "resourceLimits.disk" in exc_info.value.detail["message"]
+
+
+def test_validate_windows_resource_limits_accepts_exact_mebibyte_minimums():
+    validate_windows_resource_limits(
+        {"cpu": "2", "memory": "4096Mi", "disk": "65536Mi"}
+    )
 
 

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,9 +24,14 @@
 
 export type SandboxId = string;
 
+/**
+ * Registry authentication accepts only username and password on the lifecycle API.
+ * Additional properties are forwarded as supplied and rejected with HTTP 422.
+ */
 export interface ImageAuth extends Record<string, unknown> {
   username?: string;
   password?: string;
+  /** @deprecated Use password for registry tokens; the lifecycle API rejects this key. */
   token?: string;
 }
 
@@ -50,17 +55,23 @@ export type ResourceLimits = Record<string, string>;
 
 export type NetworkRuleAction = "allow" | "deny";
 
-export interface NetworkRule extends Record<string, unknown> {
-  /**
-   * Whether to allow or deny matching targets.
-   */
-  action: NetworkRuleAction;
-  /**
-   * FQDN or wildcard domain (e.g., "example.com", "*.example.com").
-   * IP/CIDR is not supported in the egress MVP.
-   */
-  target: string;
-}
+/**
+ * An egress rule: `target`, `ports`, or both. The union encodes that
+ * invariant at compile time (`target` used to be required).
+ *
+ * - `target`: FQDN, wildcard domain ("*.example.com"), IP, or CIDR.
+ * - `ports`: TCP destination ports (each 1-65535, at least one, at most 256
+ *   per rule — enforced server-side). Without a target the rule applies
+ *   across all IPv4/IPv6 destinations, but under `defaultAction: deny` the
+ *   DNS proxy only matches domain rules, so hostname lookups still fail —
+ *   this shape serves direct-IP clients.
+ * - A domain `target` combined with `ports` is rejected (domain rules have
+ *   no port dimension).
+ */
+export type NetworkRule = (
+  | { action: NetworkRuleAction; target: string; ports?: number[] }
+  | { action: NetworkRuleAction; target?: string; ports: number[] }
+) & Record<string, unknown>;
 
 export interface NetworkPolicy extends Record<string, unknown> {
   /**
@@ -73,9 +84,230 @@ export interface NetworkPolicy extends Record<string, unknown> {
   egress?: NetworkRule[];
 }
 
-// ============================================================================
-// Volume Models
-// ============================================================================
+
+export interface CredentialProxyConfig extends Record<string, unknown> {
+  /**
+   * Enable transparent MITM support required by Credential Vault injection.
+   */
+  enabled?: boolean;
+}
+
+export interface InlineCredentialSource extends Record<string, unknown> {
+  /**
+   * Credential source type. Defaults to "inline" when omitted.
+   */
+  type?: "inline";
+  /**
+   * Write-only inline credential value. This field is accepted in create/patch
+   * requests and is never present in Credential Vault state responses.
+   */
+  value: string;
+  endpoint?: never;
+}
+
+export interface ExchangeCredentialSource extends Record<string, unknown> {
+  type: "exchange";
+  /**
+   * Header-resolver endpoint (`unix:///path` or `https://host[:port]`).
+   */
+  endpoint: string;
+  value?: never;
+}
+
+export interface Credential extends Record<string, unknown> {
+  /**
+   * Sandbox-local credential name.
+   */
+  name: string;
+  /**
+   * Write-only credential source (inline material or exchange endpoint).
+   */
+  source: InlineCredentialSource | ExchangeCredentialSource;
+}
+
+export type CredentialMatchScheme = "https" | "http";
+
+export interface CredentialMatch extends Record<string, unknown> {
+  /**
+   * URL schemes to match. Defaults to HTTPS in the sidecar.
+   */
+  schemes?: CredentialMatchScheme[];
+  /**
+   * @deprecated Port is derived from scheme (https→443, http→80). Values other than 80 or 443 are rejected by the server.
+   */
+  ports?: number[];
+  /**
+   * Exact FQDNs or leftmost-label wildcards.
+   */
+  hosts: string[];
+  /**
+   * HTTP methods to match.
+   */
+  methods?: string[];
+  /**
+   * Request paths to match.
+   */
+  paths?: string[];
+}
+
+export type CredentialSubstitutionSurface = "path" | "query" | "header" | "body";
+
+export interface CredentialSubstitution extends Record<string, unknown> {
+  /**
+   * Name of the sandbox-local credential used as the replacement value.
+   */
+  credential: string;
+  /**
+   * Literal placeholder to replace.
+   */
+  placeholder: string;
+  /**
+   * Request surfaces where the placeholder may be replaced.
+   */
+  in: CredentialSubstitutionSurface[];
+}
+
+export interface CustomHeaderEntry extends Record<string, unknown> {
+  /**
+   * Header name to inject.
+   */
+  name: string;
+  /**
+   * Name of the sandbox-local credential to inject as this header value.
+   */
+  credential: string;
+}
+
+interface CredentialAuthSubstitutions {
+  substitutions?: CredentialSubstitution[];
+}
+
+export type CredentialAuth =
+  | ({
+      type: "bearer";
+      credential: string;
+    } & CredentialAuthSubstitutions)
+  | ({
+      type: "basic";
+      /**
+       * Credential containing pre-encoded base64(username:password).
+       */
+      credential: string;
+    } & CredentialAuthSubstitutions)
+  | ({
+      type: "apiKey";
+      name: string;
+      credential: string;
+    } & CredentialAuthSubstitutions)
+  | ({
+      type: "customHeaders";
+      headers: CustomHeaderEntry[];
+    } & CredentialAuthSubstitutions)
+  | ({
+      type: "passthrough";
+    } & CredentialAuthSubstitutions)
+  /**
+   * Typeless exchange form: only a credential reference (exchange-sourced).
+   * Static-only fields are `never` so they stay compile errors here.
+   */
+  | ({ credential: string } & {
+      type?: never;
+      name?: never;
+      headers?: never;
+      substitutions?: never;
+    });
+
+export interface CredentialBinding extends Record<string, unknown> {
+  /**
+   * Sandbox-local binding name.
+   */
+  name: string;
+  /**
+   * Request match for this binding.
+   */
+  match: CredentialMatch;
+  /**
+   * Auth injection rule for this binding.
+   */
+  auth: CredentialAuth;
+}
+
+export interface CredentialMetadata {
+  name: string;
+  /**
+   * Source type only (`inline` or `exchange`); never source material.
+   */
+  sourceType: string;
+  revision: number;
+}
+
+export interface CredentialAuthMetadata {
+  /**
+   * Static auth kind; omitted for the typeless exchange form.
+   */
+  type?: string;
+  /**
+   * Public auth parameter name, such as an API key header name.
+   */
+  name?: string;
+  /**
+   * Exchange-sourced credential reference, typeless form only.
+   */
+  credential?: string;
+}
+
+export interface CredentialBindingMetadata {
+  name: string;
+  revision: number;
+  match?: CredentialMatch;
+  /**
+   * Sanitized auth metadata. Plaintext credential references and values are not returned.
+   */
+  auth?: CredentialAuthMetadata;
+}
+
+export interface CredentialVaultState {
+  revision: number;
+  credentials: CredentialMetadata[];
+  bindings: CredentialBindingMetadata[];
+}
+
+export interface CredentialListResponse {
+  revision: number;
+  credentials: CredentialMetadata[];
+}
+
+export interface CredentialBindingListResponse {
+  revision: number;
+  bindings: CredentialBindingMetadata[];
+}
+
+export interface CredentialMutationSet extends Record<string, unknown> {
+  add?: Credential[];
+  replace?: Credential[];
+  delete?: string[];
+}
+
+export interface CredentialBindingMutationSet extends Record<string, unknown> {
+  add?: CredentialBinding[];
+  replace?: CredentialBinding[];
+  delete?: string[];
+}
+
+export interface CredentialVaultCreateRequest extends Record<string, unknown> {
+  credentials: Credential[];
+  bindings: CredentialBinding[];
+}
+
+export interface CredentialVaultPatchRequest extends Record<string, unknown> {
+  /**
+   * Optional optimistic concurrency guard.
+   */
+  expectedRevision?: number;
+  credentials?: CredentialMutationSet;
+  bindings?: CredentialBindingMutationSet;
+}
+
 
 /**
  * Host path bind mount backend.
@@ -110,7 +342,8 @@ export interface PVC extends Record<string, unknown> {
    */
   createIfNotExists?: boolean;
   /**
-   * When true, delete auto-created volume on sandbox deletion (Docker-only).
+   * When true, the auto-created volume (Docker named volume or Kubernetes PVC)
+   * is removed on sandbox deletion. Pre-existing volumes are never removed.
    */
   deleteOnSandboxTermination?: boolean;
   /**
@@ -225,6 +458,24 @@ export interface SandboxStatus extends Record<string, unknown> {
   message?: string;
 }
 
+/**
+ * Current runtime-confirmed Pool allocation for a sandbox.
+ */
+export interface AllocationSummary extends Record<string, unknown> {
+  /**
+   * Confirmed allocation mode.
+   */
+  mode: "pool";
+  /**
+   * Concrete Pool reference currently allocated to the sandbox.
+   */
+  poolRef: string;
+  /**
+   * Current confirmed allocation state.
+   */
+  state: "allocated";
+}
+
 export interface SandboxInfo extends Record<string, unknown> {
   id: SandboxId;
   image?: ImageSpec;
@@ -232,7 +483,12 @@ export interface SandboxInfo extends Record<string, unknown> {
   platform?: PlatformSpec;
   entrypoint: string[];
   metadata?: Record<string, string>;
+  extensions?: Record<string, string>;
   status: SandboxStatus;
+  /**
+   * Current runtime-confirmed Pool allocation, when available.
+   */
+  allocation?: AllocationSummary;
   /**
    * Sandbox creation time.
    */
@@ -241,6 +497,108 @@ export interface SandboxInfo extends Record<string, unknown> {
    * Sandbox expiration time (server-side TTL).
    */
   expiresAt: Date | null;
+}
+
+export interface LifecycleHook extends Record<string, unknown> {
+  /** Command and arguments executed without implicit shell expansion. */
+  command: string[];
+  /** Maximum execution time in seconds, up to 3 hours (10800 seconds). Defaults to 60. */
+  timeoutSeconds?: number;
+}
+
+export interface PeriodicLifecycleHook extends Record<string, unknown> {
+  /** Name unique among periodic hooks in this sandbox. */
+  name: string;
+  /** Five-field cron expression or descriptor such as `@hourly` or `@every 30s`. */
+  schedule: string;
+  /** Command and arguments executed without implicit shell expansion. */
+  command: string[];
+  /** Maximum execution time in seconds, up to 300. Defaults to 60. */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Application-declared activity probe (OSEP-0024).
+ *
+ * Endpoint inside the sandbox that answers `{"active": bool, "message"?: string}`
+ * with 200 while work is in progress. When the sandbox is otherwise idle, the
+ * server issues `GET {path}` on `{port}`; a busy answer counts as activity and
+ * resets the idle clock, while an explicit "not active", any failure, or a
+ * timeout records nothing.
+ */
+export interface ActivityProbe extends Record<string, unknown> {
+  /** Sandbox port serving the probe endpoint. */
+  port: number;
+  /**
+   * Absolute HTTP path of the probe endpoint. Must start with `/` and must not
+   * contain whitespace or control characters.
+   */
+  path: string;
+  /** Probe request budget in seconds (1-10). Defaults to 2. */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Idle behavior declared by the sandbox (OSEP-0024, fast-sandbox only).
+ *
+ * With `idleTimeoutSeconds`, the sandbox is auto-paused after that many seconds
+ * without ingress-observed activity. Without it, the policy is wake-only: the
+ * sandbox is never auto-paused, but a (manually) paused sandbox wakes on access.
+ * Omitting the whole policy preserves non-automated behavior exactly.
+ */
+export interface IdlePolicy extends Record<string, unknown> {
+  /**
+   * Idle threshold X in seconds (30-86400): the sandbox is auto-paused after X
+   * continuously idle seconds. Required together with `onIdle`; absent together
+   * with it means a wake-only policy.
+   */
+  idleTimeoutSeconds?: number;
+  /**
+   * Action taken at the idle threshold. Only `pause` exists today. Required
+   * with, and only valid with, `idleTimeoutSeconds`.
+   */
+  onIdle?: "pause";
+  /** Whether incoming traffic may wake the sandbox from `Paused`. Defaults to true. */
+  wakeOnAccess?: boolean;
+  /** Application-declared activity probe (relevant only with auto-pause). */
+  activeProbe?: ActivityProbe;
+}
+
+/**
+ * Renew-on-access behavior (OSEP-0009): observed access moves the expiration
+ * to `max(now + extendSeconds, current)`. Control-plane policy; supersedes the
+ * deprecated `extensions["access.renew.extend.seconds"]` key.
+ */
+export interface RenewalPolicy extends Record<string, unknown> {
+  /**
+   * Extension window X in seconds (300-86400) for each access-driven renewal.
+   */
+  extendSeconds: number;
+}
+
+/** Extensible container for sandbox lifecycle configuration. */
+export interface SandboxLifecycle extends Record<string, unknown> {
+  /**
+   * Runs after execd is ready and before the user entrypoint on every container
+   * start. A failed or timed-out hook prevents the user entrypoint from starting.
+   */
+  preStart?: LifecycleHook;
+  /**
+   * Scheduled hooks run while the sandbox is running. Runs of the same named hook
+   * never overlap; a scheduled run is skipped while its previous run is active.
+   */
+  periodic?: PeriodicLifecycleHook[];
+  /**
+   * Auto-pause and wake-on-access behavior (OSEP-0024). Supported only by the
+   * fast-sandbox backend; other backends reject the field. Control-plane
+   * policy: it never reaches the guest.
+   */
+  idlePolicy?: IdlePolicy;
+  /**
+   * Renew-on-access behavior (OSEP-0009). Control-plane policy; supersedes
+   * the deprecated `extensions["access.renew.extend.seconds"]` key.
+   */
+  renewalPolicy?: RenewalPolicy;
 }
 
 export interface CreateSandboxRequest extends Record<string, unknown> {
@@ -256,13 +614,19 @@ export interface CreateSandboxRequest extends Record<string, unknown> {
    * Timeout in seconds (server semantics).
    */
   timeout?: number | null;
-  resourceLimits: ResourceLimits;
+  resourceLimits?: ResourceLimits;
+  resourceRequests?: ResourceLimits;
   env?: Record<string, string>;
   metadata?: Record<string, string>;
+  lifecycle?: SandboxLifecycle;
   /**
    * Optional outbound network policy for the sandbox.
    */
   networkPolicy?: NetworkPolicy;
+  /**
+   * Optional Credential Vault proxy startup settings.
+   */
+  credentialProxy?: CredentialProxyConfig;
   /**
    * Optional list of volume mounts for persistent storage.
    */
@@ -270,11 +634,41 @@ export interface CreateSandboxRequest extends Record<string, unknown> {
   extensions?: Record<string, unknown>;
 }
 
+export interface CreateSandboxFromTemplateRequest extends Record<string, unknown> {
+  /**
+   * Succeeded fsb template to create the sandbox from.
+   *
+   * Template mode fixes the workload shape on the server: only metadata,
+   * network policy, extensions and the idle policy may accompany the template
+   * id, and the timeout is required.
+   */
+  templateId: string;
+  /**
+   * Sandbox timeout in seconds (server semantics). Required in template mode.
+   */
+  timeout: number;
+  metadata?: Record<string, string>;
+  /**
+   * Optional outbound network policy for the sandbox.
+   */
+  networkPolicy?: NetworkPolicy;
+  /**
+   * Optional idle behavior (OSEP-0024, fast-sandbox only). Control-plane
+   * state, not workload shape, so template mode accepts it.
+   */
+  idlePolicy?: IdlePolicy;
+  /**
+   * Opaque extension parameters passed through to the server as-is.
+   */
+  extensions?: Record<string, string>;
+}
+
 export interface CreateSandboxResponse extends Record<string, unknown> {
   id: SandboxId;
   status: SandboxStatus;
   platform?: PlatformSpec;
   metadata?: Record<string, string>;
+  extensions?: Record<string, string>;
   /**
    * Sandbox expiration time after creation.
    */
@@ -288,6 +682,13 @@ export interface CreateSandboxResponse extends Record<string, unknown> {
 
 export type SnapshotState = "Creating" | "Deleting" | "Ready" | "Failed" | string;
 
+/**
+ * Artifact class of a snapshot: `full` is the runtime's most complete capture
+ * (memory and process state on the fast-sandbox backend; filesystem-only on
+ * Docker and Kubernetes), `rootfsOnly` preserves only the writable filesystem.
+ */
+export type SnapshotMode = "full" | "rootfsOnly";
+
 export interface SnapshotStatus extends Record<string, unknown> {
   state: SnapshotState;
   reason?: string;
@@ -299,12 +700,23 @@ export interface SnapshotInfo extends Record<string, unknown> {
   id: string;
   sandboxId: SandboxId;
   name?: string;
+  /**
+   * Artifact class of the snapshot. Built-in HTTP responses always populate
+   * it (absent fields are normalized to `full`), but it stays optional so
+   * custom `Sandboxes` adapters and existing fixtures keep type-checking.
+   */
+  mode?: SnapshotMode;
   status: SnapshotStatus;
   createdAt: Date;
 }
 
 export interface CreateSnapshotRequest extends Record<string, unknown> {
   name?: string;
+  /**
+   * What the snapshot persists. Omit to let the server apply its default
+   * (`full`) — the field stays off the wire for servers that predate it.
+   */
+  mode?: SnapshotMode;
 }
 
 export interface ListSnapshotsResponse extends Record<string, unknown> {
@@ -345,6 +757,37 @@ export interface Endpoint extends Record<string, unknown> {
    * (e.g. when the server requires them for routing or auth). Omit or empty if not required.
    */
   headers?: Record<string, string>;
+  /**
+   * Origin of the sandbox taken from the server's `OPEN-SANDBOX-ORIGIN`
+   * response header (see {@link SandboxOrigin}). Omitted when the server
+   * does not send it.
+   */
+  origin?: string;
+}
+
+/**
+ * Origin backing a sandbox.
+ *
+ * The protocol defines a single origin value: `template` (reported by the
+ * server via the `OPEN-SANDBOX-ORIGIN` response header, and set locally when
+ * the sandbox was explicitly created from a template). Anything else -
+ * including sandboxes created from an image or a snapshot - is `unknown`.
+ *
+ * The server may introduce new values in future versions; treat a missing or
+ * unknown value as "not template-backed" and keep using the egress sidecar.
+ */
+export enum SandboxOrigin {
+  /**
+   * Runs on a fsb golden-image template (no sandbox-side egress sidecar;
+   * egress policy and the Credential Vault go through the lifecycle
+   * control plane).
+   */
+  TEMPLATE = "template",
+  /**
+   * The origin could not be determined (create from an image or snapshot,
+   * or an older server that does not send the header).
+   */
+  UNKNOWN = "unknown",
 }
 
 export interface ListSandboxesParams {
@@ -364,6 +807,7 @@ export interface ListSandboxesParams {
 
 export interface ListSnapshotsParams {
   sandboxId?: SandboxId;
+  name?: string;
   states?: string[];
   page?: number;
   pageSize?: number;

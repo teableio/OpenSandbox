@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,17 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/alibaba/opensandbox/internal/safego"
 	"k8s.io/apimachinery/pkg/util/wait"
 
+	"github.com/alibaba/opensandbox/execd/pkg/flag"
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 	"github.com/alibaba/opensandbox/execd/pkg/runtime"
+	"github.com/alibaba/opensandbox/execd/pkg/telemetry"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
@@ -35,6 +38,10 @@ var sseHeaders = map[string]string{
 	"Connection":        "keep-alive",
 	"X-Accel-Buffering": "no",
 }
+
+// ssePingInterval is the SSE keepalive period; it must stay well below
+// gateway idle timeouts so silent commands cannot get the stream reaped.
+var ssePingInterval = 3 * time.Second
 
 // setupSSEResponse is idempotent: once headers are committed, subsequent calls
 // no-op. Callers that need the headers up front (e.g. long-running streaming
@@ -53,9 +60,31 @@ func (c *basicController) setupSSEResponse() {
 	})
 }
 
+// streamStarted reports whether the response has been committed. It takes the
+// event write lock because the ping goroutine may be writing concurrently.
+func (c *basicController) streamStarted() bool {
+	c.chunkWriter.Lock()
+	defer c.chunkWriter.Unlock()
+	return c.ctx.Writer.Written()
+}
+
 // setServerEventsHandler adapts runtime callbacks to SSE events.
-func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context) runtime.ExecuteResultHook {
-	return runtime.ExecuteResultHook{
+//
+// It returns the hooks and a cleanup function. The cleanup function blocks
+// until the background ping goroutine has fully stopped. Callers MUST invoke
+// the cleanup function before their handler returns so that no goroutine
+// races against the response-writer close that Go's net/http performs once
+// the handler exits.
+//
+// Typical usage:
+//
+//	hooks, stopSSE := c.setServerEventsHandler(ctx)
+//	defer func() { cancel(); stopSSE() }()
+func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context) (runtime.ExecuteResultHook, func()) {
+	var pingWg sync.WaitGroup
+
+	hooks := runtime.ExecuteResultHook{
+		OnCommandAllocated: func(commandID string) { c.commandID = commandID },
 		OnExecuteInit: func(session string) {
 			event := model.ServerStreamEvent{
 				Type:      model.StreamEventTypeInit,
@@ -65,7 +94,11 @@ func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context)
 			payload := event.ToJSON()
 			c.writeSingleEvent("OnExecuteInit", payload, true, event.Summary())
 
-			safego.Go(func() { c.ping(ctx) })
+			pingWg.Add(1)
+			safego.Go(func() {
+				defer pingWg.Done()
+				c.ping(ctx)
+			})
 		},
 		OnExecuteResult: func(result map[string]any, count int) {
 			var mutated map[string]any
@@ -101,24 +134,18 @@ func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context)
 			}
 		},
 		OnExecuteComplete: func(executionTime time.Duration) {
-			event := model.ServerStreamEvent{
-				Type:          model.StreamEventTypeComplete,
-				ExecutionTime: executionTime.Milliseconds(),
-				Timestamp:     time.Now().UnixMilli(),
-			}
-			payload := event.ToJSON()
-			c.writeSingleEvent("OnExecuteComplete", payload, true, event.Summary())
+			c.writeExecutionComplete(executionTime, nil)
 		},
 		OnExecuteError: func(err *execute.ErrorOutput) {
 			if err == nil {
 				return
 			}
 
-			event := model.ServerStreamEvent{
+			event := sseLegacyCompatEvent(model.ServerStreamEvent{
 				Type:      model.StreamEventTypeError,
 				Error:     err,
 				Timestamp: time.Now().UnixMilli(),
-			}
+			})
 			payload := event.ToJSON()
 			c.writeSingleEvent("OnExecuteError", payload, true, event.Summary())
 		},
@@ -142,7 +169,7 @@ func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context)
 				Timestamp: time.Now().UnixMilli(),
 			}
 			payload := event.ToJSON()
-			c.writeSingleEvent("OnExecuteStdout", payload, true, event.Summary())
+			c.writeSingleEvent("OnExecuteStdout", payload, false, event.Summary())
 		},
 		OnExecuteStderr: func(text string) {
 			if text == "" {
@@ -155,20 +182,119 @@ func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context)
 				Timestamp: time.Now().UnixMilli(),
 			}
 			payload := event.ToJSON()
-			c.writeSingleEvent("OnExecuteStderr", payload, true, event.Summary())
+			c.writeSingleEvent("OnExecuteStderr", payload, false, event.Summary())
 		},
+	}
+
+	stopSSE := func() {
+		pingWg.Wait()
+	}
+
+	return hooks, stopSSE
+}
+
+// executionTracker follows one streamed execution: it records the execution
+// duration metric once and closes done when the terminal SSE event (complete
+// or error) has been written. Handlers wait on done only as a safety check
+// and return as soon as it closes, to avoid fixed tail latency.
+type executionTracker struct {
+	ctx        context.Context
+	operation  string
+	start      time.Time
+	recordOnce sync.Once
+	doneOnce   sync.Once
+	done       chan struct{}
+}
+
+func newExecutionTracker(ctx context.Context, operation string) *executionTracker {
+	return &executionTracker{ctx: ctx, operation: operation, start: time.Now(), done: make(chan struct{})}
+}
+
+// record reports the execution duration with result; only the first call counts.
+func (t *executionTracker) record(result string) {
+	t.recordOnce.Do(func() {
+		telemetry.RecordExecutionDuration(t.ctx, t.operation, result, float64(time.Since(t.start))/float64(time.Millisecond))
+	})
+}
+
+// wrap makes the terminal hooks record the result and close done after they
+// write their event. Install any replacement hook before calling it.
+func (t *executionTracker) wrap(hooks *runtime.ExecuteResultHook) {
+	finish := func(result string) {
+		t.record(result)
+		t.doneOnce.Do(func() { close(t.done) })
+	}
+	complete, fail := hooks.OnExecuteComplete, hooks.OnExecuteError
+	hooks.OnExecuteComplete = func(executionTime time.Duration) {
+		complete(executionTime)
+		finish("success")
+	}
+	hooks.OnExecuteError = func(err *execute.ErrorOutput) {
+		fail(err)
+		finish("failure")
 	}
 }
 
-// writeSingleEvent serializes one SSE frame.
-func (c *CodeInterpretingController) writeSingleEvent(handler string, data []byte, verbose bool, summary string) {
+// respondRunError reports an error returned by a run. Before any event has
+// been written it is a JSON error response. After that the status is already
+// committed, so it is sent as an SSE error event through hooks instead, unless
+// the run has already ended (ended is closed) with its own complete or error
+// event.
+func (c *CodeInterpretingController) respondRunError(hooks runtime.ExecuteResultHook, ended <-chan struct{}, message string) {
+	if !c.streamStarted() {
+		c.RespondError(http.StatusInternalServerError, model.ErrorCodeRuntimeError, message)
+		return
+	}
+	select {
+	case <-ended:
+		return
+	default:
+	}
+	hooks.OnExecuteError(&execute.ErrorOutput{
+		EName:     "RuntimeError",
+		EValue:    message,
+		Traceback: []string{message},
+	})
+}
+
+// sseLegacyCompatEvent drops the exit_code field (top level and inside the
+// error payload) when --sse-legacy-compat is enabled. SDKs whose EventNode
+// schema predates the field treat unknown keys as a compatibility hazard, and
+// successful foreground commands carry no information in exit_code anyway
+// (it is a constant 0; failures are reported via the error event). Newer SDKs
+// infer 0 from a complete event without exit_code, so this is lossless for
+// successful commands.
+func sseLegacyCompatEvent(event model.ServerStreamEvent) model.ServerStreamEvent {
+	if !flag.SseLegacyCompat {
+		return event
+	}
+	event.ExitCode = nil
+	if event.Error != nil {
+		shallowCopy := *event.Error
+		shallowCopy.ExitCode = nil
+		event.Error = &shallowCopy
+	}
+	return event
+}
+
+func (c *CodeInterpretingController) writeExecutionComplete(executionTime time.Duration, exitCode *int) {
+	event := sseLegacyCompatEvent(model.ServerStreamEvent{
+		Type:          model.StreamEventTypeComplete,
+		ExecutionTime: executionTime.Milliseconds(),
+		ExitCode:      exitCode,
+		Timestamp:     time.Now().UnixMilli(),
+	})
+	c.writeSingleEvent("OnExecuteComplete", event.ToJSON(), true, event.Summary())
+}
+
+func (c *basicController) writeSingleEvent(handler string, data []byte, verbose bool, summary string) {
 	if c == nil || c.ctx == nil || c.ctx.Writer == nil {
 		return
 	}
 
 	select {
 	case <-c.ctx.Request.Context().Done():
-		log.Error("StreamEvent.%s: client disconnected", handler)
+		log.ErrorWithCommandID(c.commandID, "sse: %s client disconnected", handler)
 		return
 	default:
 	}
@@ -192,16 +318,16 @@ func (c *CodeInterpretingController) writeSingleEvent(handler string, data []byt
 	}
 
 	if err != nil {
-		log.Error("StreamEvent.%s write data %s error: %v", handler, summary, err)
+		log.ErrorWithCommandID(c.commandID, "sse: %s write %s: %v", handler, summary, err)
 	} else {
 		if verbose {
-			log.Info("StreamEvent.%s write data %s", handler, summary)
+			log.InfoWithCommandID(c.commandID, "sse: %s write %s", handler, summary)
 		}
 	}
 }
 
 // ping periodically keeps the SSE connection alive.
-func (c *CodeInterpretingController) ping(ctx context.Context) {
+func (c *basicController) ping(ctx context.Context) {
 	wait.Until(func() {
 		if c.ctx.Writer == nil {
 			return
@@ -213,5 +339,5 @@ func (c *CodeInterpretingController) ping(ctx context.Context) {
 		}
 		payload := event.ToJSON()
 		c.writeSingleEvent("Ping", payload, false, event.Summary())
-	}, 3*time.Second, ctx.Done())
+	}, ssePingInterval, ctx.Done())
 }

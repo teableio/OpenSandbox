@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,10 +24,8 @@ public class ConnectionConfigTests
     [Fact]
     public void Constructor_WithDefaultOptions_ShouldUseDefaults()
     {
-        // Arrange & Act
         var config = new ConnectionConfig();
 
-        // Assert
         config.Protocol.Should().Be(ConnectionProtocol.Http);
         config.Domain.Should().Be("localhost:8080");
         config.ApiKey.Should().BeNull();
@@ -39,7 +37,6 @@ public class ConnectionConfigTests
     [Fact]
     public void Constructor_WithCustomOptions_ShouldApplyOptions()
     {
-        // Arrange
         var options = new ConnectionConfigOptions
         {
             Domain = "api.example.com",
@@ -53,10 +50,8 @@ public class ConnectionConfigTests
             }
         };
 
-        // Act
         var config = new ConnectionConfig(options);
 
-        // Assert
         config.Protocol.Should().Be(ConnectionProtocol.Https);
         config.Domain.Should().Be("api.example.com");
         config.ApiKey.Should().Be("test-api-key");
@@ -69,16 +64,13 @@ public class ConnectionConfigTests
     [Fact]
     public void Constructor_WithApiKey_ShouldAddApiKeyHeader()
     {
-        // Arrange
         var options = new ConnectionConfigOptions
         {
             ApiKey = "my-secret-key"
         };
 
-        // Act
         var config = new ConnectionConfig(options);
 
-        // Assert
         config.Headers.Should().ContainKey(Constants.ApiKeyHeader);
         config.Headers[Constants.ApiKeyHeader].Should().Be("my-secret-key");
     }
@@ -86,98 +78,80 @@ public class ConnectionConfigTests
     [Fact]
     public void GetBaseUrl_WithHttpProtocol_ShouldReturnHttpUrl()
     {
-        // Arrange
         var config = new ConnectionConfig(new ConnectionConfigOptions
         {
             Domain = "localhost:8080",
             Protocol = ConnectionProtocol.Http
         });
 
-        // Act
         var baseUrl = config.GetBaseUrl();
 
-        // Assert
         baseUrl.Should().Be("http://localhost:8080/v1");
     }
 
     [Fact]
     public void GetBaseUrl_WithHttpsProtocol_ShouldReturnHttpsUrl()
     {
-        // Arrange
         var config = new ConnectionConfig(new ConnectionConfigOptions
         {
             Domain = "api.example.com",
             Protocol = ConnectionProtocol.Https
         });
 
-        // Act
         var baseUrl = config.GetBaseUrl();
 
-        // Assert
         baseUrl.Should().Be("https://api.example.com/v1");
     }
 
     [Fact]
     public void GetBaseUrl_WithFullUrl_ShouldPreserveScheme()
     {
-        // Arrange
         var config = new ConnectionConfig(new ConnectionConfigOptions
         {
             Domain = "https://api.example.com"
         });
 
-        // Act
         var baseUrl = config.GetBaseUrl();
 
-        // Assert
         baseUrl.Should().Be("https://api.example.com/v1");
     }
 
     [Fact]
     public void GetBaseUrl_WithV1Suffix_ShouldNotDuplicate()
     {
-        // Arrange
         var config = new ConnectionConfig(new ConnectionConfigOptions
         {
             Domain = "https://api.example.com/v1"
         });
 
-        // Act
         var baseUrl = config.GetBaseUrl();
 
-        // Assert
         baseUrl.Should().Be("https://api.example.com/v1");
     }
 
     [Fact]
     public void GetBaseUrl_WithTrailingSlash_ShouldNormalize()
     {
-        // Arrange
         var config = new ConnectionConfig(new ConnectionConfigOptions
         {
             Domain = "api.example.com/"
         });
 
-        // Act
         var baseUrl = config.GetBaseUrl();
 
-        // Assert
         baseUrl.Should().Be("http://api.example.com/v1");
     }
 
     [Fact]
     public void CreateHttpClient_ShouldReturnConfiguredClient()
     {
-        // Arrange
         var config = new ConnectionConfig(new ConnectionConfigOptions
         {
             RequestTimeoutSeconds = 45
         });
 
-        // Act
         var client = config.CreateHttpClient();
 
-        // Assert
         client.Should().NotBeNull();
         client.Timeout.Should().Be(TimeSpan.FromSeconds(45));
     }
@@ -185,28 +159,82 @@ public class ConnectionConfigTests
     [Fact]
     public void GetHttpClient_ShouldReturnSameInstance()
     {
-        // Arrange
         var config = new ConnectionConfig();
 
-        // Act
         var client1 = config.GetHttpClient();
         var client2 = config.GetHttpClient();
 
-        // Assert
         client1.Should().BeSameAs(client2);
     }
 
     [Fact]
     public void CreateSseHttpClient_ShouldHaveInfiniteTimeout()
     {
-        // Arrange
         var config = new ConnectionConfig();
 
-        // Act
         var client = config.CreateSseHttpClient();
 
-        // Assert
         client.Should().NotBeNull();
         client.Timeout.Should().Be(Timeout.InfiniteTimeSpan);
+    }
+
+    [Fact]
+    public void Constructor_WithExplicitApiKeyHeaderInAnyCase_ShouldSuppressDefaultKey()
+    {
+        var options = new ConnectionConfigOptions
+        {
+            ApiKey = "configured-key",
+            Headers = new Dictionary<string, string>
+            {
+                ["open-sandbox-api-key"] = "explicit-key"
+            }
+        };
+
+        var config = new ConnectionConfig(options);
+
+        var apiKeyEntries = config.Headers
+            .Where(h => string.Equals(h.Key, Constants.ApiKeyHeader, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        apiKeyEntries.Should().HaveCount(1, "an explicit API key header suppresses the default regardless of casing");
+        apiKeyEntries[0].Should().Be(new KeyValuePair<string, string>("open-sandbox-api-key", "explicit-key"));
+    }
+
+    [Fact]
+    public void Constructor_WithEmptyExplicitApiKeyHeader_ShouldPreserveIt()
+    {
+        var options = new ConnectionConfigOptions
+        {
+            ApiKey = "configured-key",
+            Headers = new Dictionary<string, string>
+            {
+                ["Open-Sandbox-Api-Key"] = ""
+            }
+        };
+
+        var config = new ConnectionConfig(options);
+
+        var apiKeyEntries = config.Headers
+            .Where(h => string.Equals(h.Key, Constants.ApiKeyHeader, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        apiKeyEntries.Should().HaveCount(1);
+        apiKeyEntries[0].Value.Should().BeEmpty("a present-but-empty explicit header is not replaced by the default");
+    }
+
+    [Fact]
+    public void Constructor_WithCanonicalExplicitApiKeyHeader_ShouldKeepExplicitValue()
+    {
+        var options = new ConnectionConfigOptions
+        {
+            ApiKey = "configured-key",
+            Headers = new Dictionary<string, string>
+            {
+                [Constants.ApiKeyHeader] = "explicit-key"
+            }
+        };
+
+        var config = new ConnectionConfig(options);
+
+        config.Headers.Should().HaveCount(1);
+        config.Headers[Constants.ApiKeyHeader].Should().Be("explicit-key");
     }
 }

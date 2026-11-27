@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import logging
 
 import httpx
 
+from opensandbox._httpx import build_redirect_client_options
 from opensandbox.adapters.converter.exception_converter import (
     ExceptionConverter,
 )
@@ -39,25 +40,28 @@ logger = logging.getLogger(__name__)
 
 
 class MetricsAdapterSync(MetricsSync):
-    def __init__(self, connection_config: ConnectionConfigSync, execd_endpoint: SandboxEndpoint) -> None:
+    def __init__(
+        self, connection_config: ConnectionConfigSync, execd_endpoint: SandboxEndpoint
+    ) -> None:
         self.connection_config = connection_config
         self.execd_endpoint = execd_endpoint
         from opensandbox.api.execd import Client
 
         base_url = f"{self.connection_config.protocol}://{self.execd_endpoint.endpoint}"
         timeout = httpx.Timeout(self.connection_config.request_timeout.total_seconds())
-        headers = {
-            "User-Agent": self.connection_config.user_agent,
-            **self.connection_config.headers,
-            **self.execd_endpoint.headers,
-        }
+        headers = self.execd_endpoint.build_request_headers(self.connection_config)
 
-        self._client = Client(base_url=base_url, timeout=timeout)
+        self._client = Client(
+            base_url=base_url,
+            timeout=timeout,
+            follow_redirects=self.connection_config.follow_redirects,
+        )
         self._httpx_client = httpx.Client(
             base_url=base_url,
             headers=headers,
             timeout=timeout,
             transport=self.connection_config.transport,
+            **build_redirect_client_options(self.connection_config, base_url),
         )
         self._client.set_httpx_client(self._httpx_client)
 
@@ -71,5 +75,5 @@ class MetricsAdapterSync(MetricsSync):
             parsed = require_parsed(response_obj, Metrics, "Get metrics")
             return MetricsModelConverter.to_sandbox_metrics(parsed)
         except Exception as e:
-            logger.error("Failed to get metrics for sandbox %s", sandbox_id, exc_info=e)
+            logger.debug(f"Failed to get metrics for sandbox {sandbox_id}", exc_info=e)
             raise ExceptionConverter.to_sandbox_exception(e) from e

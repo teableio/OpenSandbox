@@ -1,0 +1,157 @@
+---
+title: Fast Sandbox Networking
+description: How traffic reaches and leaves Fast Sandbox sandboxes — signed route scopes and FastPath resolution inbound; subject-based egress enforcement outbound.
+---
+
+# Networking
+
+Fast Sandbox traffic flows through two adapters in this repository:
+
+- **Inbound** (client → sandbox): the ingress gateway's `FastSandboxProvider` verifies signed route scopes and forwards traffic to the Fastlet through FastPath endpoint resolution (`components/ingress/`).
+- **Outbound** (sandbox → external): one shared egress process per Fastlet pod enforces per-subject policy for N sandboxes, driven by the Sandbox Actions protocol (`components/egress/`).
+
+## Design highlights
+
+- **Explicit routing trust boundary**: header and URI routes use signed `f1.` scopes binding tenant namespace, sandbox ID, and port. Unsigned wildcard-host routing is an explicit opt-in restricted to one statically configured namespace; it requires a trusted network or authentication in front of ingress.
+- **Lazy resolution**: the upstream address resolves only when traffic arrives, so routes stay valid across Fastlet rescheduling without an invalidation protocol.
+- **Fail-closed egress**: every subject denies traffic from registration until its data plane is ready — policy delivery can be late, never early-open.
+- **Policy as data**: egress policy rides the Sandbox CRD's revisioned `actionBindings`; only credentials travel out of band, memory-only.
+- **One dispatch point**: DNS filtering and network enforcement are shared pod-netns services, dispatched per packet by source IP.
+
+## Inbound: route scope to Fastlet
+
+### Route scopes
+
+In header and URI modes, a Fast Sandbox route is an authenticated scope. The server signs the tenant namespace, sandbox ID, and port with the `opensandbox-fsb-route-v1` scheme; the `f1.` prefix identifies the scope format version, and the ingress shares the server's signing key ring.
+
+- Header mode expresses the scope as an `OpenSandbox-Ingress-To` header; URI mode encodes it in the path.
+- Clients must preserve the returned route and headers verbatim — the scope is the credential.
+- Wildcard mode instead returns `<sandbox-id>-<port>.<gateway-domain>` without a signature or routing header. Ingress accepts these Fast Sandbox routes when `--fast-sandbox-namespace` selects one namespace, and supplies that namespace to FastPath. The route label may arrive via the Host or the routing header — front proxies that own the external wildcard domain often derive the label from the Host and forward it as the routing header after stripping their own prefix — while a signed label still follows the signed path. The `fsb-` sandbox ID prefix distinguishes these routes from legacy Kubernetes routes in a mixed deployment.
+- When configured, the namespace restriction also applies to signed `f1.` routes: a valid signature for another namespace is rejected before resolution. Without this flag, signed routes retain their existing namespace-scoped behavior and unsigned Fast Sandbox routes are rejected.
+
+::: warning Unsigned wildcard routes do not authenticate clients
+The namespace is a routing boundary, not caller authentication. Anyone who can reach the gateway and knows a sandbox ID and port can access that service, including execd. Use network isolation or an authenticating front proxy. Wildcard-only routing needs no signing keys or external route store; internal FastPath/Fastlet credentials remain unchanged.
+:::
+
+The server issues these routes without calling FastPath or waiting for readiness: signing the tenant namespace, sandbox ID, and port is a local operation keyed by the shared ingress key ring. Issuance is therefore decoupled from sandbox state, and endpoint discovery never proves existence — the ingress resolves and verifies when traffic arrives.
+
+### Endpoint resolution
+
+The ingress resolves the upstream address through the FastPath `ResolveEndpoint` RPC when a request arrives. Resolution returns the target endpoint, the proxy address to forward through, and any required headers.
+
+Failure semantics are part of the contract:
+
+- A `FailedPrecondition` — including a not-yet-published route — surfaces as `503` with `Retry-After`. It is never reported as a missing sandbox: the ingress must not leak the difference between "not ready" and "does not exist".
+- The policy port (`18080`) is resolvable for SDK compatibility but returns `501` for traffic; policy operations belong to the server's network policy route, not the data path.
+
+### Access modes
+
+| Mode | Path | Trade-off |
+|---|---|---|
+| `direct-fastlet-proxy` (default) | Ingress → Fastlet pod directly | Lower latency; requires ingress to reach Fastlet pod IPs |
+| `central-proxy` | Ingress → fast-sandbox central proxy → Fastlet | No pod-IP reachability requirement; extra hop |
+
+Direct mode bypasses the central proxy, so the pod network must restrict Fastlet data-plane ports to trusted ingress workloads, and FastPath must admit the ingress namespace when the two systems deploy separately. The mode is chosen per deployment, not per request.
+
+### Transport and interoperability
+
+The ingress speaks only the `ResolveEndpoint` subset of FastPath v2 at a pinned wire revision shared with the server's generated client, so the components stay interoperable as fast-sandbox evolves. By default, gRPC transport is plaintext for zero-prerequisite compatibility; deployments can enable verified TLS and Kubernetes `TokenRequest` system authentication (`audience: fast-sandbox-fastpath`) so FastPath authenticates `opensandbox-server` and `opensandbox-ingress-gateway` and enforces per-profile RPC and namespace authorization (see [Fast Sandbox System Authentication](/guides/fast-sandbox-system-auth)).
+
+## Outbound: one egress control plane, N subjects
+
+Fastlet pods host many sandboxes in one network domain, so the per-sandbox egress sidecar does not apply. The egress component runs the opt-in **fast-sandbox profile** (`OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`): one egress process per Fastlet pod serves N sandboxes as independent **subjects**, each with its own policy, credentials, and kernel rules. The default sidecar profile is unchanged; the two profiles are mutually exclusive deployment forms.
+
+Policy reaches subjects as data: the server writes it to the Sandbox CRD's revisioned `actionBindings` through the shared lifecycle policy route, with sidecar-compatible semantics — replace is total, merge follows sidecar rules (same-target rules replace in place, first per target wins), removal is by target and idempotent. Writes are fenced by sandbox UID and generation (`409` on a lost race; other tenants are indistinguishable from missing, `404`), and a successful write commits intent only — enforcement converges on the Fastlet asynchronously, and a cleared binding resets the subject to deny-first.
+
+### Network slots
+
+Each sandbox is pre-provisioned with a **network slot** in the Fastlet pod netns before it exists: netns, veth, and masquerading are set up ahead of any create request, and the attachment identity ships in the `SET_BINDING` envelope. A sandbox never waits for network setup, and egress can enforce policy from its first packet.
+
+![Fast Sandbox network slots](../../public/images/fast-sandbox-network-slot.svg)
+
+The slot's IP is the dispatch key: the shared DNS proxy selects the subject for each packet by source IP, so one service per Fastlet serves every sandbox with per-subject policy.
+
+| `attachment.network` field | Role |
+|---|---|
+| `ip` | Dispatch key — `ip saddr` matches select the subject's rules |
+| `gateway` | Target of the DNS REDIRECT |
+| `privateCidr` | Sibling-isolation rules between sandboxes |
+| `hostVeth` | Reserved — on the bridge topology, policy hooks see the bridge device, not the veth |
+
+### Subject lifecycle
+
+A **subject** is the unit of policy, credential, and rule ownership — one per sandbox, identified by the sandbox UID. The egress process maintains a per-subject state machine:
+
+```text
+absent ──SET_BINDING──► denying ──data-plane-ready──► active
+   ▲                        │                            │
+   └──────REMOVE_BINDING────┴────────────────────────────┘
+```
+
+Subject lifecycle and policy are delivered by the Fastlet over the public **Sandbox Actions Handler** protocol (`sandbox.fast.io/actions/v1`). The egress process is the handler; two Pod-loopback HTTP endpoints serve it:
+
+- `POST /_fastlet/v1/actions` — `SET_BINDING`, `LIFECYCLE_HOOK`, `REMOVE_BINDING`.
+- `GET /_fastlet/v1/actions/status` — process incarnation probe. A changed `instanceId` makes the Fastlet replay the latest binding and all reached hooks.
+
+Every operation carries fencing fields (`runtimeInstanceId`, `attachmentId`) so a control-plane reset can never look like a rebinding. Unknown protocol versions, operations, or hook names are validation errors and are never silently ignored.
+
+### Credential delivery
+
+Credential vault revisions are **egress-held** (OSEP-0022): the server pushes complete vault revisions over the FastPath handler-relay (`InvokeHandlerAction`) to the egress vault surface (`/vault/{sandboxUid}`) on the Pod loopback. FastPath validates tenant-scoped sandbox ownership before the Fastlet forwards the payload — there is no proxy-injected identity header. The relay response is the synchronous ack: success means egress has validated **and durably persisted** the revision. Pushes stay in egress — memory plus an egress-local per-subject file, no Secret volumes, no CRD/etcd vault material. A vault mutation for a subject that has not reached `data-plane-ready` is held at the same barrier as the policy; there is no separate pending-cache channel.
+
+**Egress-local persistence** (OSEP-0022 stage 2) backs the ack with durable state:
+
+- **Layout**: one file per subject at `<egress-volume>/vault/<sandboxUid>.json` (Pod-scoped `emptyDir`; survives an egress container restart, dies with the Pod). Format: `{"v": 1, "incarnation": <runtimeInstanceId>, "attachmentId": <attachmentId>, "revision": …, "vault": {…vault JSON…}}` — a versioned shared server↔egress contract; v1 is plaintext and the volume joins the credential trust surface (mount the `emptyDir` with `medium: Memory` to keep plaintext off node disk).
+- **Commit protocol**: the relay write persists the file (atomic temp + rename + parent-dir fsync, reusing the policy-persistence machinery) **before** applying to the live store and acknowledging — acked ⇒ durable and applied. Uncertain outcomes restore the previous file and latch a recovery state that freezes vault writes until the process restarts; a rejected request never leaves a partially applied revision. The relay request body is parsed before the control-plane lock is taken and the listener sets explicit read timeouts, so a stalled client can never freeze the shared data plane.
+- **Reload at registration**: on egress restart the Fastlet replays `SET_BINDING`; the committed file reloads only when its recorded fence (runtimeInstanceId + attachmentId) matches the envelope — a mismatch (sandbox reset, or a rebind that changed only the attachment) is stale and purged, never carried into a new sandbox. A structurally corrupt file, or content the binding policy rejects, degrades that subject's vault: credential interception fails closed for it while policy enforcement continues — observable through the actions status payload (`degradedVaults`), with the unusable file quarantined so a restart cannot re-degrade on it (a file whose schema version is newer than this egress understands is preserved, not destroyed). `/healthz` stays 503 only while the recovery latch freezes writes; a per-subject degradation is never a process-health failure. A successful vault write clears the degradation.
+- **Snapshot transfer across pause/resume**: the egress exposes `VAULT_EXPORT` / `VAULT_IMPORT` actions (OSEP-0022 "Vault Lifecycle"). Export copies the subject's file into the driver-provided bundle target **strictly before** the runtime teardown purges it and seals the subject (vault ops answer 409; policy enforcement is unchanged while paused). Import lands the bundle file through the same commit protocol and re-stamps it with the restored runtime fence — the only authorized incarnation transfer, since restore may land on any Pod — before `data-plane-ready`; the vault activates with the policy at that barrier. The driver pause/resume hooks and the snapshot-manifest entry invoke the transfer.
+- **Server surface**: the user-facing vault API is server-routed (`POST|PATCH|GET|DELETE /v1/sandboxes/{id}/credential-vault[...]`). fsb sandboxes relay over this channel (the server composes `PATCH` as relay GET → in-memory merge → relay PUT carrying the read revision, so a lost cross-replica race answers 412); other backends proxy their sandbox-side sidecar. Values never leave the server on any public read.
+- **Configuration**: persistence is enabled by setting `OPENSANDBOX_EGRESS_VAULT_DIR` (the mounted `emptyDir` subdirectory) on the egress container; unset keeps the vault memory-only. `REMOVE_BINDING` purges memory plus the file (terminal).
+
+### Interception mode
+
+`OPENSANDBOX_EGRESS_FSB_INTERCEPTION_MODE` selects `all` (the unchanged default) or `credential-bound` for the Fast Sandbox profile only. The switch name is proposed pending maintainer confirmation. It does not change Pool manifests, the sidecar gate, or Actions API version selection. This first-stage contract covers Actions v1; the switch adds no Actions v2 guarantee.
+
+With the switch unset, both legacy gates `OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME=true` and `OPENSANDBOX_EGRESS_EXPERIMENTAL_FSB_TLS_ADMISSION=true` select the same admission path and emit a deprecation warning. The revision gate alone still installs the subject receiver without TLS admission. The admission gate alone, explicit `all` with either true legacy gate, and explicit `credential-bound` with an explicitly disabled legacy gate fail startup. Empty or unknown switch values also fail startup.
+
+Credential-bound startup requires transparent MITM and `dns+nft`; it rejects nondefault extra interception ports, insecure upstream TLS verification, a chained upstream proxy, and nonempty effective mitmproxy `ignore_hosts` or `allow_hosts`. Go reads the runtime user's `.mitmproxy/config.yaml` followed by `config.yml`, matching mitmdump's load order, before profile dispatch or network setup; unreadable or malformed configuration fails closed. The existing child-side checks remain in place. These restrictions apply to both the new switch and its legacy alias; `all` retains the existing configuration behavior.
+
+The subject receiver supports HTTP/1.1 requests on admitted decrypted connections. See [egress architecture](/architecture/network/egress#transparent-tls-interception-l7) for current limits and configuration.
+
+#### Defaults, capacity, and compatibility
+
+The switch is read once at egress startup, before profile dispatch or network setup; every credential-bound startup requirement fails closed, for the new switch and its deprecated alias alike. The mode distinguishes absent from explicitly empty by design: with the switch absent and both legacy gates off, startup keeps the pre-switch mitmdump launch arguments and child environment exactly and reads no mitmproxy configuration — the unchanged default — while a present-but-empty value, or any value other than `all` or `credential-bound`, fails startup, so a `value: ""` typo can never silently fall back to intercept-all.
+
+The admission budgets `OPENSANDBOX_EGRESS_FSB_TLS_CAPACITY` (per subject, default 32) and `OPENSANDBOX_EGRESS_FSB_PROCESS_TLS_CAPACITY` (process-wide, default 32768) are handed to the subject process only when TLS admission is active, accept integers from 1 to 1048576 and fall back to their respective defaults for invalid values, and are caps rather than reserved allocations. Each held idle decrypted connection measured 158–166 KB of egress memory in KVM integration environments, so the process budget should be sized from the egress container memory limit (see [egress architecture](/architecture/network/egress#transparent-tls-interception-l7)).
+
+The two budgets bound different things. With per-connection memory `m`, idle egress baseline `B` and egress container memory limit `L`:
+
+- The per-subject budget `S` caps how many decrypted connections one sandbox holds. It is not a reservation, so `S × maxSandboxesPerPod × m` is a worst case that only occurs when every sandbox on the Pod uses its full budget.
+- The process budget `P` caps decrypted connections across all subjects of one egress process. Because per-subject budgets are not reservations, `P` is the bound that protects the container: with `P × m > L − B`, the process can reach its memory limit before the budget rejects a handshake.
+- `P` below `S × maxSandboxesPerPod` means the sandboxes on one Pod cannot all reach their per-subject budget. When the memory limit cannot hold `S × maxSandboxesPerPod` connections, lower `S` or the Pod density, or raise `L`, rather than raising `P` past the memory bound.
+- The measured `m` is for idle connections, so `P × m` should stay well below `L − B` to leave room for active transfers and allocator growth.
+
+The operator runbook — the full startup checklist, the commented pool-manifest env example, the integration-environment render switch, and the rollback procedure back to intercept-all — lives in the [credential vault guide](/guides/credential-vault#enabling-and-rolling-back-credential-bound-operators); this page keeps the mode's meaning and design constraints only.
+
+#### Mixed pools and cross-Pod restore
+
+The mode belongs to the egress process, one per Fastlet Pod, so it is effectively a per-pool property: every sandbox on a Pod shares its pool's mode, and one cluster may run some pools in `credential-bound` and others in `all`. A sandbox's interception semantics follow the egress of the Fastlet Pod that hosts it. Restore may land a sandbox on any Pod: the vault bundle transfer itself (`VAULT_EXPORT` / `VAULT_IMPORT`, mode-independent) carries the credentials, but decryption and admission on the restored Pod follow the destination Pod's egress configuration — a vault restored into an `all` pool is injected under intercept-all, and one restored into a `credential-bound` pool decrypts only binding-covered hosts.
+
+#### Visibility of unbound HTTPS
+
+For a known subject with a current decision snapshot, credential-bound forwards unbound TLS/443 traffic opaquely when egress policy permits it. DNS filtering, nft enforcement, and encrypted-DNS handling are unchanged — both modes enforce the same policy — but mitmproxy addons and any audit or request-level inspection see an unbound HTTPS flow only as a tunnel: its destination and the decrypt/passthrough outcome remain observable, while the HTTP method, headers, and body do not. Deployments that rely on decrypting every HTTPS flow for L7 audit or addon-based filtering keep that visibility only in `all` mode; under `credential-bound` they must add a vault binding for each host they need to inspect.
+
+Client-side usage rules — installing a binding before requests, recycling connections after the first binding for a host, and the HTTP/1.1-only boundary on bound hosts — are covered in the [credential vault guide](/guides/credential-vault#fast-sandbox-credential-bound-vault-usage-experimental).
+
+### Enforcement
+
+Enforcement is nftables in the Fastlet pod network namespace, dispatched by source IP — the attachment block of each action envelope supplies the subject's IP, gateway, host veth, and private CIDR.
+
+- **DNS**: one shared proxy on loopback `127.0.0.1:15353`. Per-subject prerouting REDIRECTs forward sandbox DNS addressed to the attachment gateway, preserving the source IP so per-query policy dispatches to the right subject.
+- **Forward path**: per-subject `hook prerouting` chains mark allowed destinations (`meta mark 0x2`); the master forward chain drops unmarked traffic. The path deliberately never emits an explicit `accept` — with `net.bridge.bridge-nf-call-iptables=1` (the fast-sandbox bridge topology) an accept verdict returns the frame to bridge L2 and is lost.
+- **Dynamic sets**: DNS-learned IPs get bounded leases; a per-subject connection refresh loop renews leases of active TCP connections. UDP/QUIC relies on DNS TTLs.
+- **Operator network security rule files**: `/var/egress/rules/deny.always`, `allow.always`, and `reachable.ports.cap` apply to every subject exactly as in the sidecar profile — the overlay merges ahead of each subject's policy (deny before allow before user rules) and is enforced at both the DNS and nft layers, while the port-cap complement drops profile-wide in the master chains. The files hot-reload every minute (the sidecar cadence, matched to the kubelet ConfigMap sync period): a reload stages the new overlay, rebuilds the table in one atomic transaction — swapping the floor and every subject's merged policy and dropping every DNS-learned lease — and publishes to the DNS dispatch only after the kernel accepts it; a failed rebuild keeps the previous overlay and retries on the next tick. Leases are not preserved across a reload (matching the sidecar profile's apply): a tightened overlay takes effect immediately for idle IPs, a DNS answer that was in flight during the reload is re-authorized against the installed policy before its IPs are admitted (a revoked domain's cached address cannot be re-added), and already-active flows keep passing through the established-state rule until they close — a still-allowed domain recovers authorization with the sandbox's next DNS lookup. The example pool manifests (`scripts/fast-sandbox-env/manifests/pool/`) already mount `/var/egress/rules` from an **optional** `egress-network-security-rules` ConfigMap, so enforcing rules needs no pool edit: apply the shipped baseline (`scripts/fast-sandbox-env/manifests/pool/egress-network-security-rules-configmap.yaml` — cluster Pod/Service CIDR and the Fastlet slot CIDR denied, `example.com` allowed, TCP `53`/`80`/`443` reachable) or create your own ConfigMap with the files as keys, and the egress picks it up within a minute — no restart. Mount the whole volume, never `subPath` (kubelet does not update subPath mounts); a missing file or ConfigMap simply contributes no rules. A live-traffic verify (`scripts/fast-sandbox-env/verify/network-security-rules.sh`) proves the baseline end to end: kernel deny sets and port floor, DNS allow/deny from a default-deny sandbox, and deny-always-beats-default-allow plus port-cap drops from a default-allow sandbox.
+- **Encrypted DNS**: DoT (853) is always dropped; optional DoH-over-443 blocking applies globally to every subject.
+- **Chained upstream proxy**: when `OPENSANDBOX_EGRESS_UPSTREAM_PROXY` is set alongside transparent MITM, all shared-mitmproxy egress is chained through that proxy via `CONNECT`. The endpoint is infrastructure, not sandbox egress: it is dropped profile-wide in the master dispatch chain (forward and input paths, ahead of every per-subject rule) so no subject policy — default-allow included — can CONNECT the proxy directly. A hostname endpoint is registered as an infrastructure domain on the shared DNS proxy, so its answers never feed the dynamic allow sets; the shared mitmdump resolves the name through the Fastlet pod's own resolver, so it must be resolvable via cluster DNS. Since the DNS proxy's forward upstreams and the pod resolver can return different address sets (split-horizon or operator-configured DNS), the egress's self-resolution refresh queries both authorities and seeds the drop sets with the union — an address only the pod resolver returns is one a sandbox could otherwise CONNECT directly. Drop elements are permanent (no kernel timeout): containment persists through egress downtime like every other rule in the table, and expiry is owned by the egress — the refresh loop prunes addresses both authorities stop returning, while a failed resolve keeps every element (fail-closed retention). The first seed retries with bounded backoff at startup and fails egress startup if the hostname cannot be resolved, before any sandbox action is served.
+- **Upstream proxy refresh and recovery**: both resolver authorities run concurrently. Partial failures are logged and only add returned addresses; pruning requires absence from two successful refreshes of both authorities, and a sandbox DNS lookup renews retention. Before resetting the nft table, startup resolves the hostname with bounded retries and seeds the in-memory addresses. Both authorities must complete successfully with a nonempty union; failure leaves the previous kernel table intact. DNS resolution and nft application have separate timeouts.
+- **Atomicity**: static sets are swapped atomically; on restart the egress wipes stale subject rules while installing the seeded proxy addresses, publishes a new `instanceId`, and the Fastlet replays every live binding.

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,24 @@ namespace OpenSandbox.Services;
 /// </summary>
 public interface IExecdCommands
 {
+    /// <summary>Runs native executable arguments without shell expansion.</summary>
+    IAsyncEnumerable<ServerStreamEvent> RunStreamAsync(
+        IReadOnlyList<string> argv,
+        RunCommandOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Runs native executable arguments and collects the result.</summary>
+    /// <exception cref="SandboxException">
+    /// Thrown when a foreground stream ends normally without a completion or execution error event.
+    /// The error code is <see cref="SandboxErrorCodes.CommandStreamIncomplete"/>.
+    /// Handlers may have received partial output.
+    /// </exception>
+    Task<Execution> RunAsync(
+        IReadOnlyList<string> argv,
+        RunCommandOptions? options = null,
+        ExecutionHandlers? handlers = null,
+        CancellationToken cancellationToken = default);
+
     /// <summary>
     /// Runs a command and streams server events (SSE).
     /// This is the lowest-level API for command execution.
@@ -46,11 +64,37 @@ public interface IExecdCommands
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The command execution result.</returns>
     /// <exception cref="InvalidArgumentException">Thrown when request values are invalid.</exception>
-    /// <exception cref="SandboxException">Thrown when the execd service request fails.</exception>
+    /// <exception cref="SandboxException">
+    /// Thrown when the execd service request fails or when a foreground stream ends normally
+    /// without a completion or execution error event.
+    /// For an incomplete stream, the error code is <see cref="SandboxErrorCodes.CommandStreamIncomplete"/>.
+    /// Handlers may have received partial output.
+    /// </exception>
     Task<Execution> RunAsync(
         string command,
         RunCommandOptions? options = null,
         ExecutionHandlers? handlers = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Persists an environment variable for future commands and sessions.
+    /// Appends <c>KEY=VALUE</c> to the sandbox env file that the runtime loads for
+    /// every command and session (the file named by the sandbox's <c>EXECD_ENVS</c>
+    /// variable, resolved inside the sandbox). Keys must match
+    /// <c>[A-Za-z_][A-Za-z0-9_]*</c>. Values without a single quote are stored
+    /// verbatim; values containing a single quote use the env file's double-quoted
+    /// form, in which shell-style <c>$NAME</c> sequences may be expanded when the
+    /// runtime loads the file. The env file is append-only: the last write for a
+    /// key wins.
+    /// </summary>
+    /// <param name="key">Environment variable name.</param>
+    /// <param name="value">Environment variable value.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="InvalidArgumentException">Thrown when <paramref name="key"/> or <paramref name="value"/> is invalid.</exception>
+    /// <exception cref="SandboxException">Thrown when the sandbox fails to persist the variable.</exception>
+    Task SetEnvAsync(
+        string key,
+        string value,
         CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -77,12 +121,13 @@ public interface IExecdCommands
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Gets logs for a background command.
+    /// Gets logs for a background command. Each response returns at most
+    /// 16 MiB; pass the returned cursor back to fetch the remainder.
     /// </summary>
     /// <param name="executionId">The command execution ID.</param>
-    /// <param name="cursor">Optional line cursor for incremental reads.</param>
+    /// <param name="cursor">Optional byte offset into the combined output for incremental reads.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>Background command logs and latest cursor.</returns>
+    /// <returns>Background command logs and the cursor just past the returned bytes.</returns>
     /// <exception cref="InvalidArgumentException">Thrown when <paramref name="executionId"/> is null or empty.</exception>
     /// <exception cref="SandboxException">Thrown when the execd service request fails.</exception>
     Task<CommandLogs> GetBackgroundCommandLogsAsync(

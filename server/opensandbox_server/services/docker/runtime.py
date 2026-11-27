@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Runtime preparation mixin for Docker sandboxes.
-
-Provides execd archive distribution and bootstrap launcher installation.
-Mixed into DockerSandboxService.
-"""
-
 from __future__ import annotations
 
 import io
@@ -26,10 +19,10 @@ import logging
 import posixpath
 import tarfile
 import time
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
-from docker.errors import DockerException
+from docker.errors import DockerException, NotFound as DockerNotFound
 from fastapi import HTTPException, status
 
 from opensandbox_server.api.schema import PlatformSpec
@@ -42,10 +35,14 @@ OPENSANDBOX_DIR = "/opt/opensandbox"
 # even when the server runs on Windows.
 EXECED_INSTALL_PATH = posixpath.join(OPENSANDBOX_DIR, "execd")
 BOOTSTRAP_PATH = posixpath.join(OPENSANDBOX_DIR, "bootstrap.sh")
+SESSION_GATE_SOURCE_PATH = "/usr/local/libexec/opensandbox-session-gate"
+SESSION_GATE_INSTALL_PATH = posixpath.join(OPENSANDBOX_DIR, "opensandbox-session-gate")
+LAUNCHER_SOURCE_PATH = "/usr/local/libexec/opensandbox-launcher"
+LAUNCHER_INSTALL_PATH = posixpath.join(OPENSANDBOX_DIR, "opensandbox-launcher")
 
 
 class DockerRuntimeMixin:
-    """Mixin providing execd distribution and bootstrap launcher installation."""
+
 
     def _fetch_execd_archive(self, platform: Optional[PlatformSpec] = None) -> bytes:
         """Fetch (and memoize) the execd archive by effective target platform."""
@@ -71,20 +68,37 @@ class DockerRuntimeMixin:
                 )
 
                 with self._docker_operation("execd cache create container", "execd-cache"):
-                    create_kwargs: dict[str, any] = {
+                    create_kwargs: dict[str, Any] = {
                         "image": self.execd_image,
                         "command": ["tail", "-f", "/dev/null"],
                         "name": f"sandbox-execd-{uuid4()}",
                         "detach": True,
                         "auto_remove": False,
+                        # Pass the configured network mode explicitly. Without it the Docker
+                        # API falls back to `bridge`, which fails on hosts where netavark
+                        # cannot apply its ruleset (e.g. rootless podman in WSL2) even when
+                        # the sandbox itself is configured for a working mode like `pasta`.
+                        "network_mode": self.network_mode,
                     }
+                    # Honor the same [docker] security profiles and [secure_runtime] OCI
+                    # runtime as sandbox containers. Without this, a host whose default
+                    # seccomp/AppArmor profile blocks the execd image can not be fixed
+                    # through configuration: this container is created first, fails to
+                    # start, and no sandbox can ever be created.
+                    security_opt = self._profile_security_opts()
+                    if security_opt:
+                        create_kwargs["security_opt"] = security_opt
+                    if self.docker_runtime:
+                        create_kwargs["runtime"] = self.docker_runtime
                     if docker_platform is not None:
                         create_kwargs["platform"] = docker_platform
                     container = self.docker_client.containers.create(**create_kwargs)
                 with self._docker_operation("execd cache start container", "execd-cache"):
                     container.start()
                     container.reload()
-                    logger.info("Created sandbox execd archive for container %s", container.id)
+                    logger.info(
+                        f"Created sandbox execd archive for container {container.id}"
+                    )
             except TypeError as exc:
                 if docker_platform is not None:
                     raise HTTPException(
@@ -111,6 +125,55 @@ class DockerRuntimeMixin:
                 with self._docker_operation("execd cache read archive", "execd-cache"):
                     stream, _ = container.get_archive("/execd")
                     data = b"".join(stream)
+                # Also cache the full bootstrap.sh while the container is running.
+                if cache_key not in self._bootstrap_script_cache:
+                    with self._docker_operation("execd cache read bootstrap", "execd-cache"):
+                        bs_stream, _ = container.get_archive("/bootstrap.sh")
+                        self._bootstrap_script_cache[cache_key] = b"".join(bs_stream)
+                # Cache bwrap binary (best-effort — may not exist in older images).
+                if cache_key not in self._bwrap_archive_cache:
+                    try:
+                        with self._docker_operation("execd cache read bwrap", "execd-cache"):
+                            bwrap_stream, _ = container.get_archive("/usr/local/bin/bwrap")
+                            self._bwrap_archive_cache[cache_key] = b"".join(bwrap_stream)
+                    except DockerException:
+                        logger.warning("bwrap not found in execd image — isolation will be unavailable, upgrade execd image to v1.1.0+")
+                # Cache the native workload gate independently so older execd
+                # images remain usable for legacy, non-lifecycle isolation.
+                if cache_key not in self._session_gate_archive_cache:
+                    try:
+                        with self._docker_operation(
+                            "execd cache read session gate", "execd-cache"
+                        ):
+                            gate_stream, _ = container.get_archive(
+                                SESSION_GATE_SOURCE_PATH
+                            )
+                            self._session_gate_archive_cache[cache_key] = b"".join(
+                                gate_stream
+                            )
+                    except DockerNotFound:
+                        logger.warning(
+                            "session workload gate not found in execd image — "
+                            "gated isolated-session lifecycle will be unavailable"
+                        )
+                # Cache the hardening launcher (best-effort; older images do
+                # not contain it, which degrades [hardening] to unavailable).
+                if cache_key not in self._launcher_archive_cache:
+                    try:
+                        with self._docker_operation(
+                            "execd cache read launcher", "execd-cache"
+                        ):
+                            launcher_stream, _ = container.get_archive(
+                                LAUNCHER_SOURCE_PATH
+                            )
+                            self._launcher_archive_cache[cache_key] = b"".join(
+                                launcher_stream
+                            )
+                    except DockerNotFound:
+                        logger.warning(
+                            "hardening launcher not found in execd image — "
+                            "[hardening] will degrade to unavailable"
+                        )
             except DockerException as exc:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -126,15 +189,14 @@ class DockerRuntimeMixin:
                             container.remove(force=True)
                     except DockerException as cleanup_exc:
                         logger.warning(
-                            "Failed to cleanup temporary execd container: %s", cleanup_exc
+                            f"Failed to cleanup temporary execd container: {cleanup_exc}"
                         )
 
             self._execd_archive_cache[cache_key] = data
-            logger.info("Dumped execd archive to memory for platform key %s", cache_key)
+            logger.info(f"Dumped execd archive to memory for platform key {cache_key}")
             return data
 
     def _ensure_directory(self, container, path: str, sandbox_id: Optional[str] = None) -> None:
-        """Create a directory within the target container if it does not exist."""
         if not path or path == "/":
             return
         normalized_path = path.rstrip("/")
@@ -166,7 +228,6 @@ class DockerRuntimeMixin:
         sandbox_id: str,
         platform: Optional[PlatformSpec] = None,
     ) -> None:
-        """Copy execd artifacts from the platform container into the sandbox."""
         archive = self._fetch_execd_archive(platform)
         target_parent = posixpath.dirname(EXECED_INSTALL_PATH.rstrip("/")) or "/"
         self._ensure_directory(container, target_parent, sandbox_id)
@@ -182,33 +243,36 @@ class DockerRuntimeMixin:
                 },
             ) from exc
 
-    def _install_bootstrap_script(self, container, sandbox_id: str) -> None:
-        """Install the bootstrap launcher that starts execd then chains to user command."""
-        script_path = BOOTSTRAP_PATH
-        script_dir = posixpath.dirname(script_path)
-        self._ensure_directory(container, script_dir, sandbox_id)
-        execd_binary = EXECED_INSTALL_PATH
-        script_content = "\n".join(
-            [
-                "#!/bin/sh",
-                "set -e",
-                f"  {execd_binary} >/tmp/execd.log 2>&1 &",
-                'exec "$@"',
-                "",
-            ]
-        ).encode("utf-8")
+    def _install_bootstrap_script(
+        self,
+        container,
+        sandbox_id: str,
+        platform: Optional[PlatformSpec] = None,
+    ) -> None:
+        """Install the full bootstrap.sh from the execd image into the sandbox.
 
-        tar_stream = io.BytesIO()
-        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-            info = tarfile.TarInfo(name=script_path.lstrip("/"))
-            info.mode = 0o755
-            info.size = len(script_content)
-            info.mtime = int(time.time())
-            tar.addfile(info, io.BytesIO(script_content))
-        tar_stream.seek(0)
+        Uses the same execd container that _copy_execd_to_container already
+        created, so there is no extra container lifecycle overhead.
+        """
+        cache_key = self._normalize_platform_key(platform)
+        # _copy_execd_to_container is called first and ensures both the execd
+        # archive and the bootstrap script are already in the caches.
+        archive = self._bootstrap_script_cache.get(cache_key)
+        if archive is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.BOOTSTRAP_INSTALL_FAILED,
+                    "message": "bootstrap.sh not found in execd image cache",
+                },
+            )
+
+        script_dir = posixpath.dirname(BOOTSTRAP_PATH)
+        self._ensure_directory(container, script_dir, sandbox_id)
+
         try:
             with self._docker_operation("install bootstrap script", sandbox_id):
-                container.put_archive(path="/", data=tar_stream.getvalue())
+                container.put_archive(path=script_dir, data=archive)
         except DockerException as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -218,12 +282,114 @@ class DockerRuntimeMixin:
                 },
             ) from exc
 
+    def _copy_bwrap_to_container(
+        self,
+        container,
+        sandbox_id: str,
+        platform: Optional[PlatformSpec] = None,
+    ) -> None:
+        """Copy bwrap binary into /opt/opensandbox/bin/ (best-effort).
+
+        Bwrap may not exist in older execd images, so failure is non-fatal —
+        isolation will simply be unavailable at runtime.
+        """
+        cache_key = self._normalize_platform_key(platform)
+        archive = self._bwrap_archive_cache.get(cache_key)
+        if archive is None:
+            logger.warning(
+                f"bwrap archive not cached for {cache_key} — isolation will be "
+                "unavailable, upgrade execd image to v1.1.0+"
+            )
+            return
+
+        try:
+            with self._docker_operation("copy bwrap to sandbox", sandbox_id):
+                container.put_archive(path=OPENSANDBOX_DIR, data=archive)
+        except DockerException as exc:
+            logger.warning(
+                f"Failed to copy bwrap into sandbox {sandbox_id}: {exc} "
+                "(isolation will be unavailable)"
+            )
+
+    def _copy_session_gate_to_container(
+        self,
+        container,
+        sandbox_id: str,
+        platform: Optional[PlatformSpec] = None,
+    ) -> None:
+        """Copy the native workload gate into its managed runtime path.
+
+        Older execd images do not contain this helper, so distribution remains
+        best-effort for backward compatibility. WrapWithLifecycle still opens
+        the managed path fail-closed before starting a workload.
+        """
+        cache_key = self._normalize_platform_key(platform)
+        archive = self._session_gate_archive_cache.get(cache_key)
+        if archive is None:
+            logger.warning(
+                f"session workload gate archive not cached for {cache_key} — "
+                "gated isolated-session lifecycle will be unavailable"
+            )
+            return
+
+        try:
+            with self._docker_operation("copy session gate to sandbox", sandbox_id):
+                container.put_archive(path=OPENSANDBOX_DIR, data=archive)
+        except DockerException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.EXECD_DISTRIBUTION_FAILED,
+                    "message": (
+                        "Failed to copy session workload gate into sandbox "
+                        f"at {SESSION_GATE_INSTALL_PATH}: {str(exc)}"
+                    ),
+                },
+            ) from exc
+
+    def _copy_launcher_to_container(
+        self,
+        container,
+        sandbox_id: str,
+        platform: Optional[PlatformSpec] = None,
+    ) -> None:
+        """Copy the hardening launcher into its managed runtime path.
+
+        Best-effort for backward compatibility with older execd images; when
+        it is missing, [hardening] degrades to unavailable at runtime.
+        """
+        cache_key = self._normalize_platform_key(platform)
+        archive = self._launcher_archive_cache.get(cache_key)
+        if archive is None:
+            logger.warning(
+                f"hardening launcher archive not cached for {cache_key} — "
+                "[hardening] will be unavailable"
+            )
+            return
+
+        try:
+            with self._docker_operation("copy launcher to sandbox", sandbox_id):
+                container.put_archive(path=OPENSANDBOX_DIR, data=archive)
+        except DockerException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.EXECD_DISTRIBUTION_FAILED,
+                    "message": (
+                        "Failed to copy hardening launcher into sandbox "
+                        f"at {LAUNCHER_INSTALL_PATH}: {str(exc)}"
+                    ),
+                },
+            ) from exc
+
     def _prepare_sandbox_runtime(
         self,
         container,
         sandbox_id: str,
         platform: Optional[PlatformSpec] = None,
     ) -> None:
-        """Copy execd artifacts and bootstrap launcher into the sandbox container."""
         self._copy_execd_to_container(container, sandbox_id, platform)
-        self._install_bootstrap_script(container, sandbox_id)
+        self._install_bootstrap_script(container, sandbox_id, platform)
+        self._copy_bwrap_to_container(container, sandbox_id, platform)
+        self._copy_session_gate_to_container(container, sandbox_id, platform)
+        self._copy_launcher_to_container(container, sandbox_id, platform)

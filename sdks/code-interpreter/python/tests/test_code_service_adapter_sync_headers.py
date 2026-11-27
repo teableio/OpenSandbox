@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +13,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import pytest
 from opensandbox.config.connection_sync import ConnectionConfigSync
+from opensandbox.exceptions import SandboxApiException, SandboxRateLimitException
 from opensandbox.models.sandboxes import SandboxEndpoint
 
 from code_interpreter.sync.adapters.code_adapter import CodesAdapterSync
+
+
+def test_sync_adapter_non_200_includes_error_body_in_message() -> None:
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            headers={"x-request-id": "req-code-sync-123"},
+            content=b"bad request body",
+            request=request,
+        )
+
+    cfg = ConnectionConfigSync(protocol="http", transport=httpx.MockTransport(handler))
+    endpoint = SandboxEndpoint(endpoint="localhost:44772", port=44772)
+    adapter = CodesAdapterSync(endpoint, cfg)
+
+    with pytest.raises(SandboxApiException) as ei:
+        adapter.run("other")
+    assert ei.value.request_id == "req-code-sync-123"
+    # The server's error body is spliced into the message so logs carry the reason.
+    assert "bad request body" in str(ei.value)
 
 
 def test_sync_adapter_merges_endpoint_headers_into_both_clients() -> None:
@@ -45,3 +69,24 @@ def test_sync_adapter_endpoint_headers_override_connection_headers() -> None:
 
     assert adapter._httpx_client.headers["X-Shared"] == "endpoint"
     assert adapter._sse_client.headers["X-Shared"] == "endpoint"
+
+
+def test_sync_adapter_non_200_keeps_structured_error_and_rate_limit() -> None:
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "3"},
+            json={"code": "RATE_LIMITED", "message": "slow down"},
+            request=request,
+        )
+
+    cfg = ConnectionConfigSync(protocol="http", transport=httpx.MockTransport(handler))
+    adapter = CodesAdapterSync(SandboxEndpoint(endpoint="localhost:44772"), cfg)
+
+    with pytest.raises(SandboxRateLimitException) as ei:
+        adapter.run("print(1)")
+    assert ei.value.error.code == "RATE_LIMITED"
+    assert ei.value.error.message == "slow down"
+    assert ei.value.response_body is not None

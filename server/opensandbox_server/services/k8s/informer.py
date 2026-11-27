@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,57 +15,91 @@
 """Lightweight informer-style cache for namespaced custom resources."""
 
 import logging
+import math
 import threading
-from typing import Any, Callable, Dict, List, Optional
+import time
+from collections import deque
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 from kubernetes import watch
 from kubernetes.client import ApiException
 
 logger = logging.getLogger(__name__)
 
+# An idle watch sends nothing until the server closes the stream at
+# ``timeout_seconds``, so the client read timeout must sit above it.
+_WATCH_READ_TIMEOUT_BUFFER_SECONDS = 10
+_WATCH_CONNECT_TIMEOUT_SECONDS = 10
+_MAX_BACKOFF_SECONDS = 30.0
+# Per-object resourceVersions applied since the last LIST, kept so a write
+# response that arrives after its own WATCH event is recognised as observed.
+_OBSERVED_RESOURCE_VERSIONS_PER_OBJECT = 16
+# Pending-write token for a delete whose response does not carry the object.
+_DELETED = object()
+
 
 class WorkloadInformer:
-    """Maintain an in-memory cache of a namespaced custom resource via watch."""
+    """Maintain a LIST/WATCH-owned cache of a namespaced custom resource."""
 
     def __init__(
         self,
-        list_fn: Callable[..., Any],
+        list_fn: Callable[..., Dict[str, Any]],
         resync_period_seconds: int = 300,
         watch_timeout_seconds: int = 60,
         enable_watch: bool = True,
         thread_name: str = "workload-informer",
+        event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ):
         """
         Args:
             list_fn: Callable that lists the custom resource, with signature
                      ``list_fn(**kwargs) -> dict``.  Typically a bound method
                      like ``custom_api.list_namespaced_custom_object``.
-            resync_period_seconds: Full-resync interval when watch is disabled.
-            watch_timeout_seconds: Per-stream watch timeout before restart.
+            resync_period_seconds: int: Full-resync interval for the cache.
+            watch_timeout_seconds: int: Per-stream watch timeout before restart.
             enable_watch: When False only the initial list is performed.
-            thread_name: Name for the background thread, used in stack traces
-                         and debuggers.  Should be unique per informer instance.
+            thread_name: str: Name for the background thread, used in stack traces
+                     and debuggers.  Should be unique per informer instance.
+            event_handler: Optional reactor callback ``handler(event_type, object)``
+                     invoked outside the cache lock for every watch event
+                     (``ADDED``/``MODIFIED``/``DELETED``) and for every item of
+                     an initial/reconciling LIST snapshot (``SYNC``). Handler
+                     errors are logged and never kill the watch thread.
         """
         self.list_fn = list_fn
         self.resync_period_seconds = resync_period_seconds
         self.watch_timeout_seconds = watch_timeout_seconds
         self.enable_watch = enable_watch
         self._thread_name = thread_name
+        self._event_handlers: List[Callable[[str, Dict[str, Any]], None]] = (
+            [event_handler] if event_handler is not None else []
+        )
+
+        self._subscribers: Dict[str, List[Callable[[str, Dict[str, Any]], None]]] = {}
 
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._resource_version: Optional[str] = None
         self._has_synced = False
+        self._last_contact_at: Optional[float] = None
+        self._invalidation_generation = 0
+        # name -> {resourceVersion or _DELETED: write sequence number}
+        self._pending_writes: Dict[str, Dict[Any, int]] = {}
+        self._observed_resource_versions: Dict[str, Deque[str]] = {}
+        self._write_sequence = 0
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Only the informer thread reads or writes this flag.
+        self._missing_resource_reported = False
 
     @property
-    def has_synced(self) -> bool:
-        """Return True once an initial list has completed."""
-        return self._has_synced
+    def _staleness_limit_seconds(self) -> float:
+        """One resync period, by which the cache should have been rebuilt, plus a watch cycle."""
+        return self.resync_period_seconds + self.watch_timeout_seconds
 
     def start(self) -> None:
-        """Start the background watch thread if not already running."""
+        if self._stop_event.is_set():
+            return
         if self._thread and self._thread.is_alive():
             return
 
@@ -77,74 +111,185 @@ class WorkloadInformer:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop the background watch thread."""
         self._stop_event.set()
 
-    def get(self, name: str) -> Optional[Dict[str, Any]]:
-        """Return cached object by name, if present."""
+    def get_if_synced(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return a cached object only while the cache is safe to publish."""
         with self._lock:
+            if not self._cache_is_available() or name in self._pending_writes:
+                return None
             return self._cache.get(name)
 
-    def list(self) -> List[Dict[str, Any]]:
-        """Return a snapshot of every cached object."""
+    def list_if_synced(self) -> Optional[List[Dict[str, Any]]]:
+        """Return a cache snapshot, or None when callers must use the live API."""
         with self._lock:
+            if not self._cache_is_available() or self._has_unobserved_writes():
+                return None
             return list(self._cache.values())
 
-    def update_cache(self, obj: Dict[str, Any]) -> None:
-        """Upsert a single object into the cache.
+    def _has_unobserved_writes(self) -> bool:
+        """Return whether a snapshot could miss a completed write. Caller must hold ``_lock``."""
+        for name, tokens in self._pending_writes.items():
+            # A pending delete of an object already absent from the cache
+            # cannot make a snapshot stale.
+            if name in self._cache or any(token is not _DELETED for token in tokens):
+                return True
+        return False
 
-        Only advances ``_resource_version`` if the incoming version is strictly
-        newer, preventing a stale API response from rolling back the watch cursor.
+    def _cache_is_available(self) -> bool:
+        """Return whether cache reads are publishable. Caller must hold ``_lock``."""
+        if self._stop_event.is_set() or not self._has_synced:
+            return False
+        if self._last_contact_at is None:
+            return False
+        return time.monotonic() - self._last_contact_at <= self._staleness_limit_seconds
+
+    def add_event_handler(self, event_handler: Optional[Callable[[str, Dict[str, Any]], None]]) -> None:
+        """Attach an additional reactor callback to a (possibly running) informer.
+
+        Informers are created lazily by the first read path, which passes no
+        handler; watch consumers that attach later register through this method
+        so their handler is invoked for every subsequent event and resync.
         """
-        metadata = obj.get("metadata", {})
-        name = metadata.get("name")
-        if not name:
+        if event_handler is None:
             return
-
         with self._lock:
-            self._cache[name] = obj
-            self._advance_resource_version(metadata.get("resourceVersion"))
+            if event_handler not in self._event_handlers:
+                self._event_handlers.append(event_handler)
 
-    def delete_from_cache(self, name: str) -> None:
-        """Evict a single object from the cache by name."""
+    def subscribe(self, names: List[str], callback: Callable[[str, Dict[str, Any]], None]) -> Callable[[], None]:
+        """Subscribe to named resource changes; return an idempotent unsubscribe."""
+        names = list(dict.fromkeys(names))
         with self._lock:
-            self._cache.pop(name, None)
+            for name in names:
+                self._subscribers.setdefault(name, []).append(callback)
 
-    def _advance_resource_version(self, rv: Optional[str]) -> None:
-        """Advance ``_resource_version`` only when *rv* is strictly newer.
+        subscribed = True
 
-        K8s resourceVersions are opaque strings but etcd encodes them as
-        monotonically increasing integers.  If the conversion fails we skip the
-        update (conservative: keep the current, newer cursor).
+        def unsubscribe() -> None:
+            nonlocal subscribed
+            with self._lock:
+                if not subscribed:
+                    return
+                subscribed = False
+                for name in names:
+                    callbacks = self._subscribers.get(name, [])
+                    if callback in callbacks:
+                        callbacks.remove(callback)
+                    if not callbacks:
+                        self._subscribers.pop(name, None)
 
-        Must be called with ``self._lock`` already held.
+        return unsubscribe
+
+    def invalidate(self) -> None:
+        """Make the published cache unavailable after a mutation it cannot track per object.
+
+        Used for writes made by an external control plane and for write
+        responses that do not identify the written object.
+
+        The cached objects and watch cursor remain owned exclusively by LIST/WATCH.
+        A generation change also prevents an in-flight LIST from publishing a
+        snapshot that may not include the completed mutation.
         """
-        if not rv:
+        with self._lock:
+            self._invalidation_generation += 1
+            self._has_synced = False
+
+    def track_write(self, response: Any) -> None:
+        """Bypass the cache for one object until WATCH or LIST reflects a write.
+
+        ``response`` is the object returned by a successful create or patch.
+        Its resourceVersion is only compared for equality with WATCH and LIST
+        state, and never written into the cache. Other objects stay cached.
+        """
+        metadata = response.get("metadata") if isinstance(response, dict) else None
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        resource_version = metadata.get("resourceVersion") if isinstance(metadata, dict) else None
+        if not name or not resource_version:
+            self.invalidate()
             return
-        if self._resource_version is None:
-            self._resource_version = rv
+        self._add_pending_write(name, resource_version)
+
+    def track_delete(self, name: str, response: Any) -> None:
+        """Bypass the cache for one object until WATCH or LIST reflects a delete.
+
+        A delete that returns the object (for example one held by finalizers)
+        is confirmed by its resourceVersion; any other response waits for the
+        object's DELETED event.
+        """
+        metadata = response.get("metadata") if isinstance(response, dict) else None
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("name") == name
+            and metadata.get("resourceVersion")
+        ):
+            self._add_pending_write(name, metadata["resourceVersion"])
+        else:
+            self._add_pending_write(name, _DELETED)
+
+    def _add_pending_write(self, name: str, token: Any) -> None:
+        with self._lock:
+            self._write_sequence += 1
+            # The WATCH event may have been applied before the write returned;
+            # a no-op patch returns the resourceVersion already cached.
+            if token in self._observed_resource_versions.get(name, ()):
+                return
+            self._pending_writes.setdefault(name, {})[token] = self._write_sequence
+
+    def _confirm_pending_write(self, name: str, resource_version: Optional[str], deleted: bool) -> None:
+        """Drop pending writes that a WATCH event reflects. Caller must hold ``_lock``."""
+        if resource_version:
+            observed = self._observed_resource_versions.get(name)
+            if observed is None:
+                observed = deque(maxlen=_OBSERVED_RESOURCE_VERSIONS_PER_OBJECT)
+                self._observed_resource_versions[name] = observed
+            observed.append(resource_version)
+        tokens = self._pending_writes.get(name)
+        if tokens is None:
             return
-        try:
-            if int(rv) > int(self._resource_version):
-                self._resource_version = rv
-        except ValueError:
-            # Non-integer resourceVersion — skip to avoid downgrade.
-            pass
+        if resource_version:
+            tokens.pop(resource_version, None)
+        if deleted:
+            tokens.pop(_DELETED, None)
+        if not tokens:
+            del self._pending_writes[name]
 
     def _run(self) -> None:
         backoff = 1.0
+        last_full_resync_at: Optional[float] = None
         while not self._stop_event.is_set():
             try:
                 if not self._has_synced:
-                    self._full_resync()
+                    published = self._full_resync()
+                    if not published:
+                        logger.debug("Informer full resync invalidated before publication")
+                        backoff = self._wait_before_retry(backoff)
+                        continue
+                    last_full_resync_at = time.monotonic()
                     backoff = 1.0
+                    self._missing_resource_reported = False
 
                 if not self.enable_watch:
                     self._stop_event.wait(self.resync_period_seconds)
                     self._has_synced = False  # trigger a fresh list on next loop
                     continue
 
-                self._run_watch_loop()
+                if last_full_resync_at is None:
+                    last_full_resync_at = time.monotonic()
+                remaining_resync_seconds = self.resync_period_seconds - (
+                    time.monotonic() - last_full_resync_at
+                )
+                if remaining_resync_seconds <= 0:
+                    self._has_synced = False
+                    continue
+
+                watch_timeout_seconds = min(
+                    self.watch_timeout_seconds,
+                    max(1, math.ceil(remaining_resync_seconds)),
+                )
+                self._run_watch_loop(watch_timeout_seconds)
+                if time.monotonic() - last_full_resync_at >= self.resync_period_seconds:
+                    self._has_synced = False
                 backoff = 1.0
             except ApiException as exc:
                 if exc.status == 410:
@@ -152,23 +297,49 @@ class WorkloadInformer:
                     self._resource_version = None
                     self._has_synced = False
                 else:
-                    logger.warning(f"Informer watch error: {exc}", exc_info=True)
+                    self._log_api_error(exc)
                     self._has_synced = False
-                    self._stop_event.wait(min(backoff, 30.0))
-                    backoff = min(backoff * 2, 30.0)
+                    backoff = self._wait_before_retry(backoff)
             except Exception as exc:  # pragma: no cover - defensive
-                logger.warning(f"Unexpected informer error: {exc}", exc_info=True)
+                logger.warning(f"Unexpected error in informer {self._thread_name}: {exc}", exc_info=True)
                 self._has_synced = False
-                self._stop_event.wait(min(backoff, 30.0))
-                backoff = min(backoff * 2, 30.0)
+                backoff = self._wait_before_retry(backoff)
 
-    def _full_resync(self) -> None:
-        """Perform a full list to refresh the cache."""
+    def _log_api_error(self, exc: ApiException) -> None:
+        """Log a failed LIST or WATCH without flooding the log while a resource is absent.
+
+        A 404 means the API server does not serve the resource, typically
+        because its CRD is not installed. That stays true until someone
+        installs it, so it is reported once per outage and retried quietly.
+        """
+        if exc.status != 404:
+            logger.warning(f"Informer {self._thread_name} watch error: {exc}", exc_info=True)
+            return
+        if self._missing_resource_reported:
+            logger.debug(f"Informer {self._thread_name}: resource still not served (404)")
+            return
+        self._missing_resource_reported = True
+        logger.warning(
+            f"Informer {self._thread_name}: the API server does not serve this resource (404); "
+            "its CRD is probably not installed. Retrying in the background."
+        )
+
+    def _wait_before_retry(self, backoff: float) -> float:
+        """Wait interruptibly and return the next bounded retry delay."""
+        self._stop_event.wait(backoff)
+        return min(backoff * 2, _MAX_BACKOFF_SECONDS)
+
+    def _full_resync(self) -> bool:
+        """Atomically publish a full LIST snapshot unless a mutation invalidated it."""
+        with self._lock:
+            start_generation = self._invalidation_generation
+            start_write_sequence = self._write_sequence
+
         resp = self.list_fn()
 
         # list response is a dict for CustomObjectsApi
-        items = resp.get("items", []) if isinstance(resp, dict) else []
-        metadata = resp.get("metadata", {}) if isinstance(resp, dict) else {}
+        items = resp.get("items", [])
+        metadata = resp.get("metadata", {})
         resource_version = metadata.get("resourceVersion")
 
         # Build new cache outside the lock to avoid blocking readers
@@ -179,24 +350,65 @@ class WorkloadInformer:
                 new_cache[name] = item
 
         with self._lock:
-            self._cache = new_cache
-            self._advance_resource_version(resource_version)
-            self._has_synced = True
+            if self._invalidation_generation != start_generation:
+                return False
 
-    def _run_watch_loop(self) -> None:
-        """Stream watch events to keep the cache fresh."""
+            self._cache = new_cache
+            self._resource_version = resource_version
+            self._has_synced = True
+            self._last_contact_at = time.monotonic()
+            self._observed_resource_versions = {}
+            for name, item in new_cache.items():
+                item_resource_version = item.get("metadata", {}).get("resourceVersion")
+                if item_resource_version:
+                    observed = deque(maxlen=_OBSERVED_RESOURCE_VERSIONS_PER_OBJECT)
+                    observed.append(item_resource_version)
+                    self._observed_resource_versions[name] = observed
+            # A LIST that started after a write returned reflects it. Writes that
+            # returned during the LIST stay pending unless the snapshot shows them.
+            pending_writes: Dict[str, Dict[Any, int]] = {}
+            for name, tokens in self._pending_writes.items():
+                observed_tokens = self._observed_resource_versions.get(name, ())
+                remaining = {
+                    token: sequence
+                    for token, sequence in tokens.items()
+                    if sequence > start_write_sequence and token not in observed_tokens
+                }
+                if remaining:
+                    pending_writes[name] = remaining
+            self._pending_writes = pending_writes
+
+        # React to the snapshot outside the lock: a LIST reconciles objects
+        # that changed while no watch was connected (startup, reconnect).
+        if self._event_handlers or self._subscribers:
+            for item in new_cache.values():
+                self._dispatch_event("SYNC", item)
+        return True
+
+    def _run_watch_loop(self, timeout_seconds: int) -> None:
         w = watch.Watch()
         try:
             for event in w.stream(
                 self.list_fn,
                 resource_version=self._resource_version,
-                timeout_seconds=self.watch_timeout_seconds,
+                timeout_seconds=timeout_seconds,
+                # Without this a half-open connection parks the thread forever.
+                _request_timeout=(
+                    _WATCH_CONNECT_TIMEOUT_SECONDS,
+                    timeout_seconds + _WATCH_READ_TIMEOUT_BUFFER_SECONDS,
+                ),
             ):
                 if self._stop_event.is_set():
                     break
+                if not isinstance(event, dict):
+                    raise TypeError("Informer watch returned a non-dict event")
                 self._handle_event(event)
         finally:
             w.stop()
+
+        # The stream ran to completion, so the API server is still reachable.
+        with self._lock:
+            self._last_contact_at = time.monotonic()
 
     def _handle_event(self, event: Dict[str, Any]) -> None:
         obj = event.get("object")
@@ -220,4 +432,34 @@ class WorkloadInformer:
                 self._cache.pop(name, None)
             else:
                 self._cache[name] = obj
-            self._advance_resource_version(metadata.get("resourceVersion"))
+            resource_version = metadata.get("resourceVersion")
+            self._confirm_pending_write(name, resource_version, deleted=event_type == "DELETED")
+            if resource_version:
+                # resourceVersion is opaque. Watch stream order, not numeric
+                # comparison, determines the last consumed cursor.
+                self._resource_version = resource_version
+            else:
+                # The cache update is retained internally, but cannot be
+                # published until a LIST supplies a trustworthy cursor again.
+                self._has_synced = False
+
+        # Dispatch the reactor outside the cache lock so handlers can read
+        # the cache (or do slow work) without deadlocking the watch thread.
+        self._dispatch_event(event_type, obj)
+
+    def _dispatch_event(self, event_type: Optional[str], obj: Dict[str, Any]) -> None:
+        """Invoke the reactor callbacks; handler failures never kill the watch."""
+        with self._lock:
+            handlers = tuple(self._event_handlers)
+            callbacks = tuple(self._subscribers.get(obj.get("metadata", {}).get("name"), ()))
+        for handler in handlers:
+            try:
+                handler(event_type or "", obj)
+            except Exception as exc:  # noqa: BLE001 - isolation by design
+                logger.warning(f"Informer event handler failed: {exc}", exc_info=True)
+
+        for callback in callbacks:
+            try:
+                callback(event_type or "", obj)
+            except Exception as exc:  # noqa: BLE001 - isolation by design
+                logger.warning(f"Informer subscriber failed: {exc}", exc_info=True)

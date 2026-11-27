@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 package com.alibaba.opensandbox.sandbox.infrastructure.pool
 
+import com.alibaba.opensandbox.sandbox.domain.exceptions.PoolDestroyedException
+import com.alibaba.opensandbox.sandbox.domain.pool.PoolDestroyState
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -137,12 +139,132 @@ class RedisPoolStateStoreTest {
     }
 
     @Test
+    fun `tryTakeIdle surfaces alive entries below the threshold so callers can kill them`() {
+        val stateStore = requireStore()
+
+        // 1s TTL: still alive (server-side TTL has not elapsed) but well below the 60s threshold.
+        stateStore.setIdleEntryTtl(poolName, Duration.ofSeconds(1))
+        stateStore.putIdle(poolName, "id-1")
+        stateStore.putIdle(poolName, "id-2")
+
+        val result = stateStore.tryTakeIdle(poolName, Duration.ofSeconds(60))
+        assertNull(result.sandboxId)
+        assertEquals(setOf("id-1", "id-2"), result.discardedAliveSandboxIds.toSet())
+        assertEquals(0, stateStore.snapshotCounters(poolName).idleCount)
+    }
+
+    @Test
+    fun `tryTakeIdle silently drops fully-expired entries`() {
+        val stateStore = requireStore()
+
+        stateStore.setIdleEntryTtl(poolName, Duration.ofMillis(50))
+        stateStore.putIdle(poolName, "expired")
+        Thread.sleep(150)
+        stateStore.setIdleEntryTtl(poolName, Duration.ofMinutes(10))
+        stateStore.putIdle(poolName, "alive")
+
+        val result = stateStore.tryTakeIdle(poolName, Duration.ofSeconds(60))
+        // expired silently dropped (no kill needed); alive returned.
+        assertEquals("alive", result.sandboxId)
+        assertEquals(emptyList<String>(), result.discardedAliveSandboxIds)
+    }
+
+    @Test
+    fun `reapExpiredIdle with minRemainingTtl returns alive evicted entries`() {
+        val stateStore = requireStore()
+
+        stateStore.setIdleEntryTtl(poolName, Duration.ofSeconds(1))
+        stateStore.putIdle(poolName, "id-1")
+        stateStore.putIdle(poolName, "id-2")
+
+        val discardedAlive =
+            stateStore.reapExpiredIdle(poolName, Instant.now(), Duration.ofSeconds(60))
+
+        assertEquals(setOf("id-1", "id-2"), discardedAlive.toSet())
+        assertEquals(0, stateStore.snapshotCounters(poolName).idleCount)
+    }
+
+    @Test
+    fun `reapExpiredIdle with minRemainingTtl preserves entries above the threshold`() {
+        val stateStore = requireStore()
+
+        stateStore.setIdleEntryTtl(poolName, Duration.ofMinutes(10))
+        stateStore.putIdle(poolName, "id-1")
+
+        val discardedAlive =
+            stateStore.reapExpiredIdle(poolName, Instant.now(), Duration.ofSeconds(60))
+
+        assertEquals(emptyList<String>(), discardedAlive)
+        assertEquals(1, stateStore.snapshotCounters(poolName).idleCount)
+    }
+
+    @Test
+    fun `tryTakeIdle with minRemainingTtl returns entries that satisfy the threshold`() {
+        val stateStore = requireStore()
+
+        stateStore.setIdleEntryTtl(poolName, Duration.ofMinutes(10))
+        stateStore.putIdle(poolName, "id-1")
+
+        val result = stateStore.tryTakeIdle(poolName, Duration.ofSeconds(60))
+        assertEquals("id-1", result.sandboxId)
+        assertEquals(emptyList<String>(), result.discardedAliveSandboxIds)
+    }
+
+    @Test
+    fun `tryTakeIdle with zero minRemainingTtl behaves like the base call`() {
+        val stateStore = requireStore()
+
+        stateStore.putIdle(poolName, "id-1")
+        val taken = stateStore.tryTakeIdle(poolName, Duration.ZERO)
+        assertEquals("id-1", taken.sandboxId)
+        assertEquals(emptyList<String>(), taken.discardedAliveSandboxIds)
+
+        val empty = stateStore.tryTakeIdle(poolName, Duration.ZERO)
+        assertNull(empty.sandboxId)
+        assertEquals(emptyList<String>(), empty.discardedAliveSandboxIds)
+    }
+
+    @Test
     fun `setIdleEntryTtl validates positive duration`() {
         val stateStore = requireStore()
 
         assertThrows(IllegalArgumentException::class.java) {
             stateStore.setIdleEntryTtl(poolName, Duration.ZERO)
         }
+    }
+
+    @Test
+    fun `destroy state fences writes and clearPoolState keeps tombstone`() {
+        val stateStore = requireStore()
+
+        stateStore.putIdle(poolName, "id-1")
+        stateStore.setMaxIdle(poolName, 3)
+
+        stateStore.beginDestroy(poolName, "destroyer")
+
+        assertEquals(PoolDestroyState.DESTROYING, stateStore.getDestroyState(poolName))
+        assertThrows(PoolDestroyedException::class.java) {
+            stateStore.putIdle(poolName, "id-2")
+        }
+        assertThrows(PoolDestroyedException::class.java) {
+            stateStore.setMaxIdle(poolName, 4)
+        }
+        assertThrows(PoolDestroyedException::class.java) {
+            stateStore.setIdleEntryTtl(poolName, Duration.ofMinutes(5))
+        }
+        assertFalse(stateStore.tryAcquirePrimaryLock(poolName, "owner-1", Duration.ofSeconds(60)))
+        assertFalse(stateStore.renewPrimaryLock(poolName, "owner-1", Duration.ofSeconds(60)))
+        assertEquals("id-1", stateStore.tryTakeIdle(poolName))
+
+        stateStore.clearPoolState(poolName)
+        stateStore.markDestroyed(poolName, "destroyer", Duration.ofMinutes(5))
+
+        assertEquals(PoolDestroyState.DESTROYED, stateStore.getDestroyState(poolName))
+        assertThrows(PoolDestroyedException::class.java) {
+            stateStore.beginDestroy(poolName, "destroyer-2")
+        }
+        assertEquals(0, stateStore.snapshotCounters(poolName).idleCount)
+        assertNull(stateStore.getMaxIdle(poolName))
     }
 
     private fun requireStore(): RedisPoolStateStore = store ?: error("Redis store was not initialized")

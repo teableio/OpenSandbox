@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,11 +27,23 @@ namespace OpenSandbox.Tests;
 public class SandboxEgressLifecycleTests
 {
     [Fact]
+    public async Task LegacyFilesystem_ShouldRejectUnsupportedDownloadMetadata()
+    {
+        ISandboxFiles files = new StubFiles();
+        Func<Task> bytes = () => files.ReadBytesDetailedAsync("/data.bin");
+        Func<Task> stream = () => files.ReadBytesStreamDetailedAsync("/data.bin");
+
+        await bytes.Should().ThrowAsync<NotSupportedException>().WithMessage("*download metadata*");
+        await stream.Should().ThrowAsync<NotSupportedException>().WithMessage("*download metadata*");
+    }
+
+    [Fact]
     public async Task CreateAsync_ShouldBuildEgressStackOnce_AndReuseItForOperations()
     {
         var sandboxes = new StubSandboxes();
         var egress = new StubEgress();
-        var adapterFactory = new StubAdapterFactory(sandboxes, egress);
+        var credentialVault = new StubCredentialVault();
+        var adapterFactory = new StubAdapterFactory(sandboxes, egress, credentialVault);
 
         var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
         {
@@ -56,6 +68,8 @@ public class SandboxEgressLifecycleTests
             Target = "www.github.com"
         }]);
         await sandbox.DeleteEgressRulesAsync(["www.github.com", "*.blocked.org"]);
+        await sandbox.CredentialVault.GetAsync();
+        await sandbox.GetCredentialVaultAsync();
 
         sandboxes.EndpointCalls.Should().Equal(Constants.DefaultExecdPort, Constants.DefaultEgressPort);
         adapterFactory.EgressStackCallCount.Should().Be(1);
@@ -63,7 +77,39 @@ public class SandboxEgressLifecycleTests
         egress.GetPolicyCallCount.Should().Be(1);
         egress.PatchRulesCallCount.Should().Be(1);
         egress.DeleteRulesCallCount.Should().Be(1);
+        credentialVault.GetVaultCallCount.Should().Be(2);
         egress.LastDeleteTargets.Should().Equal("www.github.com", "*.blocked.org");
+    }
+
+    [Fact]
+    public async Task CreateAsync_ShouldAcceptCustomEgressWithoutCredentialVaultMethods()
+    {
+        var sandboxes = new StubSandboxes();
+        var egress = new StubEgress();
+        var adapterFactory = new StubAdapterFactory(sandboxes, egress);
+
+        var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            Image = "python:3.12",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            }
+        });
+
+        await sandbox.GetEgressPolicyAsync();
+        Func<Task> act = () => sandbox.CredentialVault.GetAsync();
+
+        egress.GetPolicyCallCount.Should().Be(1);
+        await act.Should().ThrowAsync<InvalidArgumentException>()
+            .WithMessage("Credential Vault is not available for this adapter factory*");
     }
 
     [Fact]
@@ -82,6 +128,10 @@ public class SandboxEgressLifecycleTests
             }),
             AdapterFactory = adapterFactory,
             SkipHealthCheck = true,
+            CredentialProxy = new CredentialProxyConfig
+            {
+                Enabled = true
+            },
             Volumes =
             [
                 new Volume
@@ -98,9 +148,228 @@ public class SandboxEgressLifecycleTests
         });
 
         sandboxes.LastCreateRequest.Should().NotBeNull();
+        sandboxes.LastCreateRequest!.CredentialProxy.Should().NotBeNull();
+        sandboxes.LastCreateRequest!.CredentialProxy!.Enabled.Should().BeTrue();
         sandboxes.LastCreateRequest!.Volumes.Should().NotBeNull();
         sandboxes.LastCreateRequest.Volumes!.Should().ContainSingle();
         sandboxes.LastCreateRequest.Volumes![0].Host!.Path.Should().Be("D:/sandbox-mnt/ReMe");
+    }
+
+    [Fact]
+    public async Task CreateAsync_ShouldForwardLifecycleHooks()
+    {
+        var sandboxes = new StubSandboxes();
+        var adapterFactory = new StubAdapterFactory(sandboxes, new StubEgress());
+        var lifecycle = new SandboxLifecycle
+        {
+            PreStart = new LifecycleHook
+            {
+                Command = ["/opt/hooks/restore.sh"],
+                TimeoutSeconds = 300
+            },
+            Periodic =
+            [
+                new PeriodicLifecycleHook
+                {
+                    Name = "checkpoint",
+                    Schedule = "@hourly",
+                    Command = ["/opt/hooks/checkpoint.sh"]
+                }
+            ]
+        };
+
+        await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            Image = "python:3.12",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            },
+            Lifecycle = lifecycle
+        });
+
+        sandboxes.LastCreateRequest.Should().NotBeNull();
+        var forwarded = sandboxes.LastCreateRequest!.Lifecycle;
+        forwarded.Should().NotBeNull();
+        forwarded!.PreStart.Should().NotBeNull();
+        forwarded.PreStart!.Command.Should().Equal("/opt/hooks/restore.sh");
+        forwarded.PreStart.TimeoutSeconds.Should().Be(300);
+        forwarded.Periodic.Should().ContainSingle();
+        forwarded.Periodic![0].Name.Should().Be("checkpoint");
+        forwarded.Periodic[0].Schedule.Should().Be("@hourly");
+        forwarded.Periodic[0].Command.Should().Equal("/opt/hooks/checkpoint.sh");
+    }
+
+    [Fact]
+    public async Task CreateAsync_ShouldForwardLifecycleIdlePolicy()
+    {
+        var sandboxes = new StubSandboxes();
+        var adapterFactory = new StubAdapterFactory(sandboxes, new StubEgress());
+
+        await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            Image = "python:3.12",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            },
+            Lifecycle = new SandboxLifecycle
+            {
+                IdlePolicy = new IdlePolicy
+                {
+                    IdleTimeoutSeconds = 300,
+                    OnIdle = OnIdleAction.Pause,
+                    WakeOnAccess = true,
+                    ActiveProbe = new ActivityProbe { Port = 8080, Path = "/active" }
+                }
+            }
+        });
+
+        sandboxes.LastCreateRequest.Should().NotBeNull();
+        var idlePolicy = sandboxes.LastCreateRequest!.Lifecycle!.IdlePolicy;
+        idlePolicy.Should().NotBeNull();
+        idlePolicy!.IdleTimeoutSeconds.Should().Be(300);
+        idlePolicy.OnIdle.Should().Be(OnIdleAction.Pause);
+        idlePolicy.WakeOnAccess.Should().BeTrue();
+        idlePolicy.ActiveProbe!.Port.Should().Be(8080);
+        idlePolicy.ActiveProbe.Path.Should().Be("/active");
+    }
+
+    [Fact]
+    public async Task CreateAsync_ShouldForwardLifecycleRenewalPolicy()
+    {
+        var sandboxes = new StubSandboxes();
+        var adapterFactory = new StubAdapterFactory(sandboxes, new StubEgress());
+
+        await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            Image = "python:3.12",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            },
+            Lifecycle = new SandboxLifecycle
+            {
+                RenewalPolicy = new RenewalPolicy { ExtendSeconds = 3600 }
+            }
+        });
+
+        sandboxes.LastCreateRequest.Should().NotBeNull();
+        var renewalPolicy = sandboxes.LastCreateRequest!.Lifecycle!.RenewalPolicy;
+        renewalPolicy.Should().NotBeNull();
+        renewalPolicy!.ExtendSeconds.Should().Be(3600);
+    }
+
+    [Fact]
+    public async Task CreateAsync_ShouldFastFailOnOutOfRangeRenewalPolicy()
+    {
+        var sandboxes = new StubSandboxes();
+        var adapterFactory = new StubAdapterFactory(sandboxes, new StubEgress());
+
+        Func<Task> act = () => Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            Image = "python:3.12",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            },
+            Lifecycle = new SandboxLifecycle
+            {
+                RenewalPolicy = new RenewalPolicy { ExtendSeconds = 299 }
+            }
+        });
+
+        await act.Should().ThrowAsync<ArgumentOutOfRangeException>();
+        sandboxes.LastCreateRequest.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task CreateFromTemplateAsync_ShouldForwardIdlePolicyInsideLifecycle()
+    {
+        var sandboxes = new StubSandboxes();
+        var adapterFactory = new StubAdapterFactory(sandboxes, new StubEgress());
+
+        await using var sandbox = await Sandbox.CreateFromTemplateAsync(new SandboxCreateFromTemplateOptions
+        {
+            TemplateId = "tpl-123",
+            TimeoutSeconds = 600,
+            IdlePolicy = new IdlePolicy
+            {
+                IdleTimeoutSeconds = 300,
+                OnIdle = OnIdleAction.Pause,
+                WakeOnAccess = true
+            },
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            }
+        });
+
+        sandboxes.LastCreateRequest.Should().NotBeNull();
+        var forwarded = sandboxes.LastCreateRequest!.Lifecycle;
+        forwarded.Should().NotBeNull();
+        forwarded!.IdlePolicy.Should().NotBeNull();
+        forwarded.IdlePolicy!.IdleTimeoutSeconds.Should().Be(300);
+        forwarded.IdlePolicy.OnIdle.Should().Be(OnIdleAction.Pause);
+        // Template mode must not forward workload-shaping lifecycle fields.
+        forwarded.PreStart.Should().BeNull();
+        forwarded.Periodic.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task CreateAsync_ShouldRejectInvalidIdlePolicy()
+    {
+        var act = async () => await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            Image = "python:3.12",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            SkipHealthCheck = true,
+            Lifecycle = new SandboxLifecycle
+            {
+                IdlePolicy = new IdlePolicy { IdleTimeoutSeconds = 10, OnIdle = OnIdleAction.Pause }
+            }
+        });
+
+        (await act.Should().ThrowAsync<ArgumentException>()).Which.Message.Should().Contain("IdleTimeoutSeconds");
     }
 
     [Fact]
@@ -170,21 +439,217 @@ public class SandboxEgressLifecycleTests
         adapterFactory.LifecycleStackCallCount.Should().Be(0);
     }
 
+    [Fact]
+    public async Task CreateFromTemplateAsync_ShouldRouteEgressThroughControlPlane()
+    {
+        var sandboxes = new StubSandboxes();
+        var egress = new StubEgress();
+        var adapterFactory = new StubAdapterFactory(sandboxes, egress);
+
+        await using var sandbox = await Sandbox.CreateFromTemplateAsync(new SandboxCreateFromTemplateOptions
+        {
+            TemplateId = "tpl-123",
+            TimeoutSeconds = 600,
+            Metadata = new Dictionary<string, string> { ["team"] = "platform" },
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            }
+        });
+
+        sandboxes.LastCreateRequest.Should().NotBeNull();
+        sandboxes.LastCreateRequest!.TemplateId.Should().Be("tpl-123");
+        sandboxes.LastCreateRequest.Timeout.Should().Be(600);
+        sandboxes.LastCreateRequest.Image.Should().BeNull();
+        sandboxes.LastCreateRequest.SnapshotId.Should().BeNull();
+        sandboxes.LastCreateRequest.Entrypoint.Should().BeNull();
+        sandboxes.LastCreateRequest.ResourceLimits.Should().BeNull();
+        sandboxes.LastCreateRequest.Metadata.Should().NotBeNull();
+
+        // Template-backed sandboxes never resolve the egress sidecar endpoint.
+        sandboxes.EndpointCalls.Should().Equal(Constants.DefaultExecdPort);
+        adapterFactory.EgressStackCallCount.Should().Be(0);
+        adapterFactory.NetworkPolicyStackCallCount.Should().Be(1);
+        adapterFactory.LastNetworkPolicySandboxId.Should().Be("sandbox-test-id");
+        egress.GetPolicyCallCount.Should().Be(0);
+
+        sandbox.Origin.Should().Be(SandboxOrigin.Template);
+        await sandbox.GetEgressPolicyAsync();
+        egress.GetPolicyCallCount.Should().Be(1);
+
+        // Without a factory-provided vault the getter surfaces the unavailable error.
+        Func<Task> credentialVaultProperty = () =>
+        {
+            _ = sandbox.CredentialVault;
+            return Task.CompletedTask;
+        };
+        await credentialVaultProperty.Should().ThrowAsync<SandboxException>()
+            .WithMessage("Credential Vault is not available: the adapter factory did not provide*");
+
+        // With one, template-backed sandboxes route the vault through the
+        // lifecycle control plane instead of failing.
+        var stubVault = new StubCredentialVault();
+        var routedFactory = new StubAdapterFactory(sandboxes, egress, stubVault);
+        await using var routedSandbox = await Sandbox.CreateFromTemplateAsync(new SandboxCreateFromTemplateOptions
+        {
+            TemplateId = "tpl-123",
+            TimeoutSeconds = 600,
+            AdapterFactory = routedFactory,
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            }
+        });
+        routedFactory.NetworkPolicyStackCallCount.Should().Be(1);
+        _ = routedSandbox.CredentialVault;
+        await routedSandbox.CredentialVault.GetAsync();
+        stubVault.GetVaultCallCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task CreateFromTemplateAsync_ShouldRejectBlankTemplateId()
+    {
+        Func<Task> act = async () =>
+        {
+            await Sandbox.CreateFromTemplateAsync(new SandboxCreateFromTemplateOptions
+            {
+                TemplateId = "  ",
+                TimeoutSeconds = 600
+            });
+        };
+
+        await act.Should().ThrowAsync<InvalidArgumentException>()
+            .WithMessage("TemplateId must be specified.");
+    }
+
+    [Fact]
+    public async Task CreateAsync_ShouldDetectTemplateOriginFromServerHeader()
+    {
+        var sandboxes = new StubSandboxes { ExecdEndpointOrigin = SandboxOrigin.Template };
+        var egress = new StubEgress();
+        var adapterFactory = new StubAdapterFactory(sandboxes, egress);
+
+        await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            SnapshotId = "snap-123",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            }
+        });
+
+        // The server is authoritative: fsb-prefixed sandboxes report origin=template
+        // even when the create used a snapshotId.
+        sandboxes.EndpointCalls.Should().Equal(Constants.DefaultExecdPort);
+        adapterFactory.EgressStackCallCount.Should().Be(0);
+        adapterFactory.NetworkPolicyStackCallCount.Should().Be(1);
+        adapterFactory.LastNetworkPolicySandboxId.Should().Be("sandbox-test-id");
+        sandbox.Origin.Should().Be(SandboxOrigin.Template);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_ShouldRouteEgressByReportedOrigin()
+    {
+        var sandboxes = new StubSandboxes { ExecdEndpointOrigin = SandboxOrigin.Template };
+        var egress = new StubEgress();
+        var adapterFactory = new StubAdapterFactory(sandboxes, egress);
+
+        await using var sandbox = await Sandbox.ConnectAsync(new SandboxConnectOptions
+        {
+            SandboxId = "sandbox-test-id",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            }
+        });
+
+        sandboxes.EndpointCalls.Should().Equal(Constants.DefaultExecdPort);
+        adapterFactory.EgressStackCallCount.Should().Be(0);
+        adapterFactory.NetworkPolicyStackCallCount.Should().Be(1);
+        adapterFactory.LastNetworkPolicySandboxId.Should().Be("sandbox-test-id");
+        sandbox.Origin.Should().Be(SandboxOrigin.Template);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_ShouldKeepSidecarEgressWhenOriginMissing()
+    {
+        var sandboxes = new StubSandboxes();
+        var egress = new StubEgress();
+        var credentialVault = new StubCredentialVault();
+        var adapterFactory = new StubAdapterFactory(sandboxes, egress, credentialVault);
+
+        await using var sandbox = await Sandbox.ConnectAsync(new SandboxConnectOptions
+        {
+            SandboxId = "sandbox-test-id",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            }
+        });
+
+        sandboxes.EndpointCalls.Should().Equal(Constants.DefaultExecdPort, Constants.DefaultEgressPort);
+        adapterFactory.EgressStackCallCount.Should().Be(1);
+        adapterFactory.NetworkPolicyStackCallCount.Should().Be(0);
+        sandbox.Origin.Should().Be(SandboxOrigin.Unknown);
+    }
+
     private sealed class StubAdapterFactory : IAdapterFactory
     {
         private readonly ISandboxes _sandboxes;
         private readonly IEgress _egress;
+        private readonly ICredentialVault? _credentialVault;
 
-        public StubAdapterFactory(ISandboxes sandboxes, IEgress egress)
+        public StubAdapterFactory(
+            ISandboxes sandboxes,
+            IEgress egress,
+            ICredentialVault? credentialVault = null)
         {
             _sandboxes = sandboxes;
             _egress = egress;
+            _credentialVault = credentialVault;
         }
 
         public int EgressStackCallCount { get; private set; }
         public int LifecycleStackCallCount { get; private set; }
+        public int NetworkPolicyStackCallCount { get; private set; }
 
         public string? LastEgressBaseUrl { get; private set; }
+
+        public string? LastNetworkPolicySandboxId { get; private set; }
 
         public LifecycleStack CreateLifecycleStack(CreateLifecycleStackOptions options)
         {
@@ -202,7 +667,8 @@ public class SandboxEgressLifecycleTests
                 Commands = new Mock<IExecdCommands>(MockBehavior.Strict).Object,
                 Files = new StubFiles(),
                 Health = new StubHealth(),
-                Metrics = new StubMetrics()
+                Metrics = new StubMetrics(),
+                Isolation = new Mock<IIsolatedSessions>(MockBehavior.Strict).Object
             };
         }
 
@@ -212,7 +678,19 @@ public class SandboxEgressLifecycleTests
             LastEgressBaseUrl = options.EgressBaseUrl;
             return new EgressStack
             {
-                Egress = _egress
+                Egress = _egress,
+                CredentialVault = _credentialVault
+            };
+        }
+
+        public NetworkPolicyStack CreateNetworkPolicyStack(CreateNetworkPolicyStackOptions options)
+        {
+            NetworkPolicyStackCallCount++;
+            LastNetworkPolicySandboxId = options.SandboxId;
+            return new NetworkPolicyStack
+            {
+                Egress = _egress,
+                CredentialVault = _credentialVault
             };
         }
     }
@@ -221,6 +699,12 @@ public class SandboxEgressLifecycleTests
     {
         public List<int> EndpointCalls { get; } = new();
         public CreateSandboxRequest? LastCreateRequest { get; private set; }
+
+        /// <summary>
+        /// Origin reported by the execd endpoint fetch; null means the server
+        /// sends no OPEN-SANDBOX-ORIGIN header.
+        /// </summary>
+        public string? ExecdEndpointOrigin { get; set; }
 
         public Task<CreateSandboxResponse> CreateSandboxAsync(CreateSandboxRequest request, CancellationToken cancellationToken = default)
         {
@@ -279,7 +763,8 @@ public class SandboxEgressLifecycleTests
                 Headers = new Dictionary<string, string>
                 {
                     ["X-Port"] = port.ToString()
-                }
+                },
+                Origin = port == Constants.DefaultExecdPort ? ExecdEndpointOrigin : null
             });
         }
 
@@ -295,6 +780,19 @@ public class SandboxEgressLifecycleTests
                 }
             });
         }
+
+        public Task<TemplateInfo> CreateTemplateAsync(CreateTemplateRequest request, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
+        public Task<TemplateInfo> GetTemplateAsync(string templateId, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
+        public Task<ListTemplatesResponse> ListTemplatesAsync(ListTemplatesParams? @params = null, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
+        public Task DeleteTemplateAsync(string templateId, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
     }
 
     private sealed class StubEgress : IEgress
@@ -335,6 +833,87 @@ public class SandboxEgressLifecycleTests
         }
     }
 
+    private sealed class StubCredentialVault : ICredentialVault
+    {
+        public int GetVaultCallCount { get; private set; }
+
+        public Task<CredentialVaultState> CreateAsync(
+            IReadOnlyList<Credential> credentials,
+            IReadOnlyList<CredentialBinding> bindings,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(CreateVaultState());
+        }
+
+        public Task<CredentialVaultState> GetAsync(CancellationToken cancellationToken = default)
+        {
+            GetVaultCallCount++;
+            return Task.FromResult(CreateVaultState());
+        }
+
+        public Task<CredentialVaultState> PatchAsync(
+            CredentialVaultPatchRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(CreateVaultState());
+        }
+
+        public Task DeleteAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<CredentialMetadata>> ListCredentialsAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<CredentialMetadata>>(CreateVaultState().Credentials);
+        }
+
+        public Task<CredentialMetadata> GetCredentialAsync(
+            string name,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(CreateVaultState().Credentials[0]);
+        }
+
+        public Task<IReadOnlyList<CredentialBindingMetadata>> ListBindingsAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<CredentialBindingMetadata>>(CreateVaultState().Bindings);
+        }
+
+        public Task<CredentialBindingMetadata> GetBindingAsync(
+            string name,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(CreateVaultState().Bindings[0]);
+        }
+
+        private static CredentialVaultState CreateVaultState()
+        {
+            return new CredentialVaultState
+            {
+                Revision = 1,
+                Credentials =
+                [
+                    new CredentialMetadata
+                    {
+                        Name = "api-token",
+                        SourceType = "inline",
+                        Revision = 1
+                    }
+                ],
+                Bindings =
+                [
+                    new CredentialBindingMetadata
+                    {
+                        Name = "api-binding",
+                        Revision = 1,
+                        Auth = new CredentialAuthMetadata
+                        {
+                            Type = "bearer"
+                        }
+                    }
+                ]
+            };
+        }
+    }
+
     private sealed class StubFiles : ISandboxFiles
     {
         public Task<IReadOnlyDictionary<string, SandboxFileInfo>> GetFileInfoAsync(IEnumerable<string> paths, CancellationToken cancellationToken = default) =>
@@ -347,6 +926,9 @@ public class SandboxEgressLifecycleTests
             throw new NotImplementedException();
 
         public Task DeleteDirectoriesAsync(IEnumerable<string> paths, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
+        public Task<IReadOnlyList<SandboxFileInfo>> ListDirectoryAsync(string path, int? depth = null, CancellationToken cancellationToken = default) =>
             throw new NotImplementedException();
 
         public Task WriteFilesAsync(IEnumerable<WriteEntry> entries, CancellationToken cancellationToken = default) =>
@@ -368,6 +950,9 @@ public class SandboxEgressLifecycleTests
             throw new NotImplementedException();
 
         public Task ReplaceContentsAsync(IEnumerable<ContentReplaceEntry> entries, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
+        public Task<IReadOnlyList<ContentReplaceResult>> ReplaceContentsDetailedAsync(IEnumerable<ContentReplaceEntry> entries, CancellationToken cancellationToken = default) =>
             throw new NotImplementedException();
 
         public Task SetPermissionsAsync(IEnumerable<SetPermissionEntry> entries, CancellationToken cancellationToken = default) =>

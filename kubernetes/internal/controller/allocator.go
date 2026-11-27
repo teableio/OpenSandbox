@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,9 +20,12 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -32,9 +35,9 @@ import (
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils"
 )
 
-type AllocationStore interface {
-	GetAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool) (*PoolAllocation, error)
-	SetAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool, allocation *PoolAllocation) error
+type allocationStore interface {
+	GetAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool) (*poolAllocation, error)
+	SetAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool, allocation *poolAllocation) error
 	ClearAllocation(ctx context.Context, ns string, poolName string) error
 	ReleaseAllocation(ctx context.Context, ns string, poolName string, pods []string)
 	UpdateAllocation(ctx context.Context, ns string, poolName string, sandboxName string, pods []string)
@@ -50,15 +53,15 @@ type poolEntry struct {
 	data map[string]string // podName -> sandboxName
 }
 
-// InMemoryAllocationStore depends on annoAllocationSyncer to get allocation info from BatchSandbox.
-type InMemoryAllocationStore struct {
+// inMemoryAllocationStore depends on annoAllocationSyncer to get allocation info from BatchSandbox.
+type inMemoryAllocationStore struct {
 	poolsMu sync.RWMutex
 	pools   map[string]*poolEntry
 	syncer  *annoAllocationSyncer
 }
 
-func NewInMemoryAllocationStore() AllocationStore {
-	return &InMemoryAllocationStore{
+func newInMemoryAllocationStore() allocationStore {
+	return &inMemoryAllocationStore{
 		pools:  make(map[string]*poolEntry),
 		syncer: &annoAllocationSyncer{},
 	}
@@ -66,7 +69,7 @@ func NewInMemoryAllocationStore() AllocationStore {
 
 // Recover builds the allocation map from all BatchSandboxes
 // This should be called once during controller initialization before reconcile starts
-func (store *InMemoryAllocationStore) Recover(ctx context.Context, c client.Client) error {
+func (store *inMemoryAllocationStore) Recover(ctx context.Context, c client.Client) error {
 	log := logf.FromContext(ctx)
 	log.Info("Starting allocation recovery from BatchSandboxes")
 
@@ -125,7 +128,7 @@ func (store *InMemoryAllocationStore) Recover(ctx context.Context, c client.Clie
 	return nil
 }
 
-func (store *InMemoryAllocationStore) ClearAllocation(ctx context.Context, ns string, poolName string) error {
+func (store *inMemoryAllocationStore) ClearAllocation(ctx context.Context, ns string, poolName string) error {
 	log := logf.FromContext(ctx)
 	store.poolsMu.Lock()
 	log.Info("Clearing pool allocation", "namespace", ns, "pool", poolName)
@@ -134,12 +137,12 @@ func (store *InMemoryAllocationStore) ClearAllocation(ctx context.Context, ns st
 	return nil
 }
 
-func (store *InMemoryAllocationStore) GetAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool) (*PoolAllocation, error) {
+func (store *inMemoryAllocationStore) GetAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool) (*poolAllocation, error) {
 	store.poolsMu.RLock()
 	entry, exists := store.pools[store.poolKey(pool.Namespace, pool.Name)]
 	store.poolsMu.RUnlock()
 
-	alloc := &PoolAllocation{
+	alloc := &poolAllocation{
 		PodAllocation: make(map[string]string),
 	}
 
@@ -157,7 +160,7 @@ func (store *InMemoryAllocationStore) GetAllocation(ctx context.Context, pool *s
 	return alloc, nil
 }
 
-func (store *InMemoryAllocationStore) SetAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool, alloc *PoolAllocation) error {
+func (store *inMemoryAllocationStore) SetAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool, alloc *poolAllocation) error {
 	entry := store.getOrCreatePool(pool.Namespace, pool.Name)
 
 	entry.mu.Lock()
@@ -171,7 +174,7 @@ func (store *InMemoryAllocationStore) SetAllocation(ctx context.Context, pool *s
 	return nil
 }
 
-func (store *InMemoryAllocationStore) ReleaseAllocation(ctx context.Context, ns string, poolName string, pods []string) {
+func (store *inMemoryAllocationStore) ReleaseAllocation(ctx context.Context, ns string, poolName string, pods []string) {
 	entry := store.getOrCreatePool(ns, poolName)
 
 	entry.mu.Lock()
@@ -182,7 +185,7 @@ func (store *InMemoryAllocationStore) ReleaseAllocation(ctx context.Context, ns 
 	}
 }
 
-func (store *InMemoryAllocationStore) UpdateAllocation(ctx context.Context, ns string, poolName string, sandboxName string, pods []string) {
+func (store *inMemoryAllocationStore) UpdateAllocation(ctx context.Context, ns string, poolName string, sandboxName string, pods []string) {
 	entry := store.getOrCreatePool(ns, poolName)
 
 	entry.mu.Lock()
@@ -201,7 +204,7 @@ func (store *InMemoryAllocationStore) UpdateAllocation(ctx context.Context, ns s
 
 // ReleaseSandboxAllocation releases all pods allocated to the given sandbox from the in-memory store.
 // This should be called when a BatchSandbox is deleted to ensure the allocation state is cleaned up.
-func (store *InMemoryAllocationStore) ReleaseSandboxAllocation(ctx context.Context, ns string, poolName string, sandboxName string) {
+func (store *inMemoryAllocationStore) ReleaseSandboxAllocation(ctx context.Context, ns string, poolName string, sandboxName string) {
 	store.poolsMu.RLock()
 	entry, exists := store.pools[store.poolKey(ns, poolName)]
 	store.poolsMu.RUnlock()
@@ -222,7 +225,7 @@ func (store *InMemoryAllocationStore) ReleaseSandboxAllocation(ctx context.Conte
 
 // getOrCreatePool returns the pool entry for the given pool name, creating it if necessary.
 // This method uses a double-checked locking pattern to ensure thread-safe creation.
-func (store *InMemoryAllocationStore) getOrCreatePool(ns string, poolName string) *poolEntry {
+func (store *inMemoryAllocationStore) getOrCreatePool(ns string, poolName string) *poolEntry {
 	store.poolsMu.RLock()
 	entry, exists := store.pools[store.poolKey(ns, poolName)]
 	store.poolsMu.RUnlock()
@@ -246,29 +249,30 @@ func (store *InMemoryAllocationStore) getOrCreatePool(ns string, poolName string
 	return entry
 }
 
-func (store *InMemoryAllocationStore) poolKey(ns, name string) string {
+func (store *inMemoryAllocationStore) poolKey(ns, name string) string {
 	return ns + "/" + name
 }
 
-type AllocationSyncer interface {
-	SetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, allocation *SandboxAllocation) error
-	GetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*SandboxAllocation, error)
-	GetRelease(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*AllocationRelease, error)
-	SetReleased(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, released *AllocationReleased) error
-	GetReleased(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*AllocationReleased, error)
+type allocationSyncer interface {
+	SetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, allocation *sandboxAllocation) error
+	GetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*sandboxAllocation, error)
+	GetRelease(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*allocationRelease, error)
+	SetReleased(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, released *allocationReleased) error
+	GetReleased(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*allocationReleased, error)
 }
 
 type annoAllocationSyncer struct {
-	client client.Client
+	client    client.Client
+	apiReader client.Reader
 }
 
-func NewAnnoAllocationSyncer(client client.Client) AllocationSyncer {
-	return &annoAllocationSyncer{
-		client: client,
-	}
+func newAnnoAllocationSyncer(c client.Client, apiReader client.Reader) allocationSyncer {
+	return &annoAllocationSyncer{client: c, apiReader: apiReader}
 }
 
-func (syncer *annoAllocationSyncer) SetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, allocation *SandboxAllocation) error {
+func (syncer *annoAllocationSyncer) SetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, allocation *sandboxAllocation) error {
+	allocation.PoolRef = sandbox.Spec.PoolRef
+	allocation.Generation = sandbox.Generation
 	js, err := json.Marshal(allocation)
 	if err != nil {
 		return err
@@ -277,17 +281,17 @@ func (syncer *annoAllocationSyncer) SetAllocation(ctx context.Context, sandbox *
 	if anno == nil {
 		anno = make(map[string]string)
 	}
-	anno[AnnoAllocStatusKey] = string(js)
+	anno[annoAllocStatusKey] = string(js)
 	sandbox.SetAnnotations(anno)
 
-	needAddFinalizer := !controllerutil.ContainsFinalizer(sandbox, FinalizerPoolAllocation)
+	needAddFinalizer := !controllerutil.ContainsFinalizer(sandbox, finalizerPoolAllocation)
 	if needAddFinalizer {
-		sandbox.SetFinalizers(append(sandbox.GetFinalizers(), FinalizerPoolAllocation))
+		sandbox.SetFinalizers(append(sandbox.GetFinalizers(), finalizerPoolAllocation))
 	}
 
 	meta := map[string]any{
 		"annotations": map[string]string{
-			AnnoAllocStatusKey: string(js),
+			annoAllocStatusKey: string(js),
 		},
 	}
 	if needAddFinalizer {
@@ -300,18 +304,21 @@ func (syncer *annoAllocationSyncer) SetAllocation(ctx context.Context, sandbox *
 	obj := &sandboxv1alpha1.BatchSandbox{}
 	obj.Name = sandbox.Name
 	obj.Namespace = sandbox.Namespace
-	return syncer.client.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData))
+	persistStart := time.Now()
+	patchErr := syncer.client.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData))
+	recordAllocatorPersistAllocStateDuration(ctx, sandbox, time.Since(persistStart), patchErr)
+	return patchErr
 }
 
-func (syncer *annoAllocationSyncer) GetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*SandboxAllocation, error) {
-	allocation := &SandboxAllocation{
+func (syncer *annoAllocationSyncer) GetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*sandboxAllocation, error) {
+	allocation := &sandboxAllocation{
 		Pods: make([]string, 0),
 	}
 	anno := sandbox.GetAnnotations()
 	if anno == nil {
 		return allocation, nil
 	}
-	if raw := anno[AnnoAllocStatusKey]; raw != "" {
+	if raw := anno[annoAllocStatusKey]; raw != "" {
 		err := json.Unmarshal([]byte(raw), allocation)
 		if err != nil {
 			return nil, err
@@ -320,15 +327,15 @@ func (syncer *annoAllocationSyncer) GetAllocation(ctx context.Context, sandbox *
 	return allocation, nil
 }
 
-func (syncer *annoAllocationSyncer) GetRelease(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*AllocationRelease, error) {
-	release := &AllocationRelease{
+func (syncer *annoAllocationSyncer) GetRelease(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*allocationRelease, error) {
+	release := &allocationRelease{
 		Pods: make([]string, 0),
 	}
 	anno := sandbox.GetAnnotations()
 	if anno == nil {
 		return release, nil
 	}
-	if raw := anno[AnnoAllocReleaseKey]; raw != "" {
+	if raw := anno[annoAllocReleaseKey]; raw != "" {
 		err := json.Unmarshal([]byte(raw), release)
 		if err != nil {
 			return nil, err
@@ -337,15 +344,15 @@ func (syncer *annoAllocationSyncer) GetRelease(ctx context.Context, sandbox *san
 	return release, nil
 }
 
-func (syncer *annoAllocationSyncer) GetReleased(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*AllocationReleased, error) {
-	released := &AllocationReleased{
+func (syncer *annoAllocationSyncer) GetReleased(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*allocationReleased, error) {
+	released := &allocationReleased{
 		Pods: make([]string, 0),
 	}
 	anno := sandbox.GetAnnotations()
 	if anno == nil {
 		return released, nil
 	}
-	if raw := anno[AnnoAllocReleasedKey]; raw != "" {
+	if raw := anno[annoAllocReleasedKey]; raw != "" {
 		err := json.Unmarshal([]byte(raw), released)
 		if err != nil {
 			return nil, err
@@ -354,68 +361,50 @@ func (syncer *annoAllocationSyncer) GetReleased(ctx context.Context, sandbox *sa
 	return released, nil
 }
 
-func (syncer *annoAllocationSyncer) SetReleased(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, released *AllocationReleased) error {
+func (syncer *annoAllocationSyncer) SetReleased(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, released *allocationReleased) error {
+	if syncer.apiReader == nil {
+		return fmt.Errorf("uncached API reader is not configured")
+	}
 	js, err := json.Marshal(released)
 	if err != nil {
 		return err
 	}
-	anno := sandbox.GetAnnotations()
-	if anno == nil {
-		anno = make(map[string]string)
-	}
-	anno[AnnoAllocReleasedKey] = string(js)
-	sandbox.SetAnnotations(anno)
-
-	needRemoveFinalizer := false
-	// If the sandbox is being deleted and all allocated pods have been released,
-	// remove the finalizer so the sandbox can be garbage collected.
-	if !sandbox.DeletionTimestamp.IsZero() {
-		allocation, err := syncer.GetAllocation(ctx, sandbox)
-		if err != nil {
-			return err
+	// Finalizers are shared with other cleanup controllers. Recompute from the
+	// latest object on every optimistic-lock retry so a stale array cannot
+	// restore a finalizer another controller has already removed. Bypass the
+	// informer cache so every retry can observe the conflicting API write.
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest := &sandboxv1alpha1.BatchSandbox{}
+		if err := syncer.apiReader.Get(ctx, client.ObjectKeyFromObject(sandbox), latest); err != nil {
+			return client.IgnoreNotFound(err)
 		}
-		releasedSet := make(map[string]struct{}, len(released.Pods))
-		for _, p := range released.Pods {
-			releasedSet[p] = struct{}{}
+		if sandbox.UID != "" && sandbox.UID != latest.UID {
+			return nil // The original sandbox has already been deleted.
 		}
-		allReleased := true
-		for _, p := range allocation.Pods {
-			if _, ok := releasedSet[p]; !ok {
-				allReleased = false
-				break
+		base := latest.DeepCopy()
+		if latest.Annotations == nil {
+			latest.Annotations = make(map[string]string)
+		}
+		latest.Annotations[annoAllocReleasedKey] = string(js)
+		if !latest.DeletionTimestamp.IsZero() {
+			allocation, err := syncer.GetAllocation(ctx, latest)
+			if err != nil {
+				return err
+			}
+			releasedSet := sets.New(released.Pods...)
+			if releasedSet.HasAll(allocation.Pods...) {
+				controllerutil.RemoveFinalizer(latest, finalizerPoolAllocation)
 			}
 		}
-		if allReleased && controllerutil.ContainsFinalizer(sandbox, FinalizerPoolAllocation) {
-			needRemoveFinalizer = true
-			filtered := make([]string, 0, len(sandbox.GetFinalizers()))
-			for _, f := range sandbox.GetFinalizers() {
-				if f != FinalizerPoolAllocation {
-					filtered = append(filtered, f)
-				}
-			}
-			sandbox.SetFinalizers(filtered)
+		if err := syncer.client.Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			return client.IgnoreNotFound(err)
 		}
-	}
-
-	meta := map[string]any{
-		"annotations": map[string]string{
-			AnnoAllocReleasedKey: string(js),
-		},
-	}
-	if needRemoveFinalizer {
-		meta["finalizers"] = sandbox.GetFinalizers()
-	}
-	patchData, err := json.Marshal(map[string]any{"metadata": meta})
-	if err != nil {
-		return err
-	}
-	obj := &sandboxv1alpha1.BatchSandbox{}
-	obj.Name = sandbox.Name
-	obj.Namespace = sandbox.Namespace
-	return syncer.client.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData))
+		latest.DeepCopyInto(sandbox)
+		return nil
+	})
 }
 
-type AllocSpec struct {
+type allocSpec struct {
 	// Sandboxes contains all BatchSandboxes to be scheduled in this round.
 	Sandboxes []*sandboxv1alpha1.BatchSandbox
 	Pool      *sandboxv1alpha1.Pool
@@ -424,7 +413,7 @@ type AllocSpec struct {
 }
 
 type Allocator interface {
-	Schedule(ctx context.Context, spec *AllocSpec) (*algorithm.AllocAction, error)
+	Schedule(ctx context.Context, spec *allocSpec) (*algorithm.AllocAction, error)
 	GetPoolAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool) (map[string]string, error)
 	ClearPoolAllocation(ctx context.Context, ns string, poolName string) error
 	// ReleasePodsAllocation releases the in-memory allocation for the given pods directly,
@@ -437,23 +426,24 @@ type Allocator interface {
 }
 
 type defaultAllocator struct {
-	store       AllocationStore
-	syncer      AllocationSyncer
+	store       allocationStore
+	syncer      allocationSyncer
 	client      client.Client
 	algorithm   algorithm.Algorithm
 	recoverOnce sync.Once
 }
 
-func NewDefaultAllocator(client client.Client) Allocator {
+// NewDefaultAllocator requires an uncached reader for release/finalizer retries.
+func NewDefaultAllocator(c client.Client, apiReader client.Reader) Allocator {
 	return &defaultAllocator{
-		store:     NewInMemoryAllocationStore(),
-		syncer:    NewAnnoAllocationSyncer(client),
-		client:    client,
+		store:     newInMemoryAllocationStore(),
+		syncer:    newAnnoAllocationSyncer(c, apiReader),
+		client:    c,
 		algorithm: &algorithm.PackedSchedule{},
 	}
 }
 
-func (allocator *defaultAllocator) Schedule(ctx context.Context, spec *AllocSpec) (*algorithm.AllocAction, error) {
+func (allocator *defaultAllocator) Schedule(ctx context.Context, spec *allocSpec) (*algorithm.AllocAction, error) {
 	log := logf.FromContext(ctx)
 	log.Info("Schedule started", "pool", spec.Pool.Name, "totalPods", len(spec.Pods), "sandboxes", len(spec.Sandboxes))
 	if err := allocator.checkRecovery(ctx); err != nil {
@@ -472,7 +462,7 @@ func (allocator *defaultAllocator) Schedule(ctx context.Context, spec *AllocSpec
 	// Orphan entries carry PodSupplement=0 and ToRelease=orphan pods so the normal recycle path
 	// handles them without any special-casing outside this function.
 	// Terminating sandboxes are handled inside getSandboxRequest: they receive no new supplement and
-	// all unreleased pods are queued for release.
+	// task cleanup hands back pods before they can be recycled.
 	allRequest, err := allocator.getAllRequest(ctx, spec.Sandboxes, podAllocation)
 	if err != nil {
 		return nil, err
@@ -524,7 +514,6 @@ func (allocator *defaultAllocator) getAllRequest(ctx context.Context, sandboxes 
 }
 
 func (allocator *defaultAllocator) getSandboxRequest(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*algorithm.SandboxRequest, error) {
-	log := logf.FromContext(ctx)
 	allocated, err := allocator.GetSandboxAllocation(ctx, sandbox)
 	if err != nil {
 		return nil, err
@@ -534,54 +523,31 @@ func (allocator *defaultAllocator) getSandboxRequest(ctx context.Context, sandbo
 		return nil, err
 	}
 
-	releasedSet := make(map[string]struct{}, len(released))
-	for _, r := range released {
-		releasedSet[r] = struct{}{}
-	}
-
-	// Terminating sandboxes should not receive new allocations.
-	// Queue all unreleased allocated pods for release and set supplement to zero.
-	if !sandbox.DeletionTimestamp.IsZero() {
-		toRelease := make([]string, 0)
-		for _, p := range allocated {
-			if _, ok := releasedSet[p]; !ok {
-				toRelease = append(toRelease, p)
-			}
+	deleting := !sandbox.DeletionTimestamp.IsZero()
+	var release []string
+	if deleting && !controllerutil.ContainsFinalizer(sandbox, finalizerTaskCleanup) {
+		// No tasks remain: hand back all outstanding allocations.
+		release = allocated
+	} else {
+		// While task cleanup owns the pods, only recycle explicit handoffs.
+		// The same annotation carries normal task completion and pause releases.
+		release, err = allocator.getSandboxRelease(ctx, sandbox)
+		if err != nil {
+			return nil, err
 		}
-		if len(toRelease) > 0 {
-			log.Info("Queuing terminating sandbox pods for release", "sandbox", sandbox.Name, "pods", toRelease)
-		}
-		return &algorithm.SandboxRequest{
-			SandboxName:   sandbox.Name,
-			CurAllocation: allocated,
-			CurReleased:   released,
-			PodSupplement: 0,
-			ToRelease:     toRelease,
-		}, nil
 	}
-
-	release, err := allocator.getSandboxRelease(ctx, sandbox)
-	if err != nil {
-		return nil, err
-	}
-
-	toRelease := make([]string, 0)
-	for _, r := range release {
-		if _, exists := releasedSet[r]; !exists {
-			toRelease = append(toRelease, r)
+	releasedSet := sets.New(released...)
+	toRelease := make([]string, 0, len(release))
+	for _, pod := range release {
+		if !releasedSet.Has(pod) {
+			toRelease = append(toRelease, pod)
 		}
 	}
 
-	replica := int32(0)
-	if sandbox.Spec.Replicas != nil {
-		replica = *sandbox.Spec.Replicas
+	var supplement int32
+	if !deleting && sandbox.Spec.Replicas != nil {
+		supplement = max(*sandbox.Spec.Replicas-int32(len(allocated)), 0)
 	}
-
-	supplement := int32(0)
-	if replica-int32(len(allocated)) > 0 {
-		supplement = replica - int32(len(allocated))
-	}
-
 	return &algorithm.SandboxRequest{
 		SandboxName:   sandbox.Name,
 		CurAllocation: allocated,
@@ -616,6 +582,10 @@ func (allocator *defaultAllocator) GetSandboxReleased(ctx context.Context, sandb
 }
 
 func (allocator *defaultAllocator) GetPoolAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool) (map[string]string, error) {
+	// Eviction and the capacity metrics read the store before the first Schedule.
+	if err := allocator.checkRecovery(ctx); err != nil {
+		return nil, err
+	}
 	alloc, err := allocator.store.GetAllocation(ctx, pool)
 	if err != nil {
 		return nil, err
@@ -651,7 +621,7 @@ func (allocator *defaultAllocator) SyncSandboxAllocation(ctx context.Context, sa
 	allocator.store.UpdateAllocation(ctx, sandbox.Namespace, poolRef, sandbox.Name, pods)
 
 	// Phase 2: persist to sandbox annotation.
-	allocation := &SandboxAllocation{Pods: pods}
+	allocation := &sandboxAllocation{Pods: pods}
 	if err := allocator.syncer.SetAllocation(ctx, sandbox, allocation); err != nil {
 		// Rollback in-memory store to the previous state.
 		log.Error(err, "Rollback sandbox allocation", "sandbox", sandbox.Name, "pods", oldState.Pods)
@@ -670,7 +640,7 @@ func (allocator *defaultAllocator) SyncSandboxReleased(ctx context.Context, sand
 	poolRef := sandbox.Spec.PoolRef
 
 	// Phase 1: persist to sandbox annotation.
-	released := &AllocationReleased{Pods: pods}
+	released := &allocationReleased{Pods: pods}
 	if err := allocator.syncer.SetReleased(ctx, sandbox, released); err != nil {
 		log.Error(err, "Failed to sync sandbox released", "sandbox", sandbox.Name, "pods", pods)
 		return err

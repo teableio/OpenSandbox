@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,12 @@
 # limitations under the License.
 
 FROM python:3.10-slim AS builder
+
+# Optional: inject the release version when .git is unavailable so hatch-vcs
+# resolves the real version instead of falling back to 0.1.0.dev0. Passed by
+# build.sh as --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=<version> (no leading v).
+ARG SETUPTOOLS_SCM_PRETEND_VERSION
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=$SETUPTOOLS_SCM_PRETEND_VERSION
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -55,6 +61,7 @@ COPY --from=builder /app/opensandbox_server/examples/example.config.k8s.toml /et
 COPY --from=builder /app/opensandbox_server/examples/example.config.k8s.zh.toml /etc/opensandbox/config.zh.toml
 COPY --from=builder /app/opensandbox_server/examples/example.batchsandbox-template.yaml /etc/opensandbox/example.batchsandbox-template.yaml
 COPY --from=builder /app/opensandbox_server/examples/e2e.batchsandbox-template.yaml /etc/opensandbox/e2e.batchsandbox-template.yaml
+COPY --from=builder /app/opensandbox_server/examples/e2e.batchsandbox-template-caps-drop.yaml /etc/opensandbox/e2e.batchsandbox-template-caps-drop.yaml
 
 EXPOSE 8080
 

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
@@ -51,6 +52,7 @@ type taskNode struct {
 	Status  *api.Task
 	IP      string
 	PodName string
+	PodUID  types.UID
 
 	// collect from endpoints
 	tState              TaskState
@@ -71,6 +73,19 @@ func (t *taskNode) GetState() TaskState {
 
 func (t *taskNode) IsResourceReleased() bool {
 	return t.sState == stateReleased
+}
+
+// GetTerminatedMessage returns the failure message from the task status, including
+// lifecycle hook stderr output. It is used by the controller to populate
+// BatchSandboxStatus.TaskLastErrorMessage.
+func (t *taskNode) GetTerminatedMessage() string {
+	if t.Status == nil {
+		return ""
+	}
+	if t.Status.ProcessStatus != nil && t.Status.ProcessStatus.Terminated != nil {
+		return t.Status.ProcessStatus.Terminated.Message
+	}
+	return ""
 }
 
 func (t *taskNode) isTaskCompleted() bool {
@@ -124,12 +139,10 @@ const (
 	   assigned -- "when task state is FAILED && policy is allowed" --> releasing
 	   assigned -- "set Task"
 
-	   releasing -- "when endpoint returns nil task or endpoint lost too many times  (e.g., force-deleted), endpoint is nil(unassigned)" --> released
+	   releasing -- "when endpoint returns nil task or the assigned pod is gone (e.g., force-deleted), endpoint is nil(unassigned)" --> released
 
 	   released --> $end
 	*/
-	//statePending   = "pending", endpoint is empty means pending, otherwise means assigned
-	//stateAssigned  = "assigned"
 	stateReleasing = "releasing"
 	stateReleased  = "released"
 	stateUnknown   = "unknown"
@@ -141,9 +154,10 @@ type taskClient interface {
 }
 
 const (
-	defaultTimeout        time.Duration = 3 * time.Second
-	defaultTaskPort                     = "5758"
-	defaultSchConcurrency int           = 10
+	defaultTimeout                  time.Duration = 3 * time.Second
+	defaultUnboundedPreStartTimeout time.Duration = 30 * time.Minute
+	defaultTaskPort                               = "5758"
+	defaultSchConcurrency           int           = 10
 )
 
 func newTaskClient(ip string) taskClient {
@@ -162,7 +176,6 @@ type defaultTaskScheduler struct {
 	taskNodeByNameIndex map[string]*taskNode
 
 	maxConcurrency int
-	once           sync.Once
 
 	taskStatusCollector       taskStatusCollector
 	taskClientCreator         taskClientCreator
@@ -276,7 +289,11 @@ func (sch *defaultTaskScheduler) collectTaskStatus(taskNodes []*taskNode) {
 	ips := []string{}
 	for _, tNode := range taskNodes {
 		// unassigned no need to collect task status
-		if tNode.IP == "" {
+		if tNode.IP == "" || tNode.IsResourceReleased() {
+			continue
+		}
+		if !sch.hasValidPodBinding(tNode) {
+			sch.releaseMissingPod(tNode)
 			continue
 		}
 		ips = append(ips, tNode.IP)
@@ -284,14 +301,51 @@ func (sch *defaultTaskScheduler) collectTaskStatus(taskNodes []*taskNode) {
 	if len(ips) == 0 {
 		return
 	}
-	tasks := sch.taskStatusCollector.Collect(context.Background(), ips)
+	// Failed queries are logged by the collector and left out of the result.
+	tasks, _ := sch.taskStatusCollector.Collect(context.Background(), ips)
 	for _, tNode := range taskNodes {
+		if tNode.IP == "" || tNode.IsResourceReleased() {
+			continue
+		}
 		task, ok := tasks[tNode.IP]
+		if !ok {
+			// The bound pod still exists; a failed query does not prove the
+			// task has stopped, so retain its last known status.
+			continue
+		}
 		tNode.Status = task
-		if ok && task != nil {
+		if task != nil {
 			tNode.transTaskState(parseTaskState(task), sch.logger)
 		}
 	}
+}
+
+// A terminating Pod can still report its IP after its network has been torn down.
+func hasTaskEndpoint(pod *corev1.Pod) bool {
+	return pod.DeletionTimestamp == nil && pod.Status.PodIP != ""
+}
+
+// hasValidPodBinding reports whether the pod the task node is bound to still
+// exists with the same UID and IP. Name and IP alone can both be reused by a
+// replacement pod, and a terminating Pod can no longer safely serve requests.
+func (sch *defaultTaskScheduler) hasValidPodBinding(tNode *taskNode) bool {
+	for _, pod := range sch.allPods {
+		if pod.Name == tNode.PodName && pod.UID == tNode.PodUID && pod.Status.PodIP == tNode.IP && hasTaskEndpoint(pod) {
+			return true
+		}
+	}
+	return false
+}
+
+func (sch *defaultTaskScheduler) releaseMissingPod(tNode *taskNode) {
+	// Never send the cleanup request to the old IP: it may already belong to
+	// another executor. Keep a completed task's outcome when its pod disappears
+	// or is terminating.
+	if !tNode.isTaskCompleted() {
+		tNode.Status = nil
+		tNode.transTaskState(FailedTaskState, sch.logger)
+	}
+	tNode.transSchState(stateReleased, sch.logger)
 }
 
 func parseTaskState(task *api.Task) TaskState {
@@ -344,6 +398,11 @@ func (sch *defaultTaskScheduler) scheduleTaskNodes() error {
 				<-semaphore
 				wg.Done()
 			}()
+			// This sender-side snapshot check can race with Pod replacement; closing
+			// that window requires owner fencing in the task-executor.
+			if node.IP != "" && !node.IsResourceReleased() && !sch.hasValidPodBinding(node) {
+				sch.releaseMissingPod(node)
+			}
 			scheduleSingleTaskNode(node, sch.taskClientCreator, sch.resPolicyWhenTaskComplete, sch.logger)
 		}(tNode)
 	}
@@ -351,22 +410,17 @@ func (sch *defaultTaskScheduler) scheduleTaskNodes() error {
 	return nil
 }
 
-// refreshFreePods updates the freePods slice based on allPods and currently assigned pods
-// This ensures that each pod is only assigned to one taskNode
-// Only pods with IP addresses are considered free for assignment
 func (sch *defaultTaskScheduler) refreshFreePods() {
-	// Create a map of assigned pod names for quick lookup
 	assignedPods := make(map[string]bool, len(sch.allPods)/2)
 	for _, tNode := range sch.taskNodes {
 		if tNode.IP != "" && tNode.PodName != "" {
 			assignedPods[tNode.PodName] = true
 		}
 	}
-	// Rebuild freePods list with only unassigned pods that have IP addresses
 	sch.freePods = make([]*corev1.Pod, 0, len(sch.allPods)/2)
 	for _, pod := range sch.allPods {
-		// Only consider pods with IP addresses as free for assignment
-		if !assignedPods[pod.Name] && pod.Status.PodIP != "" {
+		// Assignment is not retried, so exclude explicitly unready pods; missing PodReady remains eligible.
+		if !assignedPods[pod.Name] && hasTaskEndpoint(pod) && !utils.IsPodExplicitlyNotReady(pod.Status) {
 			sch.freePods = append(sch.freePods, pod)
 		}
 	}
@@ -385,6 +439,7 @@ func assignTaskNodes(taskNodes []*taskNode, freePods []*corev1.Pod, log logr.Log
 		log.Info("assign Pod to task node", "podName", pod.Name, "podNamespace", pod.Namespace, "podIP", pod.Status.PodIP, "taskName", tNode.Name)
 		tNode.IP = pod.Status.PodIP
 		tNode.PodName = pod.Name
+		tNode.PodUID = pod.UID
 		freePods = freePods[1:]
 	}
 	return freePods
@@ -402,6 +457,9 @@ func needRelease(tNode *taskNode, policy sandboxv1alpha1.TaskResourcePolicy) boo
 
 // scheduleSingleTaskNode handles scheduling for a single task node based on its state
 func scheduleSingleTaskNode(tNode *taskNode, taskClientCreator func(endpoint string) taskClient, resPolicyWhenTaskComplete sandboxv1alpha1.TaskResourcePolicy, log logr.Logger) {
+	if tNode.IsResourceReleased() {
+		return
+	}
 	// pending
 	if tNode.IP == "" {
 		if tNode.DeletionTimestamp != nil {
@@ -441,11 +499,33 @@ func scheduleSingleTaskNode(tNode *taskNode, taskClientCreator func(endpoint str
 }
 
 func setTask(client taskClient, task *api.Task, log logr.Logger) (*api.Task, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	ctx, cancel := contextForSetTask(task)
 	defer cancel()
 	verboseLog := log.V(3)
 	if verboseLog.Enabled() {
 		verboseLog.Info("client set task", "task", utils.DumpJSON(task))
 	}
 	return client.Set(ctx, task)
+}
+
+func contextForSetTask(task *api.Task) (context.Context, context.CancelFunc) {
+	timeout, ok := setTaskTimeout(task)
+	if !ok {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+func setTaskTimeout(task *api.Task) (time.Duration, bool) {
+	if task != nil &&
+		task.Process != nil &&
+		task.Process.Lifecycle != nil &&
+		task.Process.Lifecycle.PreStart != nil {
+		timeoutSeconds := task.Process.Lifecycle.PreStart.TimeoutSeconds
+		if timeoutSeconds == nil || *timeoutSeconds <= 0 {
+			return defaultUnboundedPreStartTimeout + defaultTimeout, true
+		}
+		return time.Duration(*timeoutSeconds)*time.Second + defaultTimeout, true
+	}
+	return defaultTimeout, true
 }

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,6 +32,13 @@ export interface ExecutionError {
   value: string;
   timestamp: number;
   traceback: string[];
+  /**
+   * Exit status for `CommandExecError` or `CommandTimeout` after a command exits
+   * non-zero (-1 when terminated by a signal). Absent when the process failed to
+   * start, no exit status was observed, or the error is not from a command.
+   * Also absent on servers that predate `error.exit_code`.
+   */
+  exitCode?: number;
 }
 
 export interface ExecutionComplete {
@@ -57,6 +64,40 @@ export interface Execution {
   exitCode?: number | null;
 }
 
+/**
+ * Normalizes a wire `error.exit_code` value. Only integers are accepted; anything else
+ * (missing, non-numeric, fractional) yields `undefined` so callers fall back to `evalue`.
+ *
+ * @internal
+ */
+export function normalizeExitCode(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+
+/**
+ * Infers the final exit code of a foreground command execution.
+ *
+ * Prefers the authoritative `error.exitCode` (from `error.exit_code`) and falls back to
+ * parsing `error.value` (`evalue`) for servers that predate `exit_code`. A completed
+ * execution without an error is `0`; anything else is `null`.
+ *
+ * @internal
+ */
+export function inferExecutionExitCode(execution: Pick<Execution, "error" | "complete">): number | null {
+  const error = execution.error;
+  if (error != null) {
+    const exitCode = normalizeExitCode(error.exitCode);
+    if (exitCode !== undefined) {
+      return exitCode;
+    }
+    const errorValue = error.value?.trim();
+    const parsedExitCode =
+      errorValue && /^-?\d+$/.test(errorValue) ? Number(errorValue) : Number.NaN;
+    return Number.isFinite(parsedExitCode) ? parsedExitCode : null;
+  }
+  return execution.complete ? 0 : null;
+}
+
 export interface ExecutionHandlers {
   /**
    * Optional low-level hook for every server-sent event (SSE) received.
@@ -69,4 +110,10 @@ export interface ExecutionHandlers {
   onExecutionComplete?: (c: ExecutionComplete) => void | Promise<void>;
   onError?: (err: ExecutionError) => void | Promise<void>;
   onInit?: (init: ExecutionInit) => void | Promise<void>;
+  /**
+   * When true, stdout/stderr messages are only delivered to handlers without
+   * being accumulated in the execution logs. Use for long-running executions
+   * to prevent unbounded memory growth.
+   */
+  skipAccumulation?: boolean;
 }

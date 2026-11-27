@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -66,6 +66,20 @@ public interface ISandboxFiles
     /// <exception cref="SandboxException">Thrown when the execd service request fails.</exception>
     Task DeleteDirectoriesAsync(
         IEnumerable<string> paths,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Lists directory contents with optional depth control.
+    /// </summary>
+    /// <param name="path">The directory path to list.</param>
+    /// <param name="depth">Optional maximum child depth to include.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A list of directory entries with metadata.</returns>
+    /// <exception cref="InvalidArgumentException">Thrown when request values are invalid.</exception>
+    /// <exception cref="SandboxException">Thrown when the execd service request fails.</exception>
+    Task<IReadOnlyList<SandboxFileInfo>> ListDirectoryAsync(
+        string path,
+        int? depth = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -155,6 +169,18 @@ public interface ISandboxFiles
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Replaces content in files and returns per-file replacement counts.
+    /// </summary>
+    /// <param name="entries">The content replace entries.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>List of replacement results with counts per file.</returns>
+    /// <exception cref="InvalidArgumentException">Thrown when request values are invalid.</exception>
+    /// <exception cref="SandboxException">Thrown when the execd service request fails.</exception>
+    Task<IReadOnlyList<ContentReplaceResult>> ReplaceContentsDetailedAsync(
+        IEnumerable<ContentReplaceEntry> entries,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Sets permissions on files.
     /// </summary>
     /// <param name="entries">The permission entries.</param>
@@ -164,4 +190,26 @@ public interface ISandboxFiles
     Task SetPermissionsAsync(
         IEnumerable<SetPermissionEntry> entries,
         CancellationToken cancellationToken = default);
+}
+
+/// <summary>Optional filesystem capability for HTTP download response metadata.</summary>
+public interface IDownloadSandboxFiles : ISandboxFiles
+{
+    /// <summary>Reads a file as bytes together with HTTP response metadata.</summary>
+    Task<ReadBytesResponse<byte[]>> ReadBytesDetailedAsync(
+        string path,
+        ReadBytesOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Reads a file as a byte stream together with HTTP response metadata.</summary>
+    Task<ReadBytesResponse<IAsyncReadBytesStream>> ReadBytesStreamDetailedAsync(
+        string path,
+        ReadBytesOptions? options = null,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>Filesystem capability for explicit execution identities.</summary>
+public interface IIdentitySandboxFiles : ISandboxFiles
+{
+    ISandboxFiles WithIdentity(uint uid, uint gid);
 }

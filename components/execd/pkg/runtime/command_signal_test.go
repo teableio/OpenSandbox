@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,9 +39,7 @@ import (
 // processes. Regression test for
 // https://github.com/alibaba/OpenSandbox/issues/922.
 func TestRunCommand_CancelKillsChildren(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found in PATH")
-	}
+	requireBash(t)
 
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 
@@ -113,14 +111,89 @@ func TestRunCommand_CancelKillsChildren(t *testing.T) {
 	t.Fatalf("child pid %d still alive 2s after cancel — process leak", childPid)
 }
 
+// TestRunBackgroundCommand_ExitDoesNotKillProcessGroup verifies that a
+// background command exiting normally does not SIGKILL its process group,
+// matching the foreground path. A child started with `&` must keep running.
+func TestRunBackgroundCommand_ExitDoesNotKillProcessGroup(t *testing.T) {
+	requireBash(t)
+
+	marker := filepath.Join(t.TempDir(), "child.done")
+
+	c := NewController("", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var session string
+	req := &ExecuteCodeRequest{
+		// The leader exits right away; the child writes the marker once
+		// the leader is gone.
+		Code: `(sleep 1; echo ok > "` + marker + `") >/dev/null 2>&1 &`,
+		Cwd:  t.TempDir(),
+		Hooks: ExecuteResultHook{
+			OnExecuteInit: func(s string) { session = s },
+		},
+	}
+	req.SetDefaultHooks()
+
+	require.NoError(t, c.runBackgroundCommand(ctx, cancel, req))
+	require.Eventually(t, func() bool {
+		status, err := c.GetCommandStatus(session)
+		return err == nil && !status.Running
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(marker)
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond, "child was killed when the background command exited")
+}
+
+// TestRunBackgroundCommand_CancelKillsChildren verifies that cancelling a
+// running background command (e.g. timeout) still kills its whole group.
+func TestRunBackgroundCommand_CancelKillsChildren(t *testing.T) {
+	requireBash(t)
+
+	dir := t.TempDir()
+	started := filepath.Join(dir, "child.started")
+	marker := filepath.Join(dir, "child.done")
+
+	c := NewController("", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var session string
+	req := &ExecuteCodeRequest{
+		// The leader waits, so the command is still running when cancelled.
+		Code: `(touch "` + started + `"; sleep 1; echo ok > "` + marker + `") >/dev/null 2>&1 & wait`,
+		Cwd:  t.TempDir(),
+		Hooks: ExecuteResultHook{
+			OnExecuteInit: func(s string) { session = s },
+		},
+	}
+	req.SetDefaultHooks()
+
+	require.NoError(t, c.runBackgroundCommand(ctx, cancel, req))
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(started)
+		return err == nil
+	}, 5*time.Second, 10*time.Millisecond, "child did not start")
+	cancel()
+	require.Eventually(t, func() bool {
+		status, err := c.GetCommandStatus(session)
+		return err == nil && !status.Running
+	}, 5*time.Second, 10*time.Millisecond)
+
+	// Give a surviving child time to write the marker.
+	time.Sleep(2 * time.Second)
+	_, err := os.Stat(marker)
+	require.True(t, os.IsNotExist(err), "child survived cancellation of the background command")
+}
+
 // TestInterrupt_AfterFinished_ReturnsError verifies that an Interrupt
 // arriving after the command has completed does not signal a recycled PID.
 // Without this guard, group-wide kill would amplify the stale-PID hazard
 // to every process in an unrelated process group.
 func TestInterrupt_AfterFinished_ReturnsError(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found in PATH")
-	}
+	requireBash(t)
 
 	c := NewController("", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -167,9 +240,7 @@ func TestInterrupt_AfterFinished_ReturnsError(t *testing.T) {
 // state as a failure caused Interrupt to surface a 500 even though the
 // kill succeeded.
 func TestKillPid_ZombieLeaderDoesNotFail(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found in PATH")
-	}
+	requireBash(t)
 
 	cmd := exec.Command("bash", "-c", `sleep 30 & wait`)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -186,7 +257,7 @@ func TestKillPid_ZombieLeaderDoesNotFail(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	c := &Controller{}
-	require.NoError(t, c.killPid(cmd.Process.Pid),
+	require.NoError(t, c.killPid("slow-teardown", cmd.Process.Pid),
 		"slow post-SIGKILL teardown must not be reported as a hard failure")
 }
 
@@ -194,9 +265,7 @@ func TestKillPid_ZombieLeaderDoesNotFail(t *testing.T) {
 // the whole process group, not just the leader. Regression test for
 // https://github.com/alibaba/OpenSandbox/issues/922.
 func TestKillPid_TerminatesEntireProcessGroup(t *testing.T) {
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not found in PATH")
-	}
+	requireBash(t)
 
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	cmd := exec.Command("bash", "-c",
@@ -231,7 +300,7 @@ func TestKillPid_TerminatesEntireProcessGroup(t *testing.T) {
 	require.NoError(t, syscall.Kill(childPid, 0), "child should be alive before kill")
 
 	c := &Controller{}
-	require.NoError(t, c.killPid(cmd.Process.Pid))
+	require.NoError(t, c.killPid("process-group", cmd.Process.Pid))
 
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

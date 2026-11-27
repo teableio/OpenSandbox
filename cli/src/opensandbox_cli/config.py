@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,9 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+import click
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -49,6 +51,7 @@ DEFAULT_CONFIG_TEMPLATE = """\
 # domain = "localhost:8080"
 # protocol = "http"
 # request_timeout = 30
+# use_server_proxy is deprecated (maintenance mode); prefer the ingress gateway for data-plane traffic.
 # use_server_proxy = false
 
 [output]
@@ -61,17 +64,41 @@ DEFAULT_CONFIG_TEMPLATE = """\
 
 
 def load_config_file(config_path: Path | None = None) -> dict[str, Any]:
-    """Load and parse the TOML config file.
-
-    Returns an empty dict if the file doesn't exist or tomllib is unavailable.
-    """
+    """Load the TOML config file; return {} when it does not exist."""
     path = config_path or DEFAULT_CONFIG_PATH
-    if not path.exists():
-        return {}
     if tomllib is None:
         return {}
-    with open(path, "rb") as f:
-        return tomllib.load(f)
+    # Open directly: exists() raises on an unsearchable parent directory.
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except (FileNotFoundError, NotADirectoryError):
+        return {}
+    except OSError as exc:
+        raise click.ClickException(f"Cannot read config file {path}: {exc}") from exc
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise click.ClickException(
+            f"Config file is not valid TOML ({path}): {exc}"
+        ) from exc
+
+
+# Config keys `config set` accepts and the value shape for each. Unknown keys
+# are rejected so a typo cannot quietly strand the real setting.
+#
+# "verbatim" keys are stored as raw CLI text: inferring a TOML number would
+# rewrite an API key such as "007123" as 7123. The kind set is closed: a new
+# kind must be handled in `_validated_config_value`, which fails loudly on
+# anything it does not recognize.
+CONFIG_VALUE_KINDS: dict[str, Literal["verbatim", "protocol", "int", "bool", "duration-or-none"]] = {
+    "connection.api_key": "verbatim",
+    "connection.domain": "verbatim",
+    "connection.protocol": "protocol",
+    "connection.request_timeout": "int",
+    "connection.use_server_proxy": "bool",
+    "output.color": "bool",
+    "defaults.image": "verbatim",
+    "defaults.timeout": "duration-or-none",
+}
 
 
 def resolve_config(
@@ -83,13 +110,18 @@ def resolve_config(
     cli_use_server_proxy: bool | None = None,
     config_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Merge config from all sources and return a flat dict.
+    """Merge config from all sources into a flat dict.
 
-    Keys returned:
-      - api_key, domain, protocol, request_timeout (int seconds), use_server_proxy (bool)
-      - default_image, default_timeout (str like "10m")
+    Config-file values are coerced to each key's declared type. Keys returned:
+    api_key, domain, protocol, request_timeout (int seconds),
+    use_server_proxy (bool; deprecated), color, default_image, default_timeout.
     """
     file_cfg = load_config_file(config_path)
+    for section in ("connection", "output", "defaults"):
+        if section in file_cfg and not isinstance(file_cfg[section], dict):
+            raise click.ClickException(
+                f"Config section '{section}' must be a TOML table (use [{section}])."
+            )
     conn = file_cfg.get("connection", {})
     output_cfg = file_cfg.get("output", {})
     defaults = file_cfg.get("defaults", {})
@@ -97,27 +129,28 @@ def resolve_config(
     return {
         "api_key": cli_api_key
         or os.getenv("OPEN_SANDBOX_API_KEY")
-        or conn.get("api_key"),
+        or _str_or_none(conn.get("api_key")),
         "domain": cli_domain
         or os.getenv("OPEN_SANDBOX_DOMAIN")
-        or conn.get("domain"),
+        or _str_or_none(conn.get("domain")),
         "protocol": cli_protocol
         or os.getenv("OPEN_SANDBOX_PROTOCOL")
-        or conn.get("protocol")
+        or _str_or_none(conn.get("protocol"))
         or "http",
-        "request_timeout": cli_timeout
-        or _int_or_none(os.getenv("OPEN_SANDBOX_REQUEST_TIMEOUT"))
-        or conn.get("request_timeout")
-        or 30,
+        "request_timeout": _request_timeout_seconds(
+            cli_timeout,
+            _int_or_none(os.getenv("OPEN_SANDBOX_REQUEST_TIMEOUT")),
+            _int_or_none(conn.get("request_timeout")),
+        ),
         "use_server_proxy": _coalesce(
             cli_use_server_proxy,
             _bool_or_none(os.getenv("OPEN_SANDBOX_USE_SERVER_PROXY")),
-            conn.get("use_server_proxy"),
+            _bool_or_none(conn.get("use_server_proxy")),
             False,
         ),
-        "color": output_cfg.get("color", True),
-        "default_image": defaults.get("image"),
-        "default_timeout": defaults.get("timeout"),
+        "color": _coalesce(_bool_or_none(output_cfg.get("color")), True),
+        "default_image": _str_or_none(defaults.get("image")),
+        "default_timeout": _str_or_none(defaults.get("timeout")),
     }
 
 
@@ -133,23 +166,60 @@ def init_config_file(config_path: Path | None = None, *, force: bool = False) ->
     return path
 
 
-def _int_or_none(value: str | None) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
+def _request_timeout_seconds(*candidates: int | None) -> int:
+    """Return the first explicit timeout in seconds; zero/negative values are rejected rather than ignored."""
+    for value in candidates:
+        if value is None:
+            continue
+        if value <= 0:
+            raise click.ClickException(
+                "Request timeout must be a positive number of seconds, "
+                f"got {value}."
+            )
+        return value
+    return 30
 
 
-def _bool_or_none(value: str | None) -> bool | None:
+def _int_or_none(value: Any) -> int | None:
+    """Coerce a configured value to ``int``, or ``None`` when it is not numeric."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (str, float)):
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    """Coerce to ``bool``, accepting 0/1 so hand-edited files keep resolving."""
     if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value) if value in (0, 1) else None
+    if not isinstance(value, str):
         return None
     normalized = value.strip().lower()
     if normalized in ("1", "true", "yes", "on"):
         return True
     if normalized in ("0", "false", "no", "off"):
         return False
+    return None
+
+
+def _str_or_none(value: Any) -> str | None:
+    """Coerce a configured value to ``str``, or ``None`` when it has no text form."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
     return None
 
 

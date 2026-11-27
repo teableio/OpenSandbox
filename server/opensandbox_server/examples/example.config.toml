@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 # Example Docker Runtime Configuration for OpenSandbox Server
 #
-# Full configuration reference: https://github.com/alibaba/OpenSandbox/blob/main/server/configuration.md
+# Full configuration reference: https://github.com/opensandbox-group/OpenSandbox/blob/main/server/configuration.md
 
 [server]
 host = "127.0.0.1"
@@ -27,12 +27,22 @@ max_sandbox_timeout_seconds = 86400
 # - Interactive TTY: type YES when prompted
 # - Non-interactive: set OPENSANDBOX_INSECURE_SERVER=YES
 
+[proxy]
+# When True (default), the sandbox reverse-proxy targets the sandbox's
+# internal Docker bridge container IP. Set to False to target the
+# server-local host-mapped port instead. Use False when the server process
+# cannot route to bridge container IPs, e.g. a launchd/systemd user session
+# on macOS where such traffic is blocked.
+resolve_internal = true
+
 [log]
 level = "INFO"
 
 [runtime]
 type = "docker"
-execd_image = "opensandbox/execd:v1.0.18"
+execd_image = "opensandbox/execd:v1.1.0"
+# Set to the mounted TOML path inside sandboxes to reserve EXECD_ISOLATION_CONFIG.
+# execd_isolation_config = "/etc/opensandbox/isolation.toml"
 
 [storage]
 # Allowlist of host path prefixes permitted for bind mounts.
@@ -46,15 +56,37 @@ volume_default_size = "1Gi"
 [store]
 type = "sqlite"
 path = "~/.opensandbox/opensandbox.db"
+# For an external PostgreSQL store, set type = "postgresql" and configure:
+# [store.postgresql]
+# min_pool_size = 1
+# max_pool_size = 10
+# connect_timeout_seconds = 5
+# pool_timeout_seconds = 5
+# Inject the DSN with OPENSANDBOX_STORE_POSTGRESQL_DSN in production.
+# Use only one active server process per PostgreSQL database.
 
 [docker]
+# Network attachment for sandbox containers: "host", "bridge", "none", "pasta",
+# "slirp4netns", or the name of a user-defined Docker network that already exists.
+# "pasta" / "slirp4netns" are passed through to runtimes that support them (podman) and are
+# the fallback where bridge networking is unavailable, e.g. rootless podman inside WSL2.
+# Egress sidecar + networkPolicy require "bridge".
 network_mode = "bridge"
+# Host port range for bridge-mode sandbox port allocation.
+# Each sandbox needs 2–3 host ports (2 without egress, 3 with egress sidecar).
+# Narrow the range to match your firewall policy — e.g., 100 concurrent sandboxes ≈ 300 ports.
+port_range_min = 40000
+port_range_max = 60000
+# The host address sandbox ports are published on (0.0.0.0 = every interface). Set an IP to keep
+# execd and the sandbox ports off public interfaces: 127.0.0.1 when the server runs on the host,
+# or the Docker bridge gateway (e.g. 172.17.0.1) when the server runs in a container.
+# publish_host = "127.0.0.1"
 # Drop dangerous capabilities and block privilege escalation
 drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
 no_new_privileges = true
 # Optional: set an AppArmor profile name (e.g., "docker-default") when AppArmor is enabled
 apparmor_profile = ""
-# Limit process count to reduce host impact from fork bombs; set to null to disable
+# Limit process count to reduce host impact from fork bombs; set to 0 to disable
 pids_limit = 4096
 # Optional: environment variables injected into every sandbox container
 # (request env overrides same-named keys). Pair with sandbox_binds to make
@@ -69,10 +101,21 @@ seccomp_profile = ""
 mode = "direct"
 
 [egress]
-image = "opensandbox/egress:v1.0.12"
+image = "opensandbox/egress:v1.1.7"
 mode = "dns"
+readiness_timeout_seconds = 30.0
+# Optional: export the egress sidecar's OpenTelemetry metrics (OTLP/HTTP only).
+# otlp_endpoint = "http://otel-collector.observability:4318"
+# Optional: chain sidecar egress through an upstream HTTP(S) CONNECT proxy. Requires mode = "dns+nft"
+# and transparent MITM per sandbox (credentialProxy.enabled or OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true).
+# [egress.upstream_proxy]
+# url = "http://proxy.example.com:3128"
+# authorization = "Basic <base64>"
+# Optional: absolute path on the Docker daemon host to a PEM CA bundle trusted in
+# addition to the system roots; mounted read-only into the egress sidecar only.
+# ca_cert_path = "/etc/ssl/private-ca/upstream-proxy-ca.pem"
 
-# 🧪 [EXPERIMENTAL] Renew-on-access. Off by default — see server/README.md.
+# Renew-on-access. Off by default — see server/README.md.
 [renew_intent]
 enabled = false
 min_interval_seconds = 60

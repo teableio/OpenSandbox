@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,7 +27,12 @@ from opensandbox.models.sandboxes import SandboxEndpoint
 def test_sandbox_service_adapter_eager_init() -> None:
     cfg = ConnectionConfig(domain="localhost:8080", api_key="x")
     adapter = SandboxesAdapter(cfg)
-    assert adapter is not None
+
+    # Eager init: the endpoint cache and authenticated HTTP client must exist
+    # immediately after construction, not on first API call.
+    assert adapter._endpoint_cache is not None
+    assert adapter._client is not None
+    assert adapter._httpx_client is not None
 
 
 @pytest.mark.asyncio
@@ -43,7 +48,6 @@ async def test_execd_service_adapters_eager_init_and_urls() -> None:
     assert cmd._get_execd_url("/ping").endswith("/ping")
     assert fs._get_execd_url("/files/download").endswith("/files/download")
 
-    # Ensure openapi clients are available without lazy init
     assert await cmd._get_client() is not None
     assert await fs._get_client() is not None
     assert await health._get_client() is not None
